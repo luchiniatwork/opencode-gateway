@@ -74,4 +74,31 @@ Run the current entry point:
 bun run index.ts
 ```
 
-The command above is still the starter project behavior. Real gateway commands and service entry points will be added as the implementation begins.
+Build the installable package CLI:
+
+```bash
+bun run build
+```
+
+This writes `dist/index.js`, adds the `opencode-gateway` shebang, and marks it executable. The package exposes that file through `package.json` `bin`, so later installs can run `opencode-gateway` directly.
+
+Build a standalone executable for release-style installs:
+
+```bash
+bun run build:bin
+```
+
+Build both artifacts:
+
+```bash
+bun run build:all
+```
+
+Smoke-check the generated CLIs:
+
+```bash
+./dist/index.js help
+./dist/opencode-gateway help
+```
+
+The current service is still an early gateway slice. Real channel and OpenCode runtime wiring will be added as the implementation continues.

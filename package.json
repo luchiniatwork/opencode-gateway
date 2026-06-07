@@ -1,10 +1,23 @@
 {
   "name": "opencode-gateway",
-  "module": "index.ts",
+  "version": "0.1.0",
+  "description": "OpenCode with a messaging front door.",
+  "module": "dist/index.js",
   "type": "module",
-  "private": true,
+  "bin": {
+    "opencode-gateway": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "SPEC.md"
+  ],
   "scripts": {
+    "build": "bun run scripts/build.ts",
+    "build:bin": "bun run scripts/build.ts --binary",
+    "build:all": "bun run scripts/build.ts --all",
     "dev": "bun --watch index.ts serve",
+    "prepack": "bun run build",
     "serve": "bun index.ts serve",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
