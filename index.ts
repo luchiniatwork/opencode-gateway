@@ -1,4 +1,5 @@
 import { createApp } from "./src/app.ts";
+import { ConfigError, loadConfig } from "./src/config/load.ts";
 
 const shutdownSignals = ["SIGINT", "SIGTERM"] as const;
 
@@ -18,13 +19,30 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     return 1;
   }
 
-  if (rest.length > 0) {
-    console.error(`Unexpected arguments for serve: ${rest.join(" ")}`);
+  const serveOptions = parseServeOptions(rest);
+
+  if (!serveOptions.ok) {
+    console.error(serveOptions.error);
     console.error("Run `opencode-gateway help` for usage.");
     return 1;
   }
 
-  const app = createApp();
+  let config;
+
+  if (serveOptions.configPath) {
+    try {
+      config = await loadConfig(serveOptions.configPath);
+    } catch (error) {
+      if (error instanceof ConfigError) {
+        console.error(error.message);
+        return 1;
+      }
+
+      throw error;
+    }
+  }
+
+  const app = createApp({ config });
 
   await app.start();
   await waitForShutdownSignal();
@@ -37,11 +55,43 @@ function printHelp(): void {
   console.log(`opencode-gateway
 
 Usage:
-  opencode-gateway serve   Start the gateway service
-  opencode-gateway help    Show this help
+  opencode-gateway serve [--config <path>]   Start the gateway service
+  opencode-gateway help                      Show this help
 
-Phase 1 slice #1 provides the process bootstrap only. Config, database,
+Phase 1 slice #2 adds JSONC config loading and validation. Database,
 channels, and OpenCode runtime wiring are added in later slices.`);
+}
+
+type ServeOptionsResult =
+  | { ok: true; configPath?: string }
+  | { ok: false; error: string };
+
+function parseServeOptions(args: string[]): ServeOptionsResult {
+  let configPath: string | undefined;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (arg === "--config" || arg === "-c") {
+      const next = args[index + 1];
+
+      if (!next || next.startsWith("-")) {
+        return { ok: false, error: `${arg} requires a path` };
+      }
+
+      if (configPath) {
+        return { ok: false, error: "Config path was provided more than once" };
+      }
+
+      configPath = next;
+      index += 1;
+      continue;
+    }
+
+    return { ok: false, error: `Unexpected argument for serve: ${arg ?? ""}` };
+  }
+
+  return configPath ? { ok: true, configPath } : { ok: true };
 }
 
 function waitForShutdownSignal(): Promise<ShutdownSignal> {

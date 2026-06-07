@@ -1,3 +1,5 @@
+import type { GatewayConfig } from "./config/schema.ts";
+
 export type GatewayLogLevel = "info" | "warn" | "error";
 
 export interface GatewayLogEntry {
@@ -9,6 +11,7 @@ export interface GatewayLogEntry {
 
 export interface GatewayAppStatus {
   started: boolean;
+  configLoaded: boolean;
 }
 
 export interface GatewayApp {
@@ -18,6 +21,7 @@ export interface GatewayApp {
 }
 
 export interface GatewayAppOptions {
+  config?: GatewayConfig;
   logger?: (entry: GatewayLogEntry) => void;
   now?: () => Date;
 }
@@ -38,7 +42,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
 
   return {
     get status(): GatewayAppStatus {
-      return { started };
+      return { started, configLoaded: Boolean(options.config) };
     },
 
     async start(): Promise<void> {
