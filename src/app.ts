@@ -1,4 +1,8 @@
+import { getConfigSeeds } from "./config/load.ts";
 import type { GatewayConfig } from "./config/schema.ts";
+import { openGatewayDatabase, type GatewayDatabase } from "./db/client.ts";
+import { runMigrations } from "./db/migrations.ts";
+import { seedDatabaseFromConfig } from "./db/repositories/seeds.ts";
 
 export type GatewayLogLevel = "info" | "warn" | "error";
 
@@ -12,6 +16,7 @@ export interface GatewayLogEntry {
 export interface GatewayAppStatus {
   started: boolean;
   configLoaded: boolean;
+  databaseConnected: boolean;
 }
 
 export interface GatewayApp {
@@ -30,6 +35,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
   const logger = options.logger ?? defaultLogger;
   const now = options.now ?? (() => new Date());
   let started = false;
+  let database: GatewayDatabase | undefined;
 
   function log(level: GatewayLogLevel, message: string): void {
     logger({
@@ -42,11 +48,28 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
 
   return {
     get status(): GatewayAppStatus {
-      return { started, configLoaded: Boolean(options.config) };
+      return {
+        started,
+        configLoaded: Boolean(options.config),
+        databaseConnected: Boolean(database),
+      };
     },
 
     async start(): Promise<void> {
       if (started) return;
+
+      if (options.config) {
+        const openedDatabase = await openGatewayDatabase(options.config.gateway.databasePath);
+
+        try {
+          runMigrations(openedDatabase.db, now);
+          seedDatabaseFromConfig(openedDatabase.db, getConfigSeeds(options.config), now);
+          database = openedDatabase;
+        } catch (error) {
+          openedDatabase.close();
+          throw error;
+        }
+      }
 
       started = true;
       log("info", "opencode-gateway starting");
@@ -56,6 +79,8 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       if (!started) return;
 
       started = false;
+      database?.close();
+      database = undefined;
       log("info", "opencode-gateway stopped");
     },
   };
