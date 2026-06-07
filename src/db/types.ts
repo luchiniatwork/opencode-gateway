@@ -1,7 +1,9 @@
+import type { ChannelId, ConversationKey } from "../channels/types.ts";
 import type { AccessRole, BusyMode, TargetMode, Verbosity } from "../config/schema.ts";
+import type { RuntimeSessionId, RuntimeTargetId } from "../opencode/types.ts";
 
 export interface TargetRecord {
-  id: string;
+  id: RuntimeTargetId;
   name: string;
   mode: TargetMode;
   serverUrl?: string;
@@ -18,7 +20,7 @@ export interface ProfileRecord {
   displayName: string;
   description?: string;
   avatar?: string;
-  defaultTargetId: string;
+  defaultTargetId: RuntimeTargetId;
   defaultAgent?: string;
   defaultModel?: string;
   defaultConfigDir?: string;
@@ -32,12 +34,12 @@ export interface ProfileRecord {
 
 export interface ConversationBindingRecord {
   id: string;
-  conversationKey: string;
-  channel: string;
+  conversationKey: ConversationKey;
+  channel: ChannelId;
   accountId: string;
   profileId: string;
-  targetId: string;
-  opencodeSessionId: string;
+  targetId: RuntimeTargetId;
+  opencodeSessionId: RuntimeSessionId;
   sessionName?: string;
   agent?: string;
   model?: string;
@@ -49,7 +51,7 @@ export interface ConversationBindingRecord {
 
 export interface AccessRuleRecord {
   id: string;
-  channel: string;
+  channel: ChannelId;
   accountId: string;
   senderId: string;
   role: AccessRole;
@@ -60,7 +62,7 @@ export interface AccessRuleRecord {
 export interface RunRecord {
   id: string;
   bindingId: string;
-  opencodeSessionId: string;
+  opencodeSessionId: RuntimeSessionId;
   opencodeMessageId?: string;
   status: string;
   startedAt: string;
