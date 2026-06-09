@@ -120,6 +120,59 @@ test("maps assistant errors to error turns", async () => {
   expect(turn.text).toBe("Missing credentials");
 });
 
+test("sends an async prompt with a gateway-owned message id", async () => {
+  const sdk = createFakeSdkClient();
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const handle = await runtime.sendAsync({
+    target: attachTarget,
+    sessionId: "session-1",
+    text: "Inspect this repo asynchronously",
+    agent: "build",
+    model: "openai/gpt-5.5",
+  });
+
+  expect(handle.id).toStartWith("gateway-");
+  expect(handle).toMatchObject({
+    sessionId: "session-1",
+    targetId: "default",
+    status: "running",
+  });
+  expect(sdk.calls.promptAsync).toEqual([
+    {
+      path: { id: "session-1" },
+      query: { directory: "/work/repo" },
+      body: {
+        messageID: handle.id,
+        agent: "build",
+        model: { providerID: "openai", modelID: "gpt-5.5" },
+        parts: [{ type: "text", text: "Inspect this repo asynchronously" }],
+      },
+    },
+  ]);
+});
+
+test("rejects invalid async prompt model references before calling OpenCode", async () => {
+  const sdk = createFakeSdkClient();
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  await expect(
+    runtime.sendAsync({ target: attachTarget, sessionId: "session-1", text: "Hello", model: "missing-separator" }),
+  ).rejects.toThrow("OpenCode model must be formatted as <providerID>/<modelID>");
+  expect(sdk.calls.promptAsync).toEqual([]);
+});
+
+test("wraps async prompt SDK errors with an actionable message", async () => {
+  const sdk = createFakeSdkClient({
+    promptAsyncError: { data: { message: "Session is locked" } },
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  await expect(runtime.sendAsync({ target: attachTarget, sessionId: "session-1", text: "Hello" })).rejects.toThrow(
+    "Unable to send async prompt to OpenCode session session-1: Session is locked",
+  );
+});
+
 test("polls session messages when prompt returns an empty body", async () => {
   const sdk = createFakeSdkClient({
     prompt: {},
@@ -201,6 +254,21 @@ test("rejects unsupported attachments in phase 1", async () => {
   expect(sdk.calls.prompt).toEqual([]);
 });
 
+test("rejects unsupported attachments in async prompts", async () => {
+  const sdk = createFakeSdkClient();
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  await expect(
+    runtime.sendAsync({
+      target: attachTarget,
+      sessionId: "session-1",
+      text: "See attached",
+      attachments: [{ filename: "image.png", url: "https://example.com/image.png" }],
+    }),
+  ).rejects.toThrow("attachments");
+  expect(sdk.calls.promptAsync).toEqual([]);
+});
+
 test("aborts a session", async () => {
   const sdk = createFakeSdkClient();
   const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
@@ -270,6 +338,7 @@ interface FakeSdkOptions {
   getSession?: FakeSession;
   sessions?: FakeSession[];
   prompt?: FakePromptResponse;
+  promptAsyncError?: unknown;
   messages?: FakePromptResponse[];
   messageSnapshots?: FakePromptResponse[][];
 }
@@ -295,12 +364,13 @@ interface FakePromptResponse {
 }
 
 function createFakeSdkClient(options: FakeSdkOptions = {}) {
-  const calls: Record<"create" | "get" | "list" | "messages" | "prompt" | "abort", unknown[]> = {
+  const calls: Record<"create" | "get" | "list" | "messages" | "prompt" | "promptAsync" | "abort", unknown[]> = {
     create: [],
     get: [],
     list: [],
     messages: [],
     prompt: [],
+    promptAsync: [],
     abort: [],
   };
   const responses = {
@@ -337,6 +407,11 @@ function createFakeSdkClient(options: FakeSdkOptions = {}) {
         async prompt(input: unknown) {
           calls.prompt.push(input);
           return { data: responses.prompt };
+        },
+        async promptAsync(input: unknown) {
+          calls.promptAsync.push(input);
+          if (options.promptAsyncError) return { error: options.promptAsyncError };
+          return { data: undefined };
         },
         async abort(input: unknown) {
           calls.abort.push(input);

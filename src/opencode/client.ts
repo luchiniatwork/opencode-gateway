@@ -79,6 +79,7 @@ interface OpenCodeSdkClient {
     list(options?: SdkSessionOptions): Promise<SdkResult<SdkSession[]>>;
     messages?(options: SdkSessionOptions): Promise<SdkResult<SdkMessageEntry[]>>;
     prompt(options: SdkSessionOptions): Promise<SdkResult<SdkPromptResponse>>;
+    promptAsync(options: SdkSessionOptions): Promise<SdkResult<void>>;
     abort(options: SdkSessionOptions): Promise<SdkResult<boolean>>;
   };
 }
@@ -173,7 +174,34 @@ export class OpenCodeRuntime implements AgentRuntime {
   }
 
   async sendAsync(input: SendRuntimeMessageInput): Promise<RuntimeTurnHandle> {
-    throw new OpenCodeRuntimeError("OpenCodeRuntime.sendAsync is not implemented yet");
+    if (input.attachments && input.attachments.length > 0) {
+      throw new OpenCodeRuntimeError("OpenCodeRuntime does not support attachments in Phase 2");
+    }
+
+    const client = this.getClient(input.target);
+    const model = parseModelRef(input.model);
+    const messageId = createGatewayMessageId();
+    const response = await unwrapSdkVoidResult(
+      client.session.promptAsync({
+        path: { id: input.sessionId },
+        query: directoryQuery(input.target),
+        body: {
+          messageID: messageId,
+          agent: input.agent,
+          model,
+          parts: [{ type: "text", text: input.text }],
+        },
+      }),
+      `Unable to send async prompt to OpenCode session ${input.sessionId}`,
+    );
+
+    return {
+      id: messageId,
+      sessionId: input.sessionId,
+      targetId: input.target.id,
+      status: "running",
+      raw: response,
+    };
   }
 
   async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent> {
@@ -270,6 +298,28 @@ async function unwrapSdkResult<T>(resultPromise: Promise<SdkResult<T>>, message:
   }
 }
 
+async function unwrapSdkVoidResult(resultPromise: Promise<SdkResult<void>>, message: string): Promise<unknown> {
+  try {
+    const result = await resultPromise;
+
+    if (isSdkFieldsResult<void>(result)) {
+      if (result.error !== undefined) {
+        throw new OpenCodeRuntimeError(`${message}: ${formatRuntimeError(result.error)}`, {
+          cause: result.error,
+        });
+      }
+
+      return result.data;
+    }
+
+    return result;
+  } catch (error) {
+    if (error instanceof OpenCodeRuntimeError) throw error;
+
+    throw new OpenCodeRuntimeError(`${message}: ${formatRuntimeError(error)}`, { cause: error });
+  }
+}
+
 async function waitForAssistantTurn(input: {
   client: OpenCodeSdkClient;
   target: RuntimeTarget;
@@ -355,6 +405,10 @@ function noAssistantResponseText(timeoutMs: number, messages: SdkMessageEntry[])
 function sleep(ms: number): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createGatewayMessageId(): string {
+  return `gateway-${crypto.randomUUID()}`;
 }
 
 function isSdkFieldsResult<T>(value: SdkResult<T>): value is SdkFieldsResult<T> {
