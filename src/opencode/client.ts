@@ -9,10 +9,12 @@ import type {
   PermissionResponseInput,
   RuntimeEvent,
   RuntimeSession,
+  RuntimeStartedTurn,
   RuntimeTarget,
   RuntimeTurn,
   RuntimeTurnHandle,
   SendRuntimeMessageInput,
+  StartRuntimeTurnInput,
   TokenUsage,
 } from "./types.ts";
 
@@ -110,18 +112,108 @@ interface ObserveState {
   finalizedMessageIds: Set<string>;
   textPartsByMessageId: Map<string, Map<string, string>>;
   toolStatusesByCallId: Map<string, string>;
+  pendingFinal?: Extract<RuntimeEvent, { type: "final" }>;
+  pendingFinalMessageId?: string;
 }
 
 interface OpenCodeRuntimeOptions {
   createClient?: (target: RuntimeTarget) => OpenCodeSdkClient;
   finalResponseTimeoutMs?: number;
   finalResponsePollIntervalMs?: number;
+  observeReconcileIntervalMs?: number;
 }
+
+const DEFAULT_OBSERVE_RECONCILE_INTERVAL_MS = 1_000;
 
 export class OpenCodeRuntimeError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = "OpenCodeRuntimeError";
+  }
+}
+
+class RuntimeEventQueue implements AsyncIterable<RuntimeEvent> {
+  private readonly values: RuntimeEvent[] = [];
+  private readonly waiters: Array<{
+    resolve: (result: IteratorResult<RuntimeEvent>) => void;
+    reject: (error: unknown) => void;
+  }> = [];
+  private done = false;
+  private failed: unknown;
+  private cancelTask: Promise<void> | undefined;
+
+  constructor(private readonly onCancel?: () => Promise<void> | void) {}
+
+  push(event: RuntimeEvent): void {
+    if (this.done) return;
+
+    const waiter = this.waiters.shift();
+
+    if (waiter) {
+      waiter.resolve({ done: false, value: event });
+      return;
+    }
+
+    this.values.push(event);
+  }
+
+  end(): void {
+    if (this.done) return;
+
+    this.done = true;
+    this.resolveWaiters();
+  }
+
+  fail(error: unknown): void {
+    if (this.done) return;
+
+    this.done = true;
+    this.failed = error;
+    this.resolveWaiters();
+  }
+
+  async cancel(): Promise<void> {
+    if (!this.cancelTask) {
+      this.done = true;
+      this.resolveWaiters();
+      this.cancelTask = Promise.resolve(this.onCancel?.()).then(() => undefined);
+    }
+
+    await this.cancelTask;
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<RuntimeEvent> {
+    return {
+      next: () => this.next(),
+      return: async () => {
+        await this.cancel();
+        return { done: true, value: undefined };
+      },
+    };
+  }
+
+  private next(): Promise<IteratorResult<RuntimeEvent>> {
+    const value = this.values.shift();
+
+    if (value) return Promise.resolve({ done: false, value });
+    if (this.failed) return Promise.reject(this.failed);
+    if (this.done) return Promise.resolve({ done: true, value: undefined });
+
+    return new Promise((resolve, reject) => {
+      this.waiters.push({ resolve, reject });
+    });
+  }
+
+  private resolveWaiters(): void {
+    const waiters = this.waiters.splice(0, this.waiters.length);
+
+    for (const waiter of waiters) {
+      if (this.failed) {
+        waiter.reject(this.failed);
+      } else {
+        waiter.resolve({ done: true, value: undefined });
+      }
+    }
   }
 }
 
@@ -139,7 +231,7 @@ function normalizeSdkEvent(
     case "session.status":
       return normalizeSessionStatus(properties, state);
     case "session.idle":
-      return matchesSession(properties, state) ? { events: [{ type: "status", status: "idle" }], terminal: false } : noEvents();
+      return normalizeSessionIdle(properties, state);
     case "message.updated":
       return normalizeMessageUpdated(properties, state);
     case "message.part.updated":
@@ -164,12 +256,21 @@ function normalizeSessionStatus(
   const status = properties.status;
   const sdkStatus = asObject(status) ? getObjectString(asObject(status)!, "type") : typeof status === "string" ? status : undefined;
 
-  if (sdkStatus === "idle") return { events: [{ type: "status", status: "idle" }], terminal: false };
+  if (sdkStatus === "idle") return normalizeSessionIdle(properties, state);
   if (sdkStatus === "busy" || sdkStatus === "retry") {
     return { events: [{ type: "status", status: "running" }], terminal: false };
   }
 
   return noEvents();
+}
+
+function normalizeSessionIdle(
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  if (!matchesSession(properties, state)) return noEvents();
+
+  return { events: [{ type: "status", status: "idle" }], terminal: false };
 }
 
 function normalizeMessageUpdated(
@@ -193,22 +294,19 @@ function normalizeMessageUpdated(
   }
 
   const time = getObject(info, "time");
-  const completed = getObjectNumber(time, "completed") !== undefined || getObjectString(info, "finish") !== undefined;
+  const finish = getObjectString(info, "finish");
+  const completed = (getObjectNumber(time, "completed") !== undefined || finish !== undefined) && finish !== "tool-calls";
   if (!completed || !messageId || state.finalizedMessageIds.has(messageId)) return noEvents();
 
-  state.finalizedMessageIds.add(messageId);
-
-  return {
-    events: [
-      {
-        type: "final",
-        text: collectMessageText(messageId, state),
-        costUsd: getObjectNumber(info, "cost"),
-        tokens: mapTokenUsage(getObject(info, "tokens")),
-      },
-    ],
-    terminal: true,
+  state.pendingFinal = {
+    type: "final",
+    text: collectMessageText(messageId, state),
+    costUsd: getObjectNumber(info, "cost"),
+    tokens: mapTokenUsage(getObject(info, "tokens")),
   };
+  state.pendingFinalMessageId = messageId;
+
+  return noEvents();
 }
 
 function normalizeMessagePartUpdated(
@@ -398,6 +496,173 @@ async function closeEventStream(stream: AsyncIterable<unknown>): Promise<void> {
   if (typeof maybeReturn === "function") await maybeReturn.call(stream);
 }
 
+interface ObservedEventPumpInput {
+  subscription: SdkEventSubscription;
+  client: OpenCodeSdkClient;
+  target: RuntimeTarget;
+  state: ObserveState;
+  signal?: AbortSignal;
+  initialBackfill?: boolean;
+  reconcileIntervalMs: number;
+}
+
+interface ObservedEventPump {
+  events: AsyncIterable<RuntimeEvent>;
+  ready: Promise<void>;
+  cancel(): Promise<void>;
+}
+
+function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPump {
+  let closed = false;
+  let readyResolved = false;
+  let resolveReady: () => void = () => undefined;
+  const ready = new Promise<void>((resolve) => {
+    resolveReady = resolve;
+  });
+  const queue = new RuntimeEventQueue(closeOnce);
+
+  void pump();
+
+  return {
+    events: queue,
+    ready,
+    cancel: () => queue.cancel(),
+  };
+
+  function markReady(): void {
+    if (readyResolved) return;
+
+    readyResolved = true;
+    resolveReady();
+  }
+
+  async function closeOnce(): Promise<void> {
+    if (closed) return;
+
+    closed = true;
+    await closeEventStream(input.subscription.stream);
+  }
+
+  async function pump(): Promise<void> {
+    try {
+      const iterator = input.subscription.stream[Symbol.asyncIterator]();
+      let nextPromise = iterator.next();
+
+      markReady();
+
+      if (input.initialBackfill && input.state.turnId) {
+        const final = await findFinalEventFromMessages(
+          input.client,
+          input.target,
+          input.state.sessionId,
+          input.state.turnId,
+          input.state,
+        );
+
+        if (final) {
+          queue.push(final);
+          queue.end();
+          return;
+        }
+      }
+
+      while (!input.signal?.aborted) {
+        const outcome = input.state.turnId
+          ? await Promise.race([
+              nextPromise.then((result) => ({ type: "event" as const, result })),
+              sleep(Math.max(input.reconcileIntervalMs, 1)).then(() => ({ type: "reconcile" as const })),
+            ])
+          : { type: "event" as const, result: await nextPromise };
+
+        if (outcome.type === "reconcile") {
+          const final = await reconcileFinalFromMessages();
+
+          if (final) {
+            queue.push(final);
+            queue.end();
+            return;
+          }
+
+          continue;
+        }
+
+        const result = outcome.result;
+
+        if (result.done) {
+          const final = await reconcileFinalFromMessages();
+
+          if (final) {
+            queue.push(final);
+            queue.end();
+            return;
+          }
+
+          break;
+        }
+
+        nextPromise = iterator.next();
+        const terminal = await pushNormalizedEvent(result.value);
+        if (terminal) break;
+      }
+
+      queue.end();
+    } catch (error) {
+      if (!input.signal?.aborted) {
+        queue.push({ type: "error", message: `OpenCode event stream failed: ${formatRuntimeError(error)}`, retryable: true });
+      }
+
+      queue.end();
+    } finally {
+      markReady();
+      await closeOnce();
+    }
+  }
+
+  async function pushNormalizedEvent(sdkEvent: unknown): Promise<boolean> {
+    const normalized = normalizeSdkEvent(sdkEvent, input.state);
+
+    for (const event of normalized.events) {
+      if (event.type === "status" && event.status === "idle" && input.state.turnId) {
+        const final = await reconcileFinalFromMessages();
+
+        if (final) {
+          queue.push(final);
+          queue.end();
+          return true;
+        }
+      }
+
+      queue.push(event);
+    }
+
+    if (normalized.terminal) {
+      queue.end();
+      return true;
+    }
+
+    return false;
+  }
+
+  async function reconcileFinalFromMessages(): Promise<Extract<RuntimeEvent, { type: "final" }> | undefined> {
+    if (!input.state.turnId) return resolvePendingFinal(input.state);
+
+    const final = await findFinalEventFromMessages(
+      input.client,
+      input.target,
+      input.state.sessionId,
+      input.state.turnId,
+      input.state,
+    );
+
+    if (final) {
+      clearPendingFinal(input.state);
+      return final;
+    }
+
+    return resolvePendingFinal(input.state);
+  }
+}
+
 function noEvents(): { events: RuntimeEvent[]; terminal: boolean } {
   return { events: [], terminal: false };
 }
@@ -406,6 +671,7 @@ export class OpenCodeRuntime implements AgentRuntime {
   private readonly createClient: (target: RuntimeTarget) => OpenCodeSdkClient;
   private readonly finalResponseTimeoutMs: number;
   private readonly finalResponsePollIntervalMs: number;
+  private readonly observeReconcileIntervalMs: number;
   private readonly clients = new Map<string, OpenCodeSdkClient>();
 
   constructor(options: OpenCodeRuntimeOptions = {}) {
@@ -414,6 +680,7 @@ export class OpenCodeRuntime implements AgentRuntime {
       ((target) => createOpencodeClient({ baseUrl: target.serverUrl }) as OpenCodeSdkClient);
     this.finalResponseTimeoutMs = options.finalResponseTimeoutMs ?? 60_000;
     this.finalResponsePollIntervalMs = options.finalResponsePollIntervalMs ?? 1_000;
+    this.observeReconcileIntervalMs = options.observeReconcileIntervalMs ?? DEFAULT_OBSERVE_RECONCILE_INTERVAL_MS;
   }
 
   async ensureSession(input: EnsureSessionInput): Promise<RuntimeSession> {
@@ -478,6 +745,61 @@ export class OpenCodeRuntime implements AgentRuntime {
     });
   }
 
+  async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    if (input.attachments && input.attachments.length > 0) {
+      throw new OpenCodeRuntimeError("OpenCodeRuntime does not support attachments in Phase 2");
+    }
+
+    const client = this.getClient(input.target);
+    const model = parseModelRef(input.model);
+    const messageId = createGatewayMessageId();
+    let subscription: SdkEventSubscription;
+
+    try {
+      subscription = await this.subscribeToEvents(client, input.target, input.signal);
+    } catch (error) {
+      throw new OpenCodeRuntimeError(
+        `Unable to observe OpenCode events before async prompt to OpenCode session ${input.sessionId}: ${formatRuntimeError(error)}`,
+        { cause: error },
+      );
+    }
+
+    const observed = startObservedEventPump({
+      subscription,
+      client,
+      target: input.target,
+      state: createObserveState(input.sessionId, messageId),
+      signal: input.signal,
+      reconcileIntervalMs: this.observeReconcileIntervalMs,
+    });
+
+    await observed.ready;
+
+    try {
+      const response = await unwrapSdkVoidResult(
+        client.session.promptAsync({
+          path: { id: input.sessionId },
+          query: directoryQuery(input.target),
+          body: {
+            messageID: messageId,
+            agent: input.agent,
+            model,
+            parts: [{ type: "text", text: input.text }],
+          },
+        }),
+        `Unable to send async prompt to OpenCode session ${input.sessionId}`,
+      );
+
+      return {
+        handle: createRuntimeTurnHandle(input, messageId, response),
+        events: observed.events,
+      };
+    } catch (error) {
+      await observed.cancel();
+      throw error;
+    }
+  }
+
   async sendAsync(input: SendRuntimeMessageInput): Promise<RuntimeTurnHandle> {
     if (input.attachments && input.attachments.length > 0) {
       throw new OpenCodeRuntimeError("OpenCodeRuntime does not support attachments in Phase 2");
@@ -500,13 +822,7 @@ export class OpenCodeRuntime implements AgentRuntime {
       `Unable to send async prompt to OpenCode session ${input.sessionId}`,
     );
 
-    return {
-      id: messageId,
-      sessionId: input.sessionId,
-      targetId: input.target.id,
-      status: "running",
-      raw: response,
-    };
+    return createRuntimeTurnHandle(input, messageId, response);
   }
 
   async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent> {
@@ -517,10 +833,7 @@ export class OpenCodeRuntime implements AgentRuntime {
     let subscription: SdkEventSubscription;
 
     try {
-      subscription = await client.event.subscribe({
-        query: directoryQuery(input.target),
-        signal: input.signal,
-      });
+      subscription = await this.subscribeToEvents(client, input.target, input.signal);
     } catch (error) {
       if (!input.signal?.aborted) {
         yield { type: "error", message: `Unable to observe OpenCode events: ${formatRuntimeError(error)}`, retryable: true };
@@ -528,34 +841,36 @@ export class OpenCodeRuntime implements AgentRuntime {
       return;
     }
 
-    const state: ObserveState = {
-      sessionId: input.sessionId,
-      turnId: input.turnId,
-      assistantMessageIds: new Set(),
-      finalizedMessageIds: new Set(),
-      textPartsByMessageId: new Map(),
-      toolStatusesByCallId: new Map(),
-    };
+    const observed = startObservedEventPump({
+      subscription,
+      client,
+      target: input.target,
+      state: createObserveState(input.sessionId, input.turnId),
+      signal: input.signal,
+      initialBackfill: true,
+      reconcileIntervalMs: this.observeReconcileIntervalMs,
+    });
 
     try {
-      for await (const sdkEvent of subscription.stream) {
-        if (input.signal?.aborted) return;
+      await observed.ready;
 
-        const normalized = normalizeSdkEvent(sdkEvent, state);
-
-        for (const event of normalized.events) {
-          yield event;
-        }
-
-        if (normalized.terminal) return;
-      }
-    } catch (error) {
-      if (!input.signal?.aborted) {
-        yield { type: "error", message: `OpenCode event stream failed: ${formatRuntimeError(error)}`, retryable: true };
+      for await (const event of observed.events) {
+        yield event;
       }
     } finally {
-      await closeEventStream(subscription.stream);
+      await observed.cancel();
     }
+  }
+
+  private async subscribeToEvents(
+    client: OpenCodeSdkClient,
+    target: RuntimeTarget,
+    signal: AbortSignal | undefined,
+  ): Promise<SdkEventSubscription> {
+    return client.event.subscribe({
+      query: directoryQuery(target),
+      signal,
+    });
   }
 
   async abort(input: AbortRuntimeTurnInput): Promise<void> {
@@ -600,6 +915,71 @@ export class OpenCodeRuntime implements AgentRuntime {
     this.clients.set(key, client);
     return client;
   }
+}
+
+async function findFinalEventFromMessages(
+  client: OpenCodeSdkClient,
+  target: RuntimeTarget,
+  sessionId: string,
+  turnId: string,
+  state: ObserveState,
+): Promise<Extract<RuntimeEvent, { type: "final" }> | undefined> {
+  const messages = await listMessages(client, target, sessionId).catch(() => []);
+  let matchingCompleted = messages.filter(
+    (message) => message.info?.role === "assistant" && message.info.parentID === turnId && isCompletedAssistantMessage(message.info),
+  );
+
+  if (matchingCompleted.length === 0) {
+    const turnIndex = messages.findIndex((message) => message.info?.role === "user" && message.info.id === turnId);
+
+    if (turnIndex >= 0) {
+      matchingCompleted = messages
+        .slice(turnIndex + 1)
+        .filter((message) => message.info?.role === "assistant" && isCompletedAssistantMessage(message.info));
+    }
+  }
+
+  const assistant = [...matchingCompleted].reverse().find((message) => finalAssistantText(message).trim().length > 0) ?? matchingCompleted.at(-1);
+
+  if (!assistant?.info?.id || state.finalizedMessageIds.has(assistant.info.id)) return undefined;
+
+  state.finalizedMessageIds.add(assistant.info.id);
+
+  return {
+    type: "final",
+    text: finalAssistantText(assistant),
+    costUsd: assistant.info.cost,
+    tokens: mapTokenUsage(assistant.info.tokens),
+  };
+}
+
+function resolvePendingFinal(state: ObserveState): Extract<RuntimeEvent, { type: "final" }> | undefined {
+  const pending = state.pendingFinal;
+  const messageId = state.pendingFinalMessageId;
+
+  if (!pending || !messageId || state.finalizedMessageIds.has(messageId)) return undefined;
+  if (!pending.text.trim()) return undefined;
+
+  state.finalizedMessageIds.add(messageId);
+  clearPendingFinal(state);
+
+  return pending;
+}
+
+function clearPendingFinal(state: ObserveState): void {
+  state.pendingFinal = undefined;
+  state.pendingFinalMessageId = undefined;
+}
+
+function isCompletedAssistantMessage(info: SdkAssistantMessage | undefined): boolean {
+  if (!info) return false;
+  if (info.finish === "tool-calls") return false;
+
+  return info.time?.completed !== undefined || info.finish !== undefined;
+}
+
+function finalAssistantText(message: SdkMessageEntry): string {
+  return extractAssistantText(message.parts ?? []);
 }
 
 function validateAttachTarget(target: RuntimeTarget): void {
@@ -758,7 +1138,32 @@ function sleep(ms: number): Promise<void> {
 }
 
 function createGatewayMessageId(): string {
-  return `gateway-${crypto.randomUUID()}`;
+  return `msg_${crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function createObserveState(sessionId: string, turnId: string | undefined): ObserveState {
+  return {
+    sessionId,
+    turnId,
+    assistantMessageIds: new Set(),
+    finalizedMessageIds: new Set(),
+    textPartsByMessageId: new Map(),
+    toolStatusesByCallId: new Map(),
+  };
+}
+
+function createRuntimeTurnHandle(
+  input: Pick<SendRuntimeMessageInput, "sessionId" | "target">,
+  messageId: string,
+  raw: unknown,
+): RuntimeTurnHandle {
+  return {
+    id: messageId,
+    sessionId: input.sessionId,
+    targetId: input.target.id,
+    status: "running",
+    raw,
+  };
 }
 
 function isSdkFieldsResult<T>(value: SdkResult<T>): value is SdkFieldsResult<T> {

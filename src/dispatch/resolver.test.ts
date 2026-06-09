@@ -18,8 +18,10 @@ import type {
   ObserveRuntimeTurnInput,
   PermissionResponseInput,
   RuntimeSession,
+  RuntimeStartedTurn,
   RuntimeTurn,
   SendRuntimeMessageInput,
+  StartRuntimeTurnInput,
 } from "../opencode/types.ts";
 import { createDispatchResolver, type DispatchResolver } from "./resolver.ts";
 
@@ -461,6 +463,10 @@ class FakeRuntime implements AgentRuntime {
 
   async sendAsync(input: SendRuntimeMessageInput): Promise<never> {
     throw new Error("FakeRuntime.sendAsync is not implemented in Phase 1 tests");
+  }
+
+  async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    throw new Error("FakeRuntime.startTurn is not implemented in resolver tests");
   }
 
   async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<never> {

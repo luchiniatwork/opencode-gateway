@@ -71,6 +71,7 @@
             packages = with pkgs; [
               bun
               opencode
+              sqlite
             ];
 
             shellHook = ''

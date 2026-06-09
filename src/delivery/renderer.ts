@@ -35,7 +35,7 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
   let task = Promise.resolve();
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  if (options.verbosity !== "off") {
+  if (options.verbosity !== "off" && options.verbosity !== "compact") {
     timer = setTimeout(() => {
       timer = undefined;
       void enqueueFlush();
@@ -52,7 +52,7 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
       detailLines.push(line);
       trimDetailLines(detailLines, options.verbosity);
 
-      if (receipt) {
+      if (receipt || !timer) {
         await enqueueFlush();
       }
     },
@@ -85,7 +85,7 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
   }
 
   async function flushProgress(): Promise<void> {
-    if (finalized || options.verbosity === "off") return;
+    if (finalized || options.verbosity === "off" || options.verbosity === "compact") return;
 
     const message = progressMessage();
     if (!message) return;
@@ -123,7 +123,7 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
   }
 
   function progressMessage(): OutboundMessage | undefined {
-    const lines = ["Working on it...", ...detailLines];
+    const lines = detailLines;
     const text = lines.join("\n").trim();
 
     if (!text) return undefined;

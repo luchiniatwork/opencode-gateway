@@ -15,6 +15,11 @@ import type {
   TypingState,
 } from "./channels/types.ts";
 import type { GatewayConfig } from "./config/schema.ts";
+import { openGatewayDatabase } from "./db/client.ts";
+import { runMigrations } from "./db/migrations.ts";
+import { createConversationBindingRepository } from "./db/repositories/conversation-bindings.ts";
+import { createRunRepository } from "./db/repositories/runs.ts";
+import { seedDatabaseFromConfig } from "./db/repositories/seeds.ts";
 import type { OutboundMessage } from "./messages/types.ts";
 import type {
   AbortRuntimeTurnInput,
@@ -25,9 +30,11 @@ import type {
   PermissionResponseInput,
   RuntimeEvent,
   RuntimeSession,
+  RuntimeStartedTurn,
   RuntimeTurn,
   RuntimeTurnHandle,
   SendRuntimeMessageInput,
+  StartRuntimeTurnInput,
 } from "./opencode/types.ts";
 
 test("gateway app starts and stops idempotently", async () => {
@@ -164,6 +171,33 @@ test("gateway app dispatches non-command messages to OpenCode and sends final re
         },
       },
     ]);
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app accepts a second message after the first async turn completes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new FakeRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await waitForSent(channel, 1);
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await waitForSent(channel, 2);
+
+    expect(runtime.calls.sendAsync.map((call) => call.text)).toEqual(["first", "second"]);
+    expect(channel.sent.map((entry) => entry.message.text)).toEqual(["answer-1", "answer-2"]);
   } finally {
     await app.stop();
     await rm(dir, { recursive: true, force: true });
@@ -321,6 +355,70 @@ test("gateway app reuses persisted session binding after restart", async () => {
     }
   } finally {
     await firstApp.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app marks stale active runs aborted on startup", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const databasePath = join(dir, "state.db");
+  const config = testConfig(databasePath);
+  const database = await openGatewayDatabase(databasePath);
+
+  try {
+    runMigrations(database.db, fixedNow);
+    seedDatabaseFromConfig(
+      database.db,
+      {
+        targets: config.opencode.targets,
+        profiles: config.profiles.entries,
+        accessRules: [{ channel: "telegram", accountId: "default", senderId: "123", role: "owner" }],
+      },
+      fixedNow,
+    );
+
+    const bindings = createConversationBindingRepository(database.db, { now: fixedNow, createId: () => "binding-1" });
+    const runs = createRunRepository(database.db, { now: fixedNow, createId: () => "run-1" });
+    const binding = bindings.upsert({
+      conversationKey,
+      channel: "telegram",
+      accountId: "default",
+      profileId: "cto",
+      targetId: "default",
+      opencodeSessionId: "session-stale",
+      busyMode: "queue",
+      verbosity: "compact",
+    });
+
+    runs.create({ bindingId: binding.id, opencodeSessionId: "session-stale", opencodeMessageId: "message-stale" });
+    database.close();
+
+    const channel = new FakeChannel();
+    const app = createApp({
+      config,
+      runtime: new FakeRuntime(),
+      channels: [fakeRegistration(channel)],
+      logger: () => undefined,
+      now: fixedNow,
+    });
+
+    try {
+      await app.start();
+    } finally {
+      await app.stop();
+    }
+
+    const verified = await openGatewayDatabase(databasePath);
+
+    try {
+      expect(
+        verified.db.query("SELECT status, error FROM runs WHERE id = 'run-1'").get(),
+      ).toEqual({ status: "aborted", error: "Gateway restarted before observing a final response." });
+    } finally {
+      verified.close();
+    }
+  } finally {
+    database.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -601,6 +699,20 @@ class FakeRuntime implements AgentRuntime {
       sessionId: input.sessionId,
       targetId: input.target.id,
       status: "running",
+    };
+  }
+
+  async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    const handle = await this.sendAsync(input);
+
+    return {
+      handle,
+      events: this.observe({
+        target: input.target,
+        sessionId: input.sessionId,
+        turnId: handle.id,
+        signal: input.signal,
+      }),
     };
   }
 

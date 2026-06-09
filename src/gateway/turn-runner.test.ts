@@ -20,9 +20,11 @@ import type {
   PermissionResponseInput,
   RuntimeEvent,
   RuntimeSession,
+  RuntimeStartedTurn,
   RuntimeTurn,
   RuntimeTurnHandle,
   SendRuntimeMessageInput,
+  StartRuntimeTurnInput,
 } from "../opencode/types.ts";
 import { createTurnRunner } from "./turn-runner.ts";
 
@@ -132,7 +134,71 @@ test("turn runner aborts the active async turn and cancels observation", async (
   }
 });
 
-test("turn runner sends compact progress after the configured delay", async () => {
+test("turn runner times out async turns without a final response", async () => {
+  const harness = await createHarness({ waitForAbort: true, runTimeoutMs: 1 });
+
+  try {
+    await harness.runner.start({
+      message: inboundMessage(),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForDeliveries(harness.deliveries, 1);
+
+    expect(harness.deliveries).toEqual([
+      {
+        kind: "error",
+        format: "plain",
+        text: "OpenCode error: OpenCode did not produce a final response within 1ms.",
+      },
+    ]);
+    expect(runRows(harness.database)).toEqual([
+      {
+        id: "run-1",
+        status: "error",
+        opencode_message_id: "message-1",
+        error: "OpenCode did not produce a final response within 1ms.",
+      },
+    ]);
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
+test("turn runner timeout completes even if observe never resolves", async () => {
+  const harness = await createHarness({ neverResolveObserve: true, runTimeoutMs: 1 });
+
+  try {
+    await harness.runner.start({
+      message: inboundMessage(),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForDeliveries(harness.deliveries, 1);
+
+    expect(harness.deliveries).toEqual([
+      {
+        kind: "error",
+        format: "plain",
+        text: "OpenCode error: OpenCode did not produce a final response within 1ms.",
+      },
+    ]);
+    expect(runRows(harness.database)).toEqual([
+      {
+        id: "run-1",
+        status: "error",
+        opencode_message_id: "message-1",
+        error: "OpenCode did not produce a final response within 1ms.",
+      },
+    ]);
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
+test("turn runner sends no compact progress before final response", async () => {
   const harness = await createHarness({
     events: [{ type: "status", status: "running" }, { type: "final", text: "done" }],
     eventDelayMs: 5,
@@ -145,10 +211,9 @@ test("turn runner sends compact progress after the configured delay", async () =
       resolution: harness.resolution,
       delivery: harness.delivery,
     });
-    await waitForDeliveries(harness.deliveries, 2);
+    await waitForDeliveries(harness.deliveries, 1);
 
     expect(harness.deliveries).toEqual([
-      { kind: "progress", format: "plain", text: "Working on it..." },
       { kind: "final", format: "markdown", text: "done" },
     ]);
   } finally {
@@ -181,7 +246,7 @@ test("turn runner renders tool progress for tools verbosity", async () => {
       {
         kind: "progress",
         format: "plain",
-        text: "Working on it...\nTool bash started: Run tests",
+        text: "Tool bash started: Run tests",
       },
       { kind: "progress", format: "plain", text: "Tool bash completed: Passed" },
       { kind: "final", format: "markdown", text: "done" },
@@ -196,8 +261,10 @@ interface HarnessOptions {
   events?: RuntimeEvent[];
   sendAsyncError?: Error;
   waitForAbort?: boolean;
+  neverResolveObserve?: boolean;
   eventDelayMs?: number;
   progressDelayMs?: number;
+  runTimeoutMs?: number;
   verbosity?: "off" | "compact" | "tools" | "verbose";
 }
 
@@ -252,7 +319,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
   const target = requireRecord(targets.getById("default"), "target");
   const runtime = new FakeRuntime(options);
   const deliveries: OutboundMessage[] = [];
-  const runner = createTurnRunner({ runtime, runs, progressDelayMs: options.progressDelayMs });
+  const runner = createTurnRunner({ runtime, runs, progressDelayMs: options.progressDelayMs, runTimeoutMs: options.runTimeoutMs });
 
   return {
     database,
@@ -379,12 +446,14 @@ class FakeRuntime implements AgentRuntime {
   private readonly events: RuntimeEvent[];
   private readonly sendAsyncError: Error | undefined;
   private readonly waitForAbort: boolean;
+  private readonly neverResolveObserve: boolean;
   private readonly eventDelayMs: number;
 
   constructor(options: HarnessOptions) {
     this.events = options.events ?? [];
     this.sendAsyncError = options.sendAsyncError;
     this.waitForAbort = options.waitForAbort ?? false;
+    this.neverResolveObserve = options.neverResolveObserve ?? false;
     this.eventDelayMs = options.eventDelayMs ?? 0;
   }
 
@@ -409,6 +478,20 @@ class FakeRuntime implements AgentRuntime {
     };
   }
 
+  async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    const handle = await this.sendAsync(input);
+
+    return {
+      handle,
+      events: this.observe({
+        target: input.target,
+        sessionId: input.sessionId,
+        turnId: handle.id,
+        signal: input.signal,
+      }),
+    };
+  }
+
   async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent> {
     this.calls.observe.push(input);
 
@@ -416,6 +499,11 @@ class FakeRuntime implements AgentRuntime {
       await new Promise<void>((resolve) => {
         input.signal?.addEventListener("abort", () => resolve(), { once: true });
       });
+      return;
+    }
+
+    if (this.neverResolveObserve) {
+      await new Promise<void>(() => undefined);
       return;
     }
 

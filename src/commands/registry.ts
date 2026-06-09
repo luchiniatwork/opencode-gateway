@@ -123,6 +123,10 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
   }
 
   async function resetText(message: InboundMessage, commandName: string): Promise<string> {
+    const stopped = await stopActiveRunForRebind(message);
+
+    if (stopped?.status === "error") return stopped.message;
+
     const result = await resolver.resetSession(message);
 
     if (result.status === "denied") return deniedDecisionText(result.decision.reason);
@@ -130,6 +134,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
     if (result.status === "error") return `Unable to create a new session: ${result.error}`;
 
     return [
+      stopped?.message,
       commandName === "new" ? "Created a new OpenCode session." : "Reset this conversation to a new OpenCode session.",
       result.previousSessionId ? `Previous session: ${result.previousSessionId}` : undefined,
       `Current session: ${result.session.id}`,
@@ -163,9 +168,42 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       if (result.status === "no_active_run") return "No active run for this conversation.";
       if (result.status === "error") return `Unable to stop active run ${result.run.id}: ${result.error}`;
 
-      return `Stopped active run ${result.run.id} for session ${binding.opencodeSessionId}.`;
+      return `Stopped active run ${result.run.id} for session ${result.run.opencodeSessionId}.`;
     } catch (error) {
       return `Unable to stop active run ${run.id}: ${formatError(error)}`;
+    }
+  }
+
+  async function stopActiveRunForRebind(
+    message: InboundMessage,
+  ): Promise<{ status: "stopped"; message: string } | { status: "error"; message: string } | undefined> {
+    const binding = repositories.bindings.getByConversationKey(message.conversation.key);
+    if (!binding) return undefined;
+
+    const run = repositories.runs.getActiveByBindingId(binding.id);
+    if (!run) return undefined;
+
+    const target = repositories.targets.getById(binding.targetId);
+    if (!target) return { status: "error", message: `OpenCode target not found: ${binding.targetId}` };
+
+    try {
+      const result = await turnRunner.abortActive({
+        binding,
+        target,
+        reason: "Stopped by gateway session reset command",
+      });
+
+      if (result.status === "no_active_run") return undefined;
+      if (result.status === "error") {
+        return { status: "error", message: `Unable to stop active run ${result.run.id}: ${result.error}` };
+      }
+
+      return {
+        status: "stopped",
+        message: `Stopped active run ${result.run.id} for session ${result.run.opencodeSessionId}.`,
+      };
+    } catch (error) {
+      return { status: "error", message: `Unable to stop active run ${run.id}: ${formatError(error)}` };
     }
   }
 

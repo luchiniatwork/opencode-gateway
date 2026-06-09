@@ -61,6 +61,11 @@ export interface RuntimeTurnHandle {
   raw?: unknown;
 }
 
+export interface RuntimeStartedTurn {
+  handle: RuntimeTurnHandle;
+  events: AsyncIterable<RuntimeEvent>;
+}
+
 export interface EnsureSessionInput {
   target: RuntimeTarget;
   sessionId?: RuntimeSessionId;
@@ -79,6 +84,10 @@ export interface SendRuntimeMessageInput {
   agent?: string;
   model?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface StartRuntimeTurnInput extends SendRuntimeMessageInput {
+  signal?: AbortSignal;
 }
 
 export interface AbortRuntimeTurnInput {
@@ -123,6 +132,7 @@ export type RuntimeEvent =
 export interface AgentRuntime {
   ensureSession(input: EnsureSessionInput): Promise<RuntimeSession>;
   send(input: SendRuntimeMessageInput): Promise<RuntimeTurn>;
+  startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn>;
   sendAsync(input: SendRuntimeMessageInput): Promise<RuntimeTurnHandle>;
   observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent>;
   abort(input: AbortRuntimeTurnInput): Promise<void>;

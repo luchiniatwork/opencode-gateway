@@ -130,6 +130,18 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
             targets: createTargetRepository(openedDatabase.db, now),
             runs: createRunRepository(openedDatabase.db, { now }),
           };
+          const staleRuns = repositories.runs.finishAllActive({
+            status: "aborted",
+            error: "Gateway restarted before observing a final response.",
+          });
+
+          if (staleRuns.length > 0) {
+            log("warn", "stale active runs marked aborted", {
+              count: staleRuns.length,
+              runIds: staleRuns.map((run) => run.id),
+            });
+          }
+
           const runtime = options.runtime ?? new OpenCodeRuntime();
           const resolver = createDispatchResolver({ config: options.config, repositories, runtime });
           turnRunner = createTurnRunner({ runtime, runs: repositories.runs, log });
@@ -478,14 +490,22 @@ function turnStartMessages(result: StartTurnResult): OutboundMessage[] {
   switch (result.status) {
     case "started":
       return [];
-    case "busy":
+    case "busy": {
+      const activeSessionId = result.run.opencodeSessionId;
+      const currentSessionId = result.resolution.binding.opencodeSessionId;
+      const sessionText =
+        activeSessionId === currentSessionId
+          ? `Session ${currentSessionId} is busy.`
+          : `Session ${currentSessionId} is blocked by active run ${result.run.id} from previous session ${activeSessionId}.`;
+
       return [
         {
           kind: "status",
           format: "plain",
-          text: `Session ${result.resolution.binding.opencodeSessionId} is busy. Use /stop to abort the active run.`,
+          text: `${sessionText} Use /stop to abort the active run.`,
         },
       ];
+    }
     case "error":
       return [
         {

@@ -16,17 +16,15 @@ test("progress renderer sends no progress in off verbosity", async () => {
   expect(harness.edited).toEqual([]);
 });
 
-test("progress renderer sends compact working acknowledgement after delay", async () => {
+test("progress renderer sends no generic acknowledgement in compact verbosity", async () => {
   const harness = createHarness();
   const renderer = createProgressRenderer({ verbosity: "compact", delayMs: 1, ...harness.delivery });
 
   await renderer.handle({ type: "text_delta", text: "ignored" });
-  await waitFor(() => harness.sent.length === 1);
+  await Bun.sleep(5);
   await renderer.finalize();
 
-  expect(harness.sent.map((entry) => entry.message)).toEqual([
-    { kind: "progress", format: "plain", text: "Working on it..." },
-  ]);
+  expect(harness.sent).toEqual([]);
   expect(harness.edited).toEqual([]);
 });
 
@@ -45,15 +43,14 @@ test("progress renderer edits one progress message when editing is available", a
   const harness = createHarness({ edit: true });
   const renderer = createProgressRenderer({ verbosity: "tools", delayMs: 1, ...harness.delivery });
 
-  await waitFor(() => harness.sent.length === 1);
   await renderer.handle({ type: "tool_start", id: "tool-1", name: "bash", summary: "Run tests" });
+  await waitFor(() => harness.sent.length === 1);
   await renderer.handle({ type: "tool_end", id: "tool-1", name: "bash", ok: true, summary: "Passed" });
   await renderer.finalize();
 
-  expect(harness.sent.map((entry) => entry.message.text)).toEqual(["Working on it..."]);
+  expect(harness.sent.map((entry) => entry.message.text)).toEqual(["Tool bash started: Run tests"]);
   expect(harness.edited.map((entry) => entry.message.text)).toEqual([
-    "Working on it...\nTool bash started: Run tests",
-    "Working on it...\nTool bash started: Run tests\nTool bash completed: Passed",
+    "Tool bash started: Run tests\nTool bash completed: Passed",
   ]);
 });
 
@@ -61,13 +58,12 @@ test("progress renderer falls back to sparse progress sends without editing", as
   const harness = createHarness();
   const renderer = createProgressRenderer({ verbosity: "tools", delayMs: 1, ...harness.delivery });
 
-  await waitFor(() => harness.sent.length === 1);
   await renderer.handle({ type: "tool_start", id: "tool-1", name: "bash", summary: "Run tests" });
+  await waitFor(() => harness.sent.length === 1);
   await renderer.handle({ type: "tool_end", id: "tool-1", name: "bash", ok: false });
   await renderer.finalize();
 
   expect(harness.sent.map((entry) => entry.message.text)).toEqual([
-    "Working on it...",
     "Tool bash started: Run tests",
     "Tool bash failed",
   ]);
@@ -77,13 +73,13 @@ test("progress renderer includes verbose status and tool updates", async () => {
   const harness = createHarness({ edit: true });
   const renderer = createProgressRenderer({ verbosity: "verbose", delayMs: 1, ...harness.delivery });
 
-  await waitFor(() => harness.sent.length === 1);
   await renderer.handle({ type: "status", status: "running" });
+  await waitFor(() => harness.sent.length === 1);
   await renderer.handle({ type: "tool_update", id: "tool-1", name: "bash", summary: "Still running" });
   await renderer.finalize();
 
   expect(harness.edited.at(-1)?.message.text).toBe(
-    "Working on it...\nStatus: running\nTool bash updated: Still running",
+    "Status: running\nTool bash updated: Still running",
   );
 });
 

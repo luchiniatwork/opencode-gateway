@@ -11,6 +11,7 @@ export interface TurnRunnerOptions {
   runtime: AgentRuntime;
   runs: RunRepository;
   progressDelayMs?: number;
+  runTimeoutMs?: number;
   log?: (level: GatewayLogLevel, message: string, context?: GatewayLogContext) => void;
 }
 
@@ -53,6 +54,7 @@ interface ActiveObserver {
 
 export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
   const { runtime, runs } = options;
+  const runTimeoutMs = options.runTimeoutMs ?? 5 * 60_000;
   const activeByRunId = new Map<string, ActiveObserver>();
   const activeRunIdByBindingId = new Map<string, string>();
 
@@ -75,8 +77,13 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
 
       log("info", "async run created", baseContext);
 
+      const controller = new AbortController();
+      const abortFromParent = () => controller.abort();
+
+      input.signal?.addEventListener("abort", abortFromParent, { once: true });
+
       try {
-        const handle = await runtime.sendAsync({
+        const started = await runtime.startTurn({
           target: resolution.target,
           sessionId: resolution.binding.opencodeSessionId,
           text: message.text,
@@ -84,14 +91,27 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
           agent: resolution.agent,
           model: resolution.model,
           metadata: messageMetadata(message),
+          signal: controller.signal,
         });
+        const { handle } = started;
         const runWithMessage = runs.setOpenCodeMessageId(run.id, handle.id) ?? { ...run, opencodeMessageId: handle.id };
 
         log("info", "async run accepted", { ...baseContext, opencodeMessageId: handle.id });
-        observeRun({ ...input, run: runWithMessage, handle });
+        observeRun({
+          ...input,
+          run: runWithMessage,
+          handle,
+          events: started.events,
+          controller,
+          cleanupParentSignal: () => {
+            input.signal?.removeEventListener("abort", abortFromParent);
+          },
+        });
 
         return { status: "started", resolution, run: runWithMessage, handle };
       } catch (error) {
+        input.signal?.removeEventListener("abort", abortFromParent);
+        controller.abort();
         const messageText = formatError(error);
         const finishedRun = runs.finishIfActive({ id: run.id, status: "error", error: messageText }) ?? run;
 
@@ -109,7 +129,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       try {
         await runtime.abort({
           target: input.target,
-          sessionId: input.binding.opencodeSessionId,
+          sessionId: run.opencodeSessionId,
           turnId: run.opencodeMessageId,
           reason: input.reason,
         });
@@ -119,7 +139,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         log("info", "async run aborted", {
           source: "channel",
           targetId: input.target.id,
-          sessionId: input.binding.opencodeSessionId,
+          sessionId: run.opencodeSessionId,
           runId: run.id,
           opencodeMessageId: run.opencodeMessageId,
         });
@@ -131,7 +151,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         log("error", "async run abort failed", {
           source: "channel",
           targetId: input.target.id,
-          sessionId: input.binding.opencodeSessionId,
+          sessionId: run.opencodeSessionId,
           runId: run.id,
           opencodeMessageId: run.opencodeMessageId,
           error: messageText,
@@ -152,18 +172,21 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     },
   };
 
-  function observeRun(input: StartTurnInput & { run: RunRecord; handle: RuntimeTurnHandle }): void {
-    const controller = new AbortController();
-    const abortFromParent = () => controller.abort();
-
-    input.signal?.addEventListener("abort", abortFromParent, { once: true });
-
+  function observeRun(
+    input: StartTurnInput & {
+      run: RunRecord;
+      handle: RuntimeTurnHandle;
+      events: AsyncIterable<RuntimeEvent>;
+      controller: AbortController;
+      cleanupParentSignal: () => void;
+    },
+  ): void {
     const observer: ActiveObserver = {
       runId: input.run.id,
       bindingId: input.resolution.binding.id,
-      controller,
+      controller: input.controller,
       cleanup() {
-        input.signal?.removeEventListener("abort", abortFromParent);
+        input.cleanupParentSignal();
         activeByRunId.delete(input.run.id);
         if (activeRunIdByBindingId.get(input.resolution.binding.id) === input.run.id) {
           activeRunIdByBindingId.delete(input.resolution.binding.id);
@@ -172,7 +195,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       task: Promise.resolve(),
     };
 
-    const task = runObserver(input, controller.signal).finally(() => observer.cleanup());
+    const task = runObserver(input, input.controller.signal).finally(() => observer.cleanup());
     observer.task = task;
     activeByRunId.set(input.run.id, observer);
     activeRunIdByBindingId.set(input.resolution.binding.id, input.run.id);
@@ -183,7 +206,10 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     });
   }
 
-  async function runObserver(input: StartTurnInput & { run: RunRecord; handle: RuntimeTurnHandle }, signal: AbortSignal): Promise<void> {
+  async function runObserver(
+    input: StartTurnInput & { run: RunRecord; handle: RuntimeTurnHandle; events: AsyncIterable<RuntimeEvent> },
+    signal: AbortSignal,
+  ): Promise<void> {
     const context = {
       ...runLogContext(input.message, input.resolution, input.run),
       opencodeMessageId: input.handle.id,
@@ -200,21 +226,30 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         log("error", "async run progress failed", { ...context, error: formatError(error) });
       },
     });
+    let timedOut = false;
+    let timeoutTask = Promise.resolve();
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      timeoutTask = finishTimedOutRun(input, context, progress);
+      activeByRunId.get(input.run.id)?.controller.abort();
+      activeByRunId.delete(input.run.id);
+      if (activeRunIdByBindingId.get(input.resolution.binding.id) === input.run.id) {
+        activeRunIdByBindingId.delete(input.resolution.binding.id);
+      }
+    }, runTimeoutMs);
 
     try {
-      for await (const event of runtime.observe({
-        target: input.resolution.target,
-        sessionId: input.resolution.binding.opencodeSessionId,
-        turnId: input.handle.id,
-        signal,
-      })) {
+      for await (const event of input.events) {
+        if (timedOut) return;
         if (signal.aborted) return;
 
         const terminal = await handleRuntimeEvent(event, input, context, progress);
         if (terminal) return;
       }
 
-      if (!signal.aborted) {
+      if (timedOut) {
+        await timeoutTask;
+      } else if (!signal.aborted) {
         await progress.finalize();
         const messageText = "OpenCode event stream ended before a final response.";
         runs.finishIfActive({ id: input.run.id, status: "error", error: messageText, opencodeMessageId: input.handle.id });
@@ -222,6 +257,11 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         log("error", "async run observer ended without final", { ...context, error: messageText });
       }
     } catch (error) {
+      if (timedOut) {
+        await timeoutTask;
+        return;
+      }
+
       if (signal.aborted) return;
 
       const messageText = formatError(error);
@@ -230,9 +270,26 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${messageText}` }, context);
       log("error", "async run observer failed", { ...context, error: messageText });
     } finally {
+      clearTimeout(timeout);
+      await timeoutTask.catch((error) => log("error", "async run timeout handling failed", { ...context, error: formatError(error) }));
       progress.cancel();
       log("info", "async run observer stopped", context);
     }
+  }
+
+  async function finishTimedOutRun(
+    input: StartTurnInput & { run: RunRecord; handle: RuntimeTurnHandle },
+    context: GatewayLogContext,
+    progress: ProgressRenderer,
+  ): Promise<void> {
+    const messageText = `OpenCode did not produce a final response within ${runTimeoutMs}ms.`;
+
+    await progress.finalize();
+    const finished = runs.finishIfActive({ id: input.run.id, status: "error", error: messageText, opencodeMessageId: input.handle.id });
+    if (!finished) return;
+
+    await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${messageText}` }, context);
+    log("error", "async run timed out", { ...context, error: messageText });
   }
 
   async function handleRuntimeEvent(

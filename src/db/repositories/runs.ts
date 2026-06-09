@@ -35,6 +35,7 @@ export interface RunRepository {
   setOpenCodeMessageId(id: string, opencodeMessageId: string): RunRecord | undefined;
   finish(input: FinishRunInput): RunRecord | undefined;
   finishIfActive(input: FinishRunInput): RunRecord | undefined;
+  finishAllActive(input: Omit<FinishRunInput, "id" | "opencodeMessageId">): RunRecord[];
   markAborted(id: string): RunRecord | undefined;
 }
 
@@ -135,6 +136,21 @@ export function createRunRepository(
         ) as RunRow | null;
 
       return row ? mapRunRow(row) : undefined;
+    },
+
+    finishAllActive(input): RunRecord[] {
+      const rows = db
+        .query(
+          `UPDATE runs SET
+            status = ?,
+            error = ?,
+            finished_at = ?
+          WHERE status = 'active'
+          RETURNING *`,
+        )
+        .all(input.status, input.error ?? null, now().toISOString()) as RunRow[];
+
+      return rows.map(mapRunRow);
     },
 
     markAborted(id): RunRecord | undefined {

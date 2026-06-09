@@ -20,8 +20,11 @@ import type {
   ObserveRuntimeTurnInput,
   PermissionResponseInput,
   RuntimeSession,
+  RuntimeStartedTurn,
   RuntimeTurn,
+  RuntimeTurnHandle,
   SendRuntimeMessageInput,
+  StartRuntimeTurnInput,
 } from "../opencode/types.ts";
 import { createCommandRouter, type CommandRouter } from "./registry.ts";
 
@@ -171,6 +174,38 @@ test("stop command aborts and marks the active run aborted", async () => {
       expect.objectContaining({ sessionId: "session-1", turnId: "message-active" }),
     ]);
     expect(harness.repositories.runs.getActiveByBindingId(bindingResult.resolution.binding.id)).toBeUndefined();
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("new command stops active run before rebinding", async () => {
+  const harness = await createHarness();
+
+  try {
+    const bindingResult = await harness.resolver.ensureBindingForMessage(inboundMessage());
+    if (bindingResult.status !== "resolved") throw new Error("expected resolved binding");
+
+    const run = harness.repositories.runs.create({
+      bindingId: bindingResult.resolution.binding.id,
+      opencodeSessionId: "old-session",
+      opencodeMessageId: "message-active",
+    });
+
+    const result = await harness.router.handle(inboundMessage({ text: "/new" }));
+    const text = responseText(result);
+
+    expect(text).toContain(`Stopped active run ${run.id} for session old-session.`);
+    expect(text).toContain("Created a new OpenCode session.");
+    expect(text).toContain("Previous session: session-1");
+    expect(text).toContain("Current session: session-2");
+    expect(harness.runtime.calls.abort).toEqual([
+      expect.objectContaining({ sessionId: "old-session", turnId: "message-active" }),
+    ]);
+    expect(harness.repositories.runs.getActiveByBindingId(bindingResult.resolution.binding.id)).toBeUndefined();
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)?.opencodeSessionId).toBe(
+      "session-2",
+    );
   } finally {
     harness.database.close();
   }
@@ -479,6 +514,10 @@ class FakeRuntime implements AgentRuntime {
 
   async sendAsync(input: SendRuntimeMessageInput): Promise<never> {
     throw new Error("FakeRuntime.sendAsync is not implemented in Phase 1 tests");
+  }
+
+  async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    throw new Error("FakeRuntime.startTurn is not implemented in command tests");
   }
 
   async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<never> {
