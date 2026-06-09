@@ -53,6 +53,14 @@ export interface RuntimeTurn {
   raw?: unknown;
 }
 
+export interface RuntimeTurnHandle {
+  id: RuntimeTurnId;
+  sessionId: RuntimeSessionId;
+  targetId: RuntimeTargetId;
+  status: Extract<RuntimeTurnStatus, "queued" | "running">;
+  raw?: unknown;
+}
+
 export interface EnsureSessionInput {
   target: RuntimeTarget;
   sessionId?: RuntimeSessionId;
@@ -78,6 +86,13 @@ export interface AbortRuntimeTurnInput {
   sessionId: RuntimeSessionId;
   turnId?: RuntimeTurnId;
   reason?: string;
+}
+
+export interface ObserveRuntimeTurnInput {
+  target: RuntimeTarget;
+  sessionId: RuntimeSessionId;
+  turnId?: RuntimeTurnId;
+  signal?: AbortSignal;
 }
 
 export interface ListRuntimeSessionsInput {
@@ -108,6 +123,9 @@ export type RuntimeEvent =
 export interface AgentRuntime {
   ensureSession(input: EnsureSessionInput): Promise<RuntimeSession>;
   send(input: SendRuntimeMessageInput): Promise<RuntimeTurn>;
+  sendAsync(input: SendRuntimeMessageInput): Promise<RuntimeTurnHandle>;
+  observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent>;
   abort(input: AbortRuntimeTurnInput): Promise<void>;
+  respondToPermission(input: PermissionResponseInput): Promise<void>;
   listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]>;
 }

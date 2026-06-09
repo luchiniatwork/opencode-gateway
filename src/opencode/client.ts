@@ -5,9 +5,13 @@ import type {
   AgentRuntime,
   EnsureSessionInput,
   ListRuntimeSessionsInput,
+  ObserveRuntimeTurnInput,
+  PermissionResponseInput,
+  RuntimeEvent,
   RuntimeSession,
   RuntimeTarget,
   RuntimeTurn,
+  RuntimeTurnHandle,
   SendRuntimeMessageInput,
   TokenUsage,
 } from "./types.ts";
@@ -168,6 +172,14 @@ export class OpenCodeRuntime implements AgentRuntime {
     });
   }
 
+  async sendAsync(input: SendRuntimeMessageInput): Promise<RuntimeTurnHandle> {
+    throw new OpenCodeRuntimeError("OpenCodeRuntime.sendAsync is not implemented yet");
+  }
+
+  async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent> {
+    throw new OpenCodeRuntimeError("OpenCodeRuntime.observe is not implemented yet");
+  }
+
   async abort(input: AbortRuntimeTurnInput): Promise<void> {
     const client = this.getClient(input.target);
 
@@ -178,6 +190,10 @@ export class OpenCodeRuntime implements AgentRuntime {
       }),
       `Unable to abort OpenCode session ${input.sessionId}`,
     );
+  }
+
+  async respondToPermission(input: PermissionResponseInput): Promise<void> {
+    throw new OpenCodeRuntimeError("OpenCodeRuntime.respondToPermission is not implemented yet");
   }
 
   async listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]> {

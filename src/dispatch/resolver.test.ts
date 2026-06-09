@@ -15,6 +15,8 @@ import type {
   AgentRuntime,
   EnsureSessionInput,
   ListRuntimeSessionsInput,
+  ObserveRuntimeTurnInput,
+  PermissionResponseInput,
   RuntimeSession,
   RuntimeTurn,
   SendRuntimeMessageInput,
@@ -457,8 +459,20 @@ class FakeRuntime implements AgentRuntime {
     };
   }
 
+  async sendAsync(input: SendRuntimeMessageInput): Promise<never> {
+    throw new Error("FakeRuntime.sendAsync is not implemented in Phase 1 tests");
+  }
+
+  async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<never> {
+    throw new Error("FakeRuntime.observe is not implemented in Phase 1 tests");
+  }
+
   async abort(input: AbortRuntimeTurnInput): Promise<void> {
     this.calls.abort.push(input);
+  }
+
+  async respondToPermission(input: PermissionResponseInput): Promise<void> {
+    throw new Error("FakeRuntime.respondToPermission is not implemented in Phase 1 tests");
   }
 
   async listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]> {
