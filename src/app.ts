@@ -98,6 +98,8 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       let openedDatabase: GatewayDatabase | undefined;
 
       if (options.config) {
+        validatePhase1RuntimeTargets(options.config);
+
         openedDatabase = await openGatewayDatabase(options.config.gateway.databasePath);
 
         try {
@@ -252,6 +254,22 @@ function configuredChannels(
   }
 
   return channels;
+}
+
+function validatePhase1RuntimeTargets(config: GatewayConfig): void {
+  const targetsById = new Map(config.opencode.targets.map((target) => [target.id, target]));
+  const profileTargetIds = new Set(config.profiles.entries.map((profile) => profile.defaultTargetId));
+  profileTargetIds.add(config.defaults.target);
+
+  const unsupportedTargets = [...profileTargetIds]
+    .map((targetId) => targetsById.get(targetId))
+    .filter((target): target is NonNullable<typeof target> => Boolean(target && target.mode !== "attach"));
+
+  if (unsupportedTargets.length === 0) return;
+
+  const labels = unsupportedTargets.map((target) => `${target.id} (${target.mode})`).join(", ");
+
+  throw new Error(`Phase 1 only supports attach-mode OpenCode targets for profile routing: ${labels}`);
 }
 
 function dispatchMessages(result: DispatchMessageResult): OutboundMessage[] {

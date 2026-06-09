@@ -2,9 +2,23 @@
 
 ## Current State
 
-The repository is still a starter Bun/TypeScript project. `SPEC.md` is the source of truth, `index.ts` only logs a starter message, and there is no `src/`, runtime adapter, persistence layer, config loader, or command surface yet.
+The repository now has the first durable gateway architecture in place: `index.ts` boots the service, `src/app.ts` composes config, SQLite repositories, dispatch, commands, runtime, and channels, and the implementation includes Phase 1 tests with fake channel/runtime coverage.
 
-Phase 1 should therefore establish the first durable architecture slice rather than refactor existing implementation code.
+Phase 1 work should therefore focus on hardening and completing the MVP slices rather than greenfield setup. `SPEC.md` remains the source of truth.
+
+## Phase 0 Contrast And Closure
+
+`SPEC.md` Phase 0 was a spike: hard-code one Telegram bot and one OpenCode attach target, send Telegram text to OpenCode, and return the final response. Its purpose was proving the OpenCode-first path and choosing whether to depend directly on `@opencode-ai/sdk` or introduce another wrapper.
+
+Phase 1 through slice 8.5 turns that spike into a durable gateway path:
+
+- Telegram and OpenCode routing are config-driven instead of hard-coded.
+- OpenCode SDK usage stays behind the local `AgentRuntime` boundary.
+- SQLite persists targets, profiles, access rules, conversation bindings, and runs.
+- `/help`, `/status`, `/new`, `/reset`, `/stop`, `/sessions`, `/use-session`, `/profiles`, and `/profile` are intercepted before OpenCode.
+- `src/app.ts` owns orchestration and response routing; channel adapters do not call OpenCode directly.
+
+Phase 0 is considered closed when a configured Telegram DM can still ask an attached OpenCode server to inspect this repository and receive a final answer through the Phase 1 pipeline, not through hard-coded spike code.
 
 ## Scope
 

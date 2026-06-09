@@ -86,6 +86,41 @@ test("gateway app handles commands before runtime dispatch", async () => {
   }
 });
 
+test("gateway app fails fast when profile routing points at a managed target", async () => {
+  const config = testConfig(":memory:");
+  const target = config.opencode.targets[0];
+
+  if (!target) throw new Error("expected test target");
+
+  config.opencode.targets[0] = {
+    ...target,
+    mode: "managed",
+    serverUrl: undefined,
+    workdir: "/tmp/opencode-gateway-managed-target",
+  };
+
+  const app = createApp({
+    config,
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  let error: unknown;
+
+  try {
+    await app.start();
+  } catch (caught) {
+    error = caught;
+  } finally {
+    await app.stop();
+  }
+
+  expect(error).toBeInstanceOf(Error);
+  expect(error instanceof Error ? error.message : "").toContain(
+    "Phase 1 only supports attach-mode OpenCode targets for profile routing: default (managed)",
+  );
+});
+
 test("gateway app dispatches non-command messages to OpenCode and sends final response", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
