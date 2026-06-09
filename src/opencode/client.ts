@@ -33,6 +33,7 @@ interface SdkAssistantMessage {
   id?: string;
   sessionID?: string;
   role?: string;
+  parentID?: string;
   error?: unknown;
   cost?: number;
   finish?: string;
@@ -53,7 +54,13 @@ interface SdkAssistantMessage {
 
 interface SdkPart {
   type: string;
+  id?: string;
+  sessionID?: string;
+  messageID?: string;
   text?: string;
+  callID?: string;
+  tool?: string;
+  state?: unknown;
 }
 
 interface SdkPromptResponse {
@@ -72,6 +79,15 @@ interface SdkSessionOptions {
   body?: unknown;
 }
 
+interface SdkEventSubscribeOptions {
+  query?: { directory?: string };
+  signal?: AbortSignal;
+}
+
+interface SdkEventSubscription {
+  stream: AsyncIterable<unknown>;
+}
+
 interface OpenCodeSdkClient {
   session: {
     create(options?: SdkSessionOptions): Promise<SdkResult<SdkSession>>;
@@ -82,6 +98,18 @@ interface OpenCodeSdkClient {
     promptAsync(options: SdkSessionOptions): Promise<SdkResult<void>>;
     abort(options: SdkSessionOptions): Promise<SdkResult<boolean>>;
   };
+  event: {
+    subscribe(options?: SdkEventSubscribeOptions): Promise<SdkEventSubscription>;
+  };
+}
+
+interface ObserveState {
+  sessionId: string;
+  turnId?: string;
+  assistantMessageIds: Set<string>;
+  finalizedMessageIds: Set<string>;
+  textPartsByMessageId: Map<string, Map<string, string>>;
+  toolStatusesByCallId: Map<string, string>;
 }
 
 interface OpenCodeRuntimeOptions {
@@ -95,6 +123,283 @@ export class OpenCodeRuntimeError extends Error {
     super(message, options);
     this.name = "OpenCodeRuntimeError";
   }
+}
+
+function normalizeSdkEvent(
+  sdkEvent: unknown,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  const event = unwrapSdkEvent(sdkEvent);
+  if (!event) return { events: [], terminal: false };
+
+  const type = getObjectString(event, "type");
+  const properties = getObject(event, "properties") ?? {};
+
+  switch (type) {
+    case "session.status":
+      return normalizeSessionStatus(properties, state);
+    case "session.idle":
+      return matchesSession(properties, state) ? { events: [{ type: "status", status: "idle" }], terminal: false } : noEvents();
+    case "message.updated":
+      return normalizeMessageUpdated(properties, state);
+    case "message.part.updated":
+      return normalizeMessagePartUpdated(properties, state);
+    case "permission.updated":
+    case "permission.asked":
+    case "permission.v2.asked":
+      return normalizePermissionRequest(type, properties, state);
+    case "session.error":
+      return normalizeSessionError(properties, state);
+    default:
+      return noEvents();
+  }
+}
+
+function normalizeSessionStatus(
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  if (!matchesSession(properties, state)) return noEvents();
+
+  const status = properties.status;
+  const sdkStatus = asObject(status) ? getObjectString(asObject(status)!, "type") : typeof status === "string" ? status : undefined;
+
+  if (sdkStatus === "idle") return { events: [{ type: "status", status: "idle" }], terminal: false };
+  if (sdkStatus === "busy" || sdkStatus === "retry") {
+    return { events: [{ type: "status", status: "running" }], terminal: false };
+  }
+
+  return noEvents();
+}
+
+function normalizeMessageUpdated(
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  const info = getObject(properties, "info");
+  if (!info || getObjectString(info, "sessionID") !== state.sessionId) return noEvents();
+  if (getObjectString(info, "role") !== "assistant") return noEvents();
+
+  const messageId = getObjectString(info, "id");
+  if (!messageBelongsToObservedTurn(messageId, getObjectString(info, "parentID"), state)) return noEvents();
+  if (messageId) state.assistantMessageIds.add(messageId);
+
+  const error = info.error;
+  if (error !== undefined) {
+    return {
+      events: [{ type: "error", message: formatRuntimeError(error), retryable: isRetryableRuntimeError(error) }],
+      terminal: true,
+    };
+  }
+
+  const time = getObject(info, "time");
+  const completed = getObjectNumber(time, "completed") !== undefined || getObjectString(info, "finish") !== undefined;
+  if (!completed || !messageId || state.finalizedMessageIds.has(messageId)) return noEvents();
+
+  state.finalizedMessageIds.add(messageId);
+
+  return {
+    events: [
+      {
+        type: "final",
+        text: collectMessageText(messageId, state),
+        costUsd: getObjectNumber(info, "cost"),
+        tokens: mapTokenUsage(getObject(info, "tokens")),
+      },
+    ],
+    terminal: true,
+  };
+}
+
+function normalizeMessagePartUpdated(
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  const part = getObject(properties, "part");
+  if (!part || getObjectString(part, "sessionID") !== state.sessionId) return noEvents();
+  if (!partBelongsToObservedTurn(part, state)) return noEvents();
+
+  const partType = getObjectString(part, "type");
+
+  if (partType === "text") {
+    const text = updateTextPartAndGetDelta(part, getObjectString(properties, "delta"), state);
+    return text ? { events: [{ type: "text_delta", text }], terminal: false } : noEvents();
+  }
+
+  if (partType === "tool") {
+    return { events: normalizeToolPart(part, state), terminal: false };
+  }
+
+  return noEvents();
+}
+
+function normalizePermissionRequest(
+  eventType: string,
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  if (!matchesSession(properties, state)) return noEvents();
+
+  const id = getObjectString(properties, "id") ?? getObjectString(properties, "requestID");
+  if (!id) return noEvents();
+
+  return {
+    events: [
+      {
+        type: "permission_request",
+        id,
+        summary: permissionSummary(properties),
+        details: compactObject({
+          eventType,
+          type: getObjectString(properties, "type"),
+          permission: getObjectString(properties, "permission"),
+          pattern: properties.pattern,
+          patterns: properties.patterns,
+          action: getObjectString(properties, "action"),
+          resources: properties.resources,
+          messageID: getObjectString(properties, "messageID"),
+          callID: getObjectString(properties, "callID"),
+          metadata: properties.metadata,
+        }),
+      },
+    ],
+    terminal: false,
+  };
+}
+
+function normalizeSessionError(
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  const sessionId = getObjectString(properties, "sessionID");
+  if (sessionId && sessionId !== state.sessionId) return noEvents();
+
+  const error = properties.error;
+  return {
+    events: [{ type: "error", message: formatRuntimeError(error), retryable: isRetryableRuntimeError(error) }],
+    terminal: true,
+  };
+}
+
+function normalizeToolPart(part: Record<string, unknown>, state: ObserveState): RuntimeEvent[] {
+  const callId = getObjectString(part, "callID") ?? getObjectString(part, "id");
+  const name = getObjectString(part, "tool") ?? "tool";
+  const toolState = asObject(part.state);
+  const status = toolState ? getObjectString(toolState, "status") : undefined;
+
+  if (!callId || !status) return [];
+
+  const previousStatus = state.toolStatusesByCallId.get(callId);
+  if (previousStatus === status && (status === "completed" || status === "error")) return [];
+
+  state.toolStatusesByCallId.set(callId, status);
+  const summary = toolState ? toolSummary(toolState) : undefined;
+
+  if (!previousStatus && (status === "pending" || status === "running")) {
+    return [{ type: "tool_start", id: callId, name, summary }];
+  }
+
+  if (status === "pending" || status === "running") {
+    return [{ type: "tool_update", id: callId, name, summary }];
+  }
+
+  if (status === "completed") return [{ type: "tool_end", id: callId, name, ok: true, summary }];
+  if (status === "error") return [{ type: "tool_end", id: callId, name, ok: false, summary }];
+
+  return [];
+}
+
+function updateTextPartAndGetDelta(
+  part: Record<string, unknown>,
+  explicitDelta: string | undefined,
+  state: ObserveState,
+): string | undefined {
+  const messageId = getObjectString(part, "messageID");
+  if (!messageId) return explicitDelta;
+
+  const partId = getObjectString(part, "id") ?? `${messageId}:text`;
+  const parts = getMessageTextParts(messageId, state);
+  const previous = parts.get(partId) ?? "";
+  const fullText = getObjectString(part, "text");
+
+  if (explicitDelta !== undefined) {
+    parts.set(partId, fullText ?? `${previous}${explicitDelta}`);
+    return explicitDelta.length > 0 ? explicitDelta : undefined;
+  }
+
+  if (fullText === undefined || fullText === previous) return undefined;
+
+  parts.set(partId, fullText);
+  return fullText.startsWith(previous) ? fullText.slice(previous.length) : fullText;
+}
+
+function getMessageTextParts(messageId: string, state: ObserveState): Map<string, string> {
+  const existing = state.textPartsByMessageId.get(messageId);
+  if (existing) return existing;
+
+  const parts = new Map<string, string>();
+  state.textPartsByMessageId.set(messageId, parts);
+  return parts;
+}
+
+function collectMessageText(messageId: string, state: ObserveState): string {
+  return [...(state.textPartsByMessageId.get(messageId)?.values() ?? [])]
+    .filter((text) => text.length > 0)
+    .join("\n\n");
+}
+
+function permissionSummary(properties: Record<string, unknown>): string {
+  return (
+    getObjectString(properties, "title") ??
+    getObjectString(properties, "permission") ??
+    getObjectString(properties, "action") ??
+    getObjectString(properties, "type") ??
+    "OpenCode permission request"
+  );
+}
+
+function toolSummary(state: Record<string, unknown>): string | undefined {
+  return getObjectString(state, "title") ?? getObjectString(state, "error") ?? getObjectString(state, "status");
+}
+
+function partBelongsToObservedTurn(part: Record<string, unknown>, state: ObserveState): boolean {
+  const messageId = getObjectString(part, "messageID");
+  if (!state.turnId || !messageId) return true;
+  if (messageId === state.turnId) return false;
+  if (state.assistantMessageIds.size === 0) return true;
+  return state.assistantMessageIds.has(messageId);
+}
+
+function messageBelongsToObservedTurn(
+  messageId: string | undefined,
+  parentId: string | undefined,
+  state: ObserveState,
+): boolean {
+  if (!state.turnId) return true;
+  if (parentId === state.turnId) return true;
+  return Boolean(messageId && state.assistantMessageIds.has(messageId));
+}
+
+function matchesSession(properties: Record<string, unknown>, state: ObserveState): boolean {
+  return getObjectString(properties, "sessionID") === state.sessionId;
+}
+
+function unwrapSdkEvent(value: unknown): Record<string, unknown> | undefined {
+  const event = asObject(value);
+  if (!event) return undefined;
+  if (getObjectString(event, "type")) return event;
+
+  const data = getObject(event, "data");
+  return data && getObjectString(data, "type") ? data : undefined;
+}
+
+async function closeEventStream(stream: AsyncIterable<unknown>): Promise<void> {
+  const maybeReturn = (stream as unknown as AsyncIterator<unknown>).return;
+  if (typeof maybeReturn === "function") await maybeReturn.call(stream);
+}
+
+function noEvents(): { events: RuntimeEvent[]; terminal: boolean } {
+  return { events: [], terminal: false };
 }
 
 export class OpenCodeRuntime implements AgentRuntime {
@@ -205,7 +510,52 @@ export class OpenCodeRuntime implements AgentRuntime {
   }
 
   async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent> {
-    throw new OpenCodeRuntimeError("OpenCodeRuntime.observe is not implemented yet");
+    const client = this.getClient(input.target);
+
+    if (input.signal?.aborted) return;
+
+    let subscription: SdkEventSubscription;
+
+    try {
+      subscription = await client.event.subscribe({
+        query: directoryQuery(input.target),
+        signal: input.signal,
+      });
+    } catch (error) {
+      if (!input.signal?.aborted) {
+        yield { type: "error", message: `Unable to observe OpenCode events: ${formatRuntimeError(error)}`, retryable: true };
+      }
+      return;
+    }
+
+    const state: ObserveState = {
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      assistantMessageIds: new Set(),
+      finalizedMessageIds: new Set(),
+      textPartsByMessageId: new Map(),
+      toolStatusesByCallId: new Map(),
+    };
+
+    try {
+      for await (const sdkEvent of subscription.stream) {
+        if (input.signal?.aborted) return;
+
+        const normalized = normalizeSdkEvent(sdkEvent, state);
+
+        for (const event of normalized.events) {
+          yield event;
+        }
+
+        if (normalized.terminal) return;
+      }
+    } catch (error) {
+      if (!input.signal?.aborted) {
+        yield { type: "error", message: `OpenCode event stream failed: ${formatRuntimeError(error)}`, retryable: true };
+      }
+    } finally {
+      await closeEventStream(subscription.stream);
+    }
   }
 
   async abort(input: AbortRuntimeTurnInput): Promise<void> {
@@ -451,12 +801,13 @@ function extractAssistantText(parts: SdkPart[]): string {
     .join("\n\n");
 }
 
-function mapTokenUsage(tokens: SdkAssistantMessage["tokens"]): TokenUsage | undefined {
-  if (!tokens) return undefined;
+function mapTokenUsage(tokens: unknown): TokenUsage | undefined {
+  const tokenRecord = asObject(tokens);
+  if (!tokenRecord) return undefined;
 
-  const input = tokens.input;
-  const output = tokens.output;
-  const reasoning = tokens.reasoning ?? 0;
+  const input = getObjectNumber(tokenRecord, "input");
+  const output = getObjectNumber(tokenRecord, "output");
+  const reasoning = getObjectNumber(tokenRecord, "reasoning") ?? 0;
   const total = (input ?? 0) + (output ?? 0) + reasoning;
 
   return {
@@ -515,12 +866,42 @@ function formatRuntimeError(error: unknown): string {
   return "unknown error";
 }
 
-function getObject(value: object, key: string): Record<string, unknown> | undefined {
-  const entry = (value as Record<string, unknown>)[key];
+function isRetryableRuntimeError(error: unknown): boolean | undefined {
+  const errorRecord = asObject(error);
+  const data = getObject(errorRecord, "data");
+  const retryable = data?.isRetryable ?? errorRecord?.isRetryable;
+
+  return typeof retryable === "boolean" ? retryable : undefined;
+}
+
+function compactObject(input: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
+}
+
+function asObject(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+}
+
+function getObject(value: unknown, key: string): Record<string, unknown> | undefined {
+  const object = asObject(value);
+  if (!object) return undefined;
+
+  const entry = object[key];
   return entry && typeof entry === "object" ? (entry as Record<string, unknown>) : undefined;
 }
 
-function getObjectString(value: object, key: string): string | undefined {
-  const entry = (value as Record<string, unknown>)[key];
+function getObjectString(value: unknown, key: string): string | undefined {
+  const object = asObject(value);
+  if (!object) return undefined;
+
+  const entry = object[key];
   return typeof entry === "string" && entry.length > 0 ? entry : undefined;
+}
+
+function getObjectNumber(value: unknown, key: string): number | undefined {
+  const object = asObject(value);
+  if (!object) return undefined;
+
+  const entry = object[key];
+  return typeof entry === "number" && Number.isFinite(entry) ? entry : undefined;
 }
