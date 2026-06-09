@@ -101,6 +101,23 @@ Defer:
 - Send plain text or Markdown-safe responses.
 - Do not implement media in Phase 1.
 
+### 8.5 App Composition And Orchestration
+
+- Treat `src/app.ts` as the gateway composition root, not only a database bootstrapper.
+- Instantiate repositories from the migrated SQLite database.
+- Instantiate the attach-mode `OpenCodeRuntime`.
+- Instantiate `DispatchResolver` and `CommandRouter`.
+- Start configured channel adapters, beginning with Telegram when `channels.telegram.enabled` is true.
+- Route `ChannelEvent.message` through the gateway pipeline:
+  - command router first
+  - if handled, send command responses back through the source channel
+  - otherwise dispatch the message to OpenCode through `DispatchResolver`
+  - send final, busy, denied, or error responses back through the source channel
+- Build an `OutboundTarget` from the inbound conversation metadata so app orchestration, not channel code, owns response routing.
+- Stop all started channel adapters during gateway shutdown.
+- Keep Phase 1 final-response-only; progress streaming and event observation remain Phase 2.
+- Add integration coverage with fake channel and fake runtime for command handling, non-command dispatch, access denial, and session reuse across restart.
+
 ### 9. Observability
 
 - Add `src/observability/logging.ts`.
