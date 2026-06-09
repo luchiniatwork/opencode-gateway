@@ -277,6 +277,38 @@ test("gateway app reuses persisted session binding after restart", async () => {
   }
 });
 
+test("gateway app /new rebinds while old sessions remain listable", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new FakeRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ text: "first" }));
+    await channel.emit(inboundMessage({ id: "message-2", text: "/new", commandText: "/new" }));
+    await channel.emit(inboundMessage({ id: "message-3", text: "/sessions", commandText: "/sessions" }));
+
+    expect(runtime.calls.send).toHaveLength(1);
+    expect(runtime.calls.ensureSession).toHaveLength(2);
+    expect(runtime.calls.listSessions).toEqual([expect.objectContaining({ limit: 10 })]);
+    expect(channel.sent).toHaveLength(3);
+    expect(channel.sent[1]?.message.text).toContain("Previous session: session-1");
+    expect(channel.sent[1]?.message.text).toContain("Current session: session-2");
+    expect(channel.sent[2]?.message.text).toContain("- session-1 - Tiago via telegram");
+    expect(channel.sent[2]?.message.text).toContain("* session-2 - Tiago via telegram");
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("gateway app stops started channels and closes the database", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
@@ -440,6 +472,7 @@ class FakeRuntime implements AgentRuntime {
 
   private nextSessionNumber = 1;
   private nextMessageNumber = 1;
+  private sessions: RuntimeSession[] = [];
 
   async ensureSession(input: EnsureSessionInput): Promise<RuntimeSession> {
     this.calls.ensureSession.push(input);
@@ -452,11 +485,15 @@ class FakeRuntime implements AgentRuntime {
       };
     }
 
-    return {
+    const session = {
       id: `session-${this.nextSessionNumber++}`,
       targetId: input.target.id,
       title: input.title,
     };
+
+    this.sessions.push(session);
+
+    return session;
   }
 
   async send(input: SendRuntimeMessageInput): Promise<RuntimeTurn> {
@@ -478,6 +515,6 @@ class FakeRuntime implements AgentRuntime {
 
   async listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]> {
     this.calls.listSessions.push(input);
-    return [];
+    return this.sessions;
   }
 }

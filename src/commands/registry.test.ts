@@ -48,6 +48,22 @@ test("unknown command returns help guidance", async () => {
   }
 });
 
+test("commandText takes precedence over text and strips bot mention", async () => {
+  const harness = await createHarness();
+
+  try {
+    const result = await harness.router.handle(
+      inboundMessage({ text: "not a command", commandText: "/profile@GatewayBot review" }),
+    );
+
+    expect(responseText(result)).toContain("Switched profile to Review (review).");
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)?.profileId).toBe("review");
+    expect(harness.runtime.calls.ensureSession).toHaveLength(1);
+  } finally {
+    harness.database.close();
+  }
+});
+
 test("unknown sender is denied before command side effects", async () => {
   const harness = await createHarness({ accessRules: [] });
 
