@@ -13,26 +13,17 @@ import { seedDatabaseFromConfig } from "./db/repositories/seeds.ts";
 import { createTargetRepository } from "./db/repositories/targets.ts";
 import { createDispatchResolver, type DispatchMessageResult } from "./dispatch/resolver.ts";
 import type { OutboundMessage } from "./messages/types.ts";
+import { createHealthSnapshot, type ChannelHealthStatus, type GatewayHealthSnapshot } from "./observability/health.ts";
+import {
+  createJsonLogSink,
+  type GatewayLogContext,
+  type GatewayLogEntry,
+  type GatewayLogLevel,
+} from "./observability/logging.ts";
 import { OpenCodeRuntime } from "./opencode/client.ts";
 import type { AgentRuntime } from "./opencode/types.ts";
 
-export type GatewayLogLevel = "debug" | "info" | "warn" | "error";
-
-export interface GatewayLogEntry {
-  timestamp: string;
-  level: GatewayLogLevel;
-  component: string;
-  message: string;
-  channel?: string;
-  accountId?: string;
-  conversationKey?: string;
-  profileId?: string;
-  targetId?: string;
-  sessionId?: string;
-  runId?: string;
-  error?: string;
-  [key: string]: unknown;
-}
+export type { GatewayLogEntry, GatewayLogLevel } from "./observability/logging.ts";
 
 export interface GatewayAppStatus {
   started: boolean;
@@ -42,6 +33,8 @@ export interface GatewayAppStatus {
 
 export interface GatewayApp {
   readonly status: GatewayAppStatus;
+  readonly healthUrl?: string;
+  health(): GatewayHealthSnapshot;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -62,17 +55,19 @@ export interface GatewayAppOptions {
 }
 
 export function createApp(options: GatewayAppOptions = {}): GatewayApp {
-  const logger = options.logger ?? defaultLogger;
+  const logger = options.logger ?? createJsonLogSink({ level: options.config?.gateway.logLevel });
   const now = options.now ?? (() => new Date());
   let started = false;
   let database: GatewayDatabase | undefined;
   let abortController: AbortController | undefined;
+  let healthServer: ReturnType<typeof Bun.serve> | undefined;
   const startedChannels: GatewayChannelRegistration<any>[] = [];
+  const channelStatuses = new Map<string, ChannelHealthStatus>();
 
   function log(
     level: GatewayLogLevel,
     message: string,
-    context: Omit<GatewayLogEntry, "timestamp" | "level" | "component" | "message"> = {},
+    context: GatewayLogContext = {},
   ): void {
     logger({
       timestamp: now().toISOString(),
@@ -90,6 +85,14 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
         configLoaded: Boolean(options.config),
         databaseConnected: Boolean(database),
       };
+    },
+
+    get healthUrl(): string | undefined {
+      return healthServer ? new URL("/health", healthServer.url).toString() : undefined;
+    },
+
+    health(): GatewayHealthSnapshot {
+      return healthSnapshot();
     },
 
     async start(): Promise<void> {
@@ -122,34 +125,71 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
             repositories,
             resolver,
             runtime,
-            getHealth: () => ({
-              gateway: started ? "healthy" : "configured",
-              targets: Object.fromEntries(repositories.targets.list().map((target) => [target.id, "configured"])),
-            }),
+            getHealth: () => {
+              const snapshot = healthSnapshot();
+
+              return {
+                gateway: snapshot.gateway,
+                targets: snapshot.opencodeTargets,
+              };
+            },
           });
           const channels = options.channels ?? configuredChannels(options.config, options.createTelegramAdapter);
 
           for (const channel of channels) {
             startedChannels.push(channel);
+            channelStatuses.set(channelStatusKey(channel), "configured");
 
-            await channel.adapter.start({
-              accountId: channel.accountId,
-              config: channel.config,
-              signal: abortController.signal,
-              logger: channelLogger(channel.adapter.id, channel.accountId),
-              emit: async (event) => {
-                await handleChannelEvent(channel, event, async (message) => {
-                  const commandResult = await commandRouter.handle(message);
+            try {
+              await channel.adapter.start({
+                accountId: channel.accountId,
+                config: channel.config,
+                signal: abortController.signal,
+                logger: channelLogger(channel.adapter.id, channel.accountId),
+                emit: async (event) => {
+                  await handleChannelEvent(channel, event, async (message) => {
+                    log("info", "inbound message received", messageLogContext(message));
 
-                  if (commandResult.handled) return commandResult.messages;
+                    const commandResult = await commandRouter.handle(message);
 
-                  return dispatchMessages(await resolver.dispatchMessage(message));
-                });
-              },
-            });
+                    if (commandResult.handled) {
+                      log("info", "gateway command handled", {
+                        ...messageLogContext(message),
+                        command: commandResult.command,
+                      });
+
+                      return commandResult.messages;
+                    }
+
+                    const dispatchResult = await resolver.dispatchMessage(message);
+                    logDispatchResult(dispatchResult, message);
+
+                    return dispatchMessages(dispatchResult);
+                  });
+                },
+              });
+              channelStatuses.set(channelStatusKey(channel), "running");
+              log("info", "channel started", {
+                source: "channel",
+                channel: channel.adapter.id,
+                accountId: channel.accountId,
+              });
+            } catch (error) {
+              channelStatuses.set(channelStatusKey(channel), "error");
+              log("error", "channel start failed", {
+                source: "channel",
+                channel: channel.adapter.id,
+                accountId: channel.accountId,
+                error: formatError(error),
+              });
+              throw error;
+            }
           }
+
+          startHealthServer(options.config);
         } catch (error) {
           await stopStartedChannels();
+          stopHealthServer();
           abortController = undefined;
           database = undefined;
           openedDatabase.close();
@@ -168,6 +208,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       abortController?.abort();
       abortController = undefined;
       await stopStartedChannels();
+      stopHealthServer();
       database?.close();
       database = undefined;
       log("info", "opencode-gateway stopped");
@@ -219,8 +260,16 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
     for (const channel of channels) {
       try {
         await channel.adapter.stop();
+        channelStatuses.set(channelStatusKey(channel), "stopped");
+        log("info", "channel stopped", {
+          source: "channel",
+          channel: channel.adapter.id,
+          accountId: channel.accountId,
+        });
       } catch (error) {
+        channelStatuses.set(channelStatusKey(channel), "error");
         log("error", "channel stop failed", {
+          source: "channel",
           channel: channel.adapter.id,
           accountId: channel.accountId,
           error: formatError(error),
@@ -237,6 +286,81 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       error: (message, context) => log("error", message, { channel, accountId, ...context }),
     };
   }
+
+  function startHealthServer(config: GatewayConfig): void {
+    healthServer = Bun.serve({
+      hostname: config.gateway.host,
+      port: config.gateway.port,
+      fetch(request) {
+        const url = new URL(request.url);
+
+        if (request.method !== "GET" || url.pathname !== "/health") {
+          return new Response("Not Found", { status: 404 });
+        }
+
+        return Response.json(healthSnapshot());
+      },
+    });
+
+    log("info", "health endpoint started", {
+      component: "health",
+      host: config.gateway.host,
+      port: healthServer.port,
+    });
+  }
+
+  function stopHealthServer(): void {
+    if (!healthServer) return;
+
+    healthServer.stop(true);
+    healthServer = undefined;
+  }
+
+  function healthSnapshot(): GatewayHealthSnapshot {
+    return createHealthSnapshot({
+      config: options.config,
+      started,
+      channelStatuses: Object.fromEntries(channelStatuses),
+    });
+  }
+
+  function logDispatchResult(result: DispatchMessageResult, message: InboundMessage): void {
+    if (result.status === "denied") {
+      log("warn", "dispatch denied", {
+        ...messageLogContext(message),
+        reason: result.decision.reason,
+      });
+      return;
+    }
+
+    const context = {
+      ...messageLogContext(message),
+      profileId: result.resolution.profile.id,
+      targetId: result.resolution.target.id,
+      sessionId: result.resolution.binding.opencodeSessionId,
+      runId: result.run.id,
+    };
+
+    if (result.status === "error") {
+      log("error", "dispatch failed", { ...context, error: result.error });
+      return;
+    }
+
+    log(result.status === "busy" ? "warn" : "info", `dispatch ${result.status}`, context);
+  }
+}
+
+function channelStatusKey(channel: GatewayChannelRegistration<any>): string {
+  return `${channel.adapter.id}:${channel.accountId}`;
+}
+
+function messageLogContext(message: InboundMessage): GatewayLogContext {
+  return {
+    source: "channel",
+    channel: message.channel,
+    accountId: message.accountId,
+    conversationKey: message.conversation.key,
+  };
 }
 
 function configuredChannels(

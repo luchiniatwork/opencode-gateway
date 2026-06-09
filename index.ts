@@ -58,8 +58,8 @@ Usage:
   opencode-gateway serve [--config <path>]   Start the gateway service
   opencode-gateway help                      Show this help
 
-Phase 1 slice #2 adds JSONC config loading and validation. Database,
-channels, and OpenCode runtime wiring are added in later slices.`);
+Phase 1 MVP starts the configured gateway, channels, OpenCode runtime,
+SQLite state, structured logs, and health endpoint.`);
 }
 
 type ServeOptionsResult =

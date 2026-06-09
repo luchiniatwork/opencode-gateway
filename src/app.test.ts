@@ -162,6 +162,46 @@ test("gateway app dispatches non-command messages to OpenCode and sends final re
   }
 });
 
+test("gateway app serves health JSON", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime: new FakeRuntime(),
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+
+    const healthUrl = app.healthUrl;
+
+    expect(healthUrl).toBeDefined();
+
+    const response = await fetch(healthUrl as string);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      ok: true,
+      version: "0.1.0",
+      gateway: "healthy",
+      channels: { "telegram:default": "running" },
+      opencodeTargets: { default: "configured" },
+      profiles: { default: "cto", active: ["cto"] },
+    });
+
+    const missing = await fetch(new URL("/missing", healthUrl).toString());
+
+    expect(missing.status).toBe(404);
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("gateway app denies unknown senders before runtime dispatch", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
@@ -278,7 +318,7 @@ function testConfig(databasePath: string): GatewayConfig {
   return {
     gateway: {
       host: "127.0.0.1",
-      port: 8765,
+      port: 0,
       databasePath,
       logLevel: "info",
     },
