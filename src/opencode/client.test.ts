@@ -1,0 +1,270 @@
+import { expect, test } from "bun:test";
+
+import { OpenCodeRuntime, OpenCodeRuntimeError } from "./client.ts";
+import type { RuntimeTarget } from "./types.ts";
+
+test("creates a session when no session id is provided", async () => {
+  const sdk = createFakeSdkClient({
+    createSession: {
+      id: "session-1",
+      title: "New chat",
+      time: { created: 1_700_000_000_000, updated: 1_700_000_000_500 },
+    },
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const session = await runtime.ensureSession({ target: attachTarget, title: "New chat" });
+
+  expect(session).toEqual({
+    id: "session-1",
+    targetId: "default",
+    title: "New chat",
+    createdAt: "2023-11-14T22:13:20.000Z",
+    updatedAt: "2023-11-14T22:13:20.500Z",
+    raw: sdk.responses.createSession,
+  });
+  expect(sdk.calls.create).toEqual([
+    {
+      body: { title: "New chat" },
+      query: { directory: "/work/repo" },
+    },
+  ]);
+});
+
+test("loads an existing session when session id is provided", async () => {
+  const sdk = createFakeSdkClient({
+    getSession: {
+      id: "session-existing",
+      title: "Existing chat",
+      time: { created: 1_700_000_000_000, updated: 1_700_000_001_000 },
+    },
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const session = await runtime.ensureSession({ target: attachTarget, sessionId: "session-existing" });
+
+  expect(session.id).toBe("session-existing");
+  expect(session.title).toBe("Existing chat");
+  expect(sdk.calls.get).toEqual([
+    {
+      path: { id: "session-existing" },
+      query: { directory: "/work/repo" },
+    },
+  ]);
+});
+
+test("sends a final-response prompt and maps assistant text, cost, and tokens", async () => {
+  const sdk = createFakeSdkClient({
+    prompt: {
+      info: {
+        id: "message-1",
+        sessionID: "session-1",
+        cost: 0.12,
+        tokens: { input: 10, output: 20, reasoning: 5 },
+      },
+      parts: [
+        { type: "text", text: "First paragraph." },
+        { type: "tool" },
+        { type: "text", text: "Second paragraph." },
+      ],
+    },
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const turn = await runtime.send({
+    target: attachTarget,
+    sessionId: "session-1",
+    text: "Inspect this repo",
+    agent: "build",
+    model: "openai/gpt-5.5",
+  });
+
+  expect(turn).toEqual({
+    id: "message-1",
+    sessionId: "session-1",
+    status: "completed",
+    text: "First paragraph.\n\nSecond paragraph.",
+    costUsd: 0.12,
+    tokens: { input: 10, output: 20, total: 35 },
+    raw: sdk.responses.prompt,
+  });
+  expect(sdk.calls.prompt).toEqual([
+    {
+      path: { id: "session-1" },
+      query: { directory: "/work/repo" },
+      body: {
+        agent: "build",
+        model: { providerID: "openai", modelID: "gpt-5.5" },
+        parts: [{ type: "text", text: "Inspect this repo" }],
+      },
+    },
+  ]);
+});
+
+test("maps assistant errors to error turns", async () => {
+  const sdk = createFakeSdkClient({
+    prompt: {
+      info: {
+        id: "message-1",
+        sessionID: "session-1",
+        error: { name: "ProviderAuthError", data: { message: "Missing credentials" } },
+      },
+      parts: [],
+    },
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const turn = await runtime.send({ target: attachTarget, sessionId: "session-1", text: "Hello" });
+
+  expect(turn.status).toBe("error");
+  expect(turn.text).toBe("Missing credentials");
+});
+
+test("rejects unsupported attachments in phase 1", async () => {
+  const sdk = createFakeSdkClient();
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  await expect(
+    runtime.send({
+      target: attachTarget,
+      sessionId: "session-1",
+      text: "See attached",
+      attachments: [{ filename: "image.png", url: "https://example.com/image.png" }],
+    }),
+  ).rejects.toThrow("attachments");
+  expect(sdk.calls.prompt).toEqual([]);
+});
+
+test("aborts a session", async () => {
+  const sdk = createFakeSdkClient();
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  await runtime.abort({ target: attachTarget, sessionId: "session-1" });
+
+  expect(sdk.calls.abort).toEqual([
+    {
+      path: { id: "session-1" },
+      query: { directory: "/work/repo" },
+    },
+  ]);
+});
+
+test("lists sessions sorted by updated time and applies limit", async () => {
+  const sdk = createFakeSdkClient({
+    sessions: [
+      { id: "older", title: "Older", time: { updated: 1_700_000_000_000 } },
+      { id: "newer", title: "Newer", time: { updated: 1_700_000_010_000 } },
+      { id: "middle", title: "Middle", time: { updated: 1_700_000_005_000 } },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const sessions = await runtime.listSessions({ target: attachTarget, limit: 2 });
+
+  expect(sessions.map((session) => session.id)).toEqual(["newer", "middle"]);
+  expect(sdk.calls.list).toEqual([{ query: { directory: "/work/repo" } }]);
+});
+
+test("rejects non-attach targets", async () => {
+  const sdk = createFakeSdkClient();
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+  const target: RuntimeTarget = {
+    id: "managed",
+    name: "Managed",
+    mode: "managed",
+    workdir: "/work/repo",
+  };
+
+  await expect(runtime.listSessions({ target })).rejects.toThrow(OpenCodeRuntimeError);
+  expect(sdk.calls.list).toEqual([]);
+});
+
+test("wraps SDK error responses with an actionable message", async () => {
+  const sdk = createFakeSdkClient({
+    createSessionError: { data: { message: "OpenCode unavailable" } },
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  await expect(runtime.ensureSession({ target: attachTarget })).rejects.toThrow(
+    "Unable to create OpenCode session: OpenCode unavailable",
+  );
+});
+
+const attachTarget: RuntimeTarget = {
+  id: "default",
+  name: "Default",
+  mode: "attach",
+  serverUrl: "http://127.0.0.1:4096",
+  workdir: "/work/repo",
+};
+
+interface FakeSdkOptions {
+  createSession?: FakeSession;
+  createSessionError?: unknown;
+  getSession?: FakeSession;
+  sessions?: FakeSession[];
+  prompt?: FakePromptResponse;
+}
+
+interface FakeSession {
+  id: string;
+  title?: string;
+  time?: { created?: number; updated?: number };
+}
+
+interface FakePromptResponse {
+  info?: {
+    id?: string;
+    sessionID?: string;
+    error?: unknown;
+    cost?: number;
+    tokens?: { input?: number; output?: number; reasoning?: number };
+  };
+  parts?: Array<{ type: string; text?: string }>;
+}
+
+function createFakeSdkClient(options: FakeSdkOptions = {}) {
+  const calls: Record<"create" | "get" | "list" | "prompt" | "abort", unknown[]> = {
+    create: [],
+    get: [],
+    list: [],
+    prompt: [],
+    abort: [],
+  };
+  const responses = {
+    createSession: options.createSession ?? { id: "session-created" },
+    getSession: options.getSession ?? { id: "session-existing" },
+    sessions: options.sessions ?? [],
+    prompt: options.prompt ?? { info: { id: "message-1", sessionID: "session-1" }, parts: [] },
+  };
+
+  return {
+    calls,
+    responses,
+    client: {
+      session: {
+        async create(input: unknown) {
+          calls.create.push(input);
+          if (options.createSessionError) return { error: options.createSessionError };
+          return { data: responses.createSession };
+        },
+        async get(input: unknown) {
+          calls.get.push(input);
+          return { data: responses.getSession };
+        },
+        async list(input: unknown) {
+          calls.list.push(input);
+          return { data: responses.sessions };
+        },
+        async prompt(input: unknown) {
+          calls.prompt.push(input);
+          return { data: responses.prompt };
+        },
+        async abort(input: unknown) {
+          calls.abort.push(input);
+          return { data: true };
+        },
+      },
+    },
+  };
+}
