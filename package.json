@@ -19,6 +19,7 @@
     "dev": "bun --watch index.ts serve",
     "prepack": "bun run build",
     "serve": "bun index.ts serve",
+    "smoke:real": "bun scripts/smoke-real.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { ConfigError, getConfigSeeds, parseGatewayConfig } from "./load.ts";
+import { ConfigError, getConfigSeeds, loadConfig, parseGatewayConfig } from "./load.ts";
 
 const env = { TELEGRAM_BOT_TOKEN: "secret-token" };
 
@@ -72,6 +75,47 @@ test("loads JSONC config with defaults, env expansion, and home expansion", () =
     inboundDebounceMs: 1500,
   });
   expect(config.channels.telegram?.token).toBe("secret-token");
+});
+
+test("loads file-backed config paths relative to the config file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-config-"));
+  const configPath = join(dir, "config.jsonc");
+
+  await writeFile(
+    configPath,
+    `{
+      "gateway": { "databasePath": "./state.db" },
+      "opencode": {
+        "targets": [{
+          "id": "default",
+          "mode": "attach",
+          "serverUrl": "http://127.0.0.1:4096",
+          "workdir": "./workspace",
+          "configDir": "./opencode-config"
+        }]
+      },
+      "profiles": {
+        "entries": [{
+          "id": "cto",
+          "displayName": "Tiago CTO",
+          "defaultTarget": "default",
+          "defaultConfigDir": "./profile-config"
+        }]
+      }
+    }`,
+    "utf8",
+  );
+
+  try {
+    const config = await loadConfig(configPath, { env, homeDir: "/home/alice" });
+
+    expect(config.gateway.databasePath).toBe(join(dir, "state.db"));
+    expect(config.opencode.targets[0]?.workdir).toBe(join(dir, "workspace"));
+    expect(config.opencode.targets[0]?.configDir).toBe(join(dir, "opencode-config"));
+    expect(config.profiles.entries[0]?.defaultConfigDir).toBe(join(dir, "profile-config"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("derives access rule seeds from Telegram allowlist", () => {

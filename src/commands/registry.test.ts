@@ -78,6 +78,21 @@ test("unknown sender is denied before command side effects", async () => {
   }
 });
 
+test("unknown sender is denied before any command response", async () => {
+  const harness = await createHarness({ accessRules: [] });
+
+  try {
+    const help = await harness.router.handle(inboundMessage({ text: "/help" }));
+    const unknown = await harness.router.handle(inboundMessage({ text: "/nope" }));
+
+    expect(responseText(help)).toBe("Access denied: this sender is not allowlisted.");
+    expect(responseText(unknown)).toBe("Access denied: this sender is not allowlisted.");
+    expect(harness.runtime.calls.ensureSession).toEqual([]);
+  } finally {
+    harness.database.close();
+  }
+});
+
 test("status reports context without creating a binding", async () => {
   const harness = await createHarness();
 

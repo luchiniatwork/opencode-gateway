@@ -1,0 +1,53 @@
+{
+  // Real Phase 1 smoke config.
+  // Required environment:
+  // - TELEGRAM_BOT_TOKEN: token from BotFather
+  // - TELEGRAM_ALLOW_FROM: numeric Telegram user id allowed to use the bot
+  // - OPENAI_API_KEY: OpenAI API key available to the attached OpenCode server
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "databasePath": "~/.opencode-gateway/smoke-state.db",
+    "logLevel": "info"
+  },
+  "opencode": {
+    "targets": [
+      {
+        "id": "default",
+        "name": "Local OpenCode",
+        "mode": "attach",
+        "serverUrl": "http://127.0.0.1:4096",
+        "workdir": "./opencode-smoke",
+        "defaultModel": "openai/gpt-5.5"
+      }
+    ]
+  },
+  "profiles": {
+    "default": "default",
+    "entries": [
+      {
+        "id": "default",
+        "displayName": "Default",
+        "description": "Phase 1 real smoke profile",
+        "defaultTarget": "default",
+        "defaultModel": "openai/gpt-5.5",
+        "defaults": { "verbosity": "compact", "busyMode": "queue" }
+      }
+    ]
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "{env:TELEGRAM_BOT_TOKEN}",
+      "allowFrom": ["{env:TELEGRAM_ALLOW_FROM}"],
+      "groups": {}
+    }
+  },
+  "defaults": {
+    "profile": "default",
+    "target": "default",
+    "busyMode": "queue",
+    "verbosity": "compact",
+    "inboundDebounceMs": 1500
+  }
+}

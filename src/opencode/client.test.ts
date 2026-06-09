@@ -120,6 +120,72 @@ test("maps assistant errors to error turns", async () => {
   expect(turn.text).toBe("Missing credentials");
 });
 
+test("polls session messages when prompt returns an empty body", async () => {
+  const sdk = createFakeSdkClient({
+    prompt: {},
+    messageSnapshots: [
+      [],
+      [
+        {
+          info: { id: "message-user", role: "user", sessionID: "session-1" },
+          parts: [{ type: "text", text: "Hello" }],
+        },
+        {
+          info: { id: "message-assistant", role: "assistant", sessionID: "session-1" },
+          parts: [{ type: "text", text: "Hello from OpenCode." }],
+        },
+      ],
+    ],
+  });
+  const runtime = new OpenCodeRuntime({
+    createClient: () => sdk.client,
+    finalResponseTimeoutMs: 0,
+    finalResponsePollIntervalMs: 0,
+  });
+
+  const turn = await runtime.send({ target: attachTarget, sessionId: "session-1", text: "Hello" });
+
+  expect(turn).toMatchObject({
+    id: "message-assistant",
+    sessionId: "session-1",
+    status: "completed",
+    text: "Hello from OpenCode.",
+  });
+  expect(sdk.calls.messages).toHaveLength(2);
+});
+
+test("returns an error turn when OpenCode never produces an assistant message", async () => {
+  const sdk = createFakeSdkClient({
+    prompt: {},
+    messageSnapshots: [
+      [],
+      [
+        {
+          info: {
+            id: "message-user",
+            role: "user",
+            sessionID: "session-1",
+            agent: "build",
+            model: { providerID: "missing", modelID: "model" },
+          },
+          parts: [{ type: "text", text: "Hello" }],
+        },
+      ],
+    ],
+  });
+  const runtime = new OpenCodeRuntime({
+    createClient: () => sdk.client,
+    finalResponseTimeoutMs: 0,
+    finalResponsePollIntervalMs: 0,
+  });
+
+  const turn = await runtime.send({ target: attachTarget, sessionId: "session-1", text: "Hello" });
+
+  expect(turn.status).toBe("error");
+  expect(turn.text).toContain("did not produce an assistant response");
+  expect(turn.text).toContain("agent build, model missing/model");
+});
+
 test("rejects unsupported attachments in phase 1", async () => {
   const sdk = createFakeSdkClient();
   const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
@@ -204,6 +270,8 @@ interface FakeSdkOptions {
   getSession?: FakeSession;
   sessions?: FakeSession[];
   prompt?: FakePromptResponse;
+  messages?: FakePromptResponse[];
+  messageSnapshots?: FakePromptResponse[][];
 }
 
 interface FakeSession {
@@ -216,18 +284,22 @@ interface FakePromptResponse {
   info?: {
     id?: string;
     sessionID?: string;
+    role?: string;
     error?: unknown;
     cost?: number;
+    agent?: string;
+    model?: { providerID?: string; modelID?: string };
     tokens?: { input?: number; output?: number; reasoning?: number };
   };
   parts?: Array<{ type: string; text?: string }>;
 }
 
 function createFakeSdkClient(options: FakeSdkOptions = {}) {
-  const calls: Record<"create" | "get" | "list" | "prompt" | "abort", unknown[]> = {
+  const calls: Record<"create" | "get" | "list" | "messages" | "prompt" | "abort", unknown[]> = {
     create: [],
     get: [],
     list: [],
+    messages: [],
     prompt: [],
     abort: [],
   };
@@ -235,6 +307,8 @@ function createFakeSdkClient(options: FakeSdkOptions = {}) {
     createSession: options.createSession ?? { id: "session-created" },
     getSession: options.getSession ?? { id: "session-existing" },
     sessions: options.sessions ?? [],
+    messages: options.messages ?? [],
+    messageSnapshots: options.messageSnapshots,
     prompt: options.prompt ?? { info: { id: "message-1", sessionID: "session-1" }, parts: [] },
   };
 
@@ -255,6 +329,10 @@ function createFakeSdkClient(options: FakeSdkOptions = {}) {
         async list(input: unknown) {
           calls.list.push(input);
           return { data: responses.sessions };
+        },
+        async messages(input: unknown) {
+          calls.messages.push(input);
+          return { data: responses.messageSnapshots?.[calls.messages.length - 1] ?? responses.messages };
         },
         async prompt(input: unknown) {
           calls.prompt.push(input);

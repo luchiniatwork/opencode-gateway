@@ -41,6 +41,9 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       const parsed = parseCommand(message);
       if (!parsed) return { handled: false };
 
+      const denied = accessDeniedText(message);
+      if (denied) return { handled: true, command: parsed.name, messages: [markdown(denied)] };
+
       const response = await executeCommand(parsed, message);
       return { handled: true, command: parsed.name, messages: [markdown(response)] };
     },

@@ -1,5 +1,6 @@
 import { parse, printParseErrorCode, type ParseError } from "jsonc-parser";
 import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { ZodError } from "zod";
 
 import {
@@ -16,6 +17,7 @@ import {
 export interface ConfigLoadOptions {
   env?: Record<string, string | undefined>;
   homeDir?: string;
+  baseDir?: string;
 }
 
 export class ConfigError extends Error {
@@ -32,7 +34,7 @@ export async function loadConfig(
   filePath: string,
   options: ConfigLoadOptions = {},
 ): Promise<GatewayConfig> {
-  const resolvedPath = expandHomePath(filePath, getHomeDir(options));
+  const resolvedPath = resolve(expandPath(filePath, getHomeDir(options), undefined));
 
   let content: string;
 
@@ -44,7 +46,7 @@ export async function loadConfig(
     ]);
   }
 
-  return parseGatewayConfig(content, options);
+  return parseGatewayConfig(content, { ...options, baseDir: dirname(resolvedPath) });
 }
 
 export function parseGatewayConfig(
@@ -91,7 +93,7 @@ export function parseGatewayConfig(
     throw new ConfigError("Invalid config", issues);
   }
 
-  return normalizeConfig(rawConfig, getHomeDir(options));
+  return normalizeConfig(rawConfig, getHomeDir(options), options.baseDir);
 }
 
 export function getConfigSeeds(config: GatewayConfig): ConfigSeeds {
@@ -115,15 +117,15 @@ function getAccessRuleSeeds(config: GatewayConfig): AccessRuleSeed[] {
   }));
 }
 
-function normalizeConfig(rawConfig: RawGatewayConfig, homeDir: string): GatewayConfig {
+function normalizeConfig(rawConfig: RawGatewayConfig, homeDir: string, baseDir: string | undefined): GatewayConfig {
   const targets = rawConfig.opencode.targets.map(
     (target): GatewayTargetConfig => ({
       id: target.id,
       name: target.name ?? target.id,
       mode: target.mode,
       serverUrl: target.serverUrl,
-      workdir: expandOptionalHomePath(target.workdir, homeDir),
-      configDir: expandOptionalHomePath(target.configDir, homeDir),
+      workdir: expandOptionalPath(target.workdir, homeDir, baseDir),
+      configDir: expandOptionalPath(target.configDir, homeDir, baseDir),
       defaultAgent: target.defaultAgent,
       defaultModel: target.defaultModel,
     }),
@@ -156,7 +158,7 @@ function normalizeConfig(rawConfig: RawGatewayConfig, homeDir: string): GatewayC
       defaultTargetId: profile.defaultTarget,
       defaultAgent: profile.defaultAgent,
       defaultModel: profile.defaultModel,
-      defaultConfigDir: expandOptionalHomePath(profile.defaultConfigDir, homeDir),
+      defaultConfigDir: expandOptionalPath(profile.defaultConfigDir, homeDir, baseDir),
       accessPolicyId: profile.accessPolicyId,
       commandPolicyId: profile.commandPolicyId,
       defaults: {
@@ -172,7 +174,7 @@ function normalizeConfig(rawConfig: RawGatewayConfig, homeDir: string): GatewayC
     gateway: {
       host: rawConfig.gateway.host,
       port: rawConfig.gateway.port,
-      databasePath: expandHomePath(rawConfig.gateway.databasePath, homeDir),
+      databasePath: expandPath(rawConfig.gateway.databasePath, homeDir, baseDir),
       logLevel: rawConfig.gateway.logLevel,
     },
     opencode: { targets },
@@ -347,14 +349,15 @@ function expandStringEnvRef(
   };
 }
 
-function expandOptionalHomePath(value: string | undefined, homeDir: string): string | undefined {
+function expandOptionalPath(value: string | undefined, homeDir: string, baseDir: string | undefined): string | undefined {
   if (!value) return undefined;
-  return expandHomePath(value, homeDir);
+  return expandPath(value, homeDir, baseDir);
 }
 
-function expandHomePath(value: string, homeDir: string): string {
+function expandPath(value: string, homeDir: string, baseDir: string | undefined): string {
   if (value === "~") return homeDir;
   if (value.startsWith("~/")) return `${homeDir}${value.slice(1)}`;
+  if (baseDir && !isAbsolute(value) && value !== ":memory:") return join(baseDir, value);
   return value;
 }
 

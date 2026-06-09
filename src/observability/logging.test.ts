@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { createJsonLogSink } from "./logging.ts";
+import { createJsonLogSink, redactLogEntry } from "./logging.ts";
 
 test("json log sink filters by level and redacts sensitive fields", () => {
   const lines: string[] = [];
@@ -38,4 +38,38 @@ test("json log sink filters by level and redacts sensitive fields", () => {
   } finally {
     console.log = originalLog;
   }
+});
+
+test("redacts nested secrets from objects and arrays", () => {
+  const redacted = redactLogEntry({
+    timestamp: "2026-01-01T00:00:00.000Z",
+    level: "error",
+    component: "test",
+    message: "written",
+    raw: {
+      headers: {
+        authorization: "Bearer secret-token",
+        cookie: "session=secret",
+      },
+      attempts: [
+        {
+          api_key: "secret-key",
+          status: "failed",
+        },
+      ],
+    },
+  });
+
+  expect(redacted.raw).toEqual({
+    headers: {
+      authorization: "[redacted]",
+      cookie: "[redacted]",
+    },
+    attempts: [
+      {
+        api_key: "[redacted]",
+        status: "failed",
+      },
+    ],
+  });
 });

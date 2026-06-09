@@ -28,8 +28,18 @@ interface SdkSession {
 interface SdkAssistantMessage {
   id?: string;
   sessionID?: string;
+  role?: string;
   error?: unknown;
   cost?: number;
+  finish?: string;
+  time?: {
+    completed?: number;
+  };
+  agent?: string;
+  model?: {
+    providerID?: string;
+    modelID?: string;
+  };
   tokens?: {
     input?: number;
     output?: number;
@@ -47,6 +57,11 @@ interface SdkPromptResponse {
   parts?: SdkPart[];
 }
 
+interface SdkMessageEntry {
+  info?: SdkAssistantMessage;
+  parts?: SdkPart[];
+}
+
 interface SdkSessionOptions {
   path?: { id: string };
   query?: { directory?: string };
@@ -58,6 +73,7 @@ interface OpenCodeSdkClient {
     create(options?: SdkSessionOptions): Promise<SdkResult<SdkSession>>;
     get(options: SdkSessionOptions): Promise<SdkResult<SdkSession>>;
     list(options?: SdkSessionOptions): Promise<SdkResult<SdkSession[]>>;
+    messages?(options: SdkSessionOptions): Promise<SdkResult<SdkMessageEntry[]>>;
     prompt(options: SdkSessionOptions): Promise<SdkResult<SdkPromptResponse>>;
     abort(options: SdkSessionOptions): Promise<SdkResult<boolean>>;
   };
@@ -65,6 +81,8 @@ interface OpenCodeSdkClient {
 
 interface OpenCodeRuntimeOptions {
   createClient?: (target: RuntimeTarget) => OpenCodeSdkClient;
+  finalResponseTimeoutMs?: number;
+  finalResponsePollIntervalMs?: number;
 }
 
 export class OpenCodeRuntimeError extends Error {
@@ -76,12 +94,16 @@ export class OpenCodeRuntimeError extends Error {
 
 export class OpenCodeRuntime implements AgentRuntime {
   private readonly createClient: (target: RuntimeTarget) => OpenCodeSdkClient;
+  private readonly finalResponseTimeoutMs: number;
+  private readonly finalResponsePollIntervalMs: number;
   private readonly clients = new Map<string, OpenCodeSdkClient>();
 
   constructor(options: OpenCodeRuntimeOptions = {}) {
     this.createClient =
       options.createClient ??
       ((target) => createOpencodeClient({ baseUrl: target.serverUrl }) as OpenCodeSdkClient);
+    this.finalResponseTimeoutMs = options.finalResponseTimeoutMs ?? 60_000;
+    this.finalResponsePollIntervalMs = options.finalResponsePollIntervalMs ?? 1_000;
   }
 
   async ensureSession(input: EnsureSessionInput): Promise<RuntimeSession> {
@@ -117,6 +139,8 @@ export class OpenCodeRuntime implements AgentRuntime {
 
     const client = this.getClient(input.target);
     const model = parseModelRef(input.model);
+    const beforeMessages = await listMessages(client, input.target, input.sessionId).catch(() => []);
+    const beforeMessageIds = new Set(beforeMessages.map((message) => message.info?.id).filter(isNonEmptyString));
     const response = await unwrapSdkResult(
       client.session.prompt({
         path: { id: input.sessionId },
@@ -130,7 +154,18 @@ export class OpenCodeRuntime implements AgentRuntime {
       `Unable to send prompt to OpenCode session ${input.sessionId}`,
     );
 
-    return mapTurn(input.sessionId, response);
+    if (isPromptResponse(response)) {
+      return mapTurn(input.sessionId, response);
+    }
+
+    return waitForAssistantTurn({
+      client,
+      target: input.target,
+      sessionId: input.sessionId,
+      beforeMessageIds,
+      timeoutMs: this.finalResponseTimeoutMs,
+      pollIntervalMs: this.finalResponsePollIntervalMs,
+    });
   }
 
   async abort(input: AbortRuntimeTurnInput): Promise<void> {
@@ -219,8 +254,99 @@ async function unwrapSdkResult<T>(resultPromise: Promise<SdkResult<T>>, message:
   }
 }
 
+async function waitForAssistantTurn(input: {
+  client: OpenCodeSdkClient;
+  target: RuntimeTarget;
+  sessionId: string;
+  beforeMessageIds: Set<string>;
+  timeoutMs: number;
+  pollIntervalMs: number;
+}): Promise<RuntimeTurn> {
+  const deadline = Date.now() + input.timeoutMs;
+  let latestMessages: SdkMessageEntry[] = [];
+
+  do {
+    latestMessages = await listMessages(input.client, input.target, input.sessionId);
+
+    const assistant = latestMessages.find(
+      (message) => message.info?.role === "assistant" && !messageIdWasSeen(message, input.beforeMessageIds),
+    );
+
+    if (assistant) {
+      return mapTurn(input.sessionId, {
+        info: assistant.info,
+        parts: assistant.parts ?? [],
+      });
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+
+    await sleep(Math.min(input.pollIntervalMs, remainingMs));
+  } while (true);
+
+  return {
+    sessionId: input.sessionId,
+    status: "error",
+    text: noAssistantResponseText(input.timeoutMs, latestMessages),
+    raw: { messages: latestMessages },
+  };
+}
+
+async function listMessages(
+  client: OpenCodeSdkClient,
+  target: RuntimeTarget,
+  sessionId: string,
+): Promise<SdkMessageEntry[]> {
+  if (!client.session.messages) return [];
+
+  return unwrapSdkResult(
+    client.session.messages({
+      path: { id: sessionId },
+      query: directoryQuery(target),
+    }),
+    `Unable to list OpenCode messages for session ${sessionId}`,
+  );
+}
+
+function isPromptResponse(value: SdkPromptResponse): boolean {
+  return Boolean(value.info || (Array.isArray(value.parts) && value.parts.length > 0));
+}
+
+function messageIdWasSeen(message: SdkMessageEntry, seen: Set<string>): boolean {
+  const id = message.info?.id;
+
+  return typeof id === "string" && seen.has(id);
+}
+
+function noAssistantResponseText(timeoutMs: number, messages: SdkMessageEntry[]): string {
+  const latestUser = [...messages].reverse().find((message) => message.info?.role === "user");
+  const model = latestUser?.info?.model;
+  const modelRef = model?.providerID && model.modelID ? `${model.providerID}/${model.modelID}` : undefined;
+  const details = [latestUser?.info?.agent ? `agent ${latestUser.info.agent}` : undefined, modelRef ? `model ${modelRef}` : undefined]
+    .filter(Boolean)
+    .join(", ");
+
+  return [
+    `OpenCode accepted the prompt but did not produce an assistant response within ${timeoutMs}ms.`,
+    details ? `Selected ${details}.` : undefined,
+    "Check the target model/agent configuration and OpenCode server logs.",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function isSdkFieldsResult<T>(value: SdkResult<T>): value is SdkFieldsResult<T> {
   return Boolean(value && typeof value === "object" && ("data" in value || "error" in value));
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
 }
 
 function mapSession(target: RuntimeTarget, session: SdkSession): RuntimeSession {

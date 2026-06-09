@@ -16,9 +16,65 @@
         "type": "github"
       }
     },
+    "opencode-darwin-arm64": {
+      "flake": false,
+      "locked": {
+        "lastModified": 499162500,
+        "narHash": "sha256-a2sdDXiXQur9seUeG26oYeSPkrGS3WJmiT0qiZhdwtM=",
+        "type": "tarball",
+        "url": "https://registry.npmjs.org/opencode-darwin-arm64/-/opencode-darwin-arm64-1.16.2.tgz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://registry.npmjs.org/opencode-darwin-arm64/-/opencode-darwin-arm64-1.16.2.tgz"
+      }
+    },
+    "opencode-darwin-x64": {
+      "flake": false,
+      "locked": {
+        "lastModified": 499162500,
+        "narHash": "sha256-PrQV//bMpRft8jqYXgYX1FB4yaqqLgU2IBakKeEBm74=",
+        "type": "tarball",
+        "url": "https://registry.npmjs.org/opencode-darwin-x64/-/opencode-darwin-x64-1.16.2.tgz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://registry.npmjs.org/opencode-darwin-x64/-/opencode-darwin-x64-1.16.2.tgz"
+      }
+    },
+    "opencode-linux-arm64": {
+      "flake": false,
+      "locked": {
+        "lastModified": 499162500,
+        "narHash": "sha256-mqXE3lGQWlsg4HIDr3WdWzUfnbhYP82GfStqqtrSfQc=",
+        "type": "tarball",
+        "url": "https://registry.npmjs.org/opencode-linux-arm64/-/opencode-linux-arm64-1.16.2.tgz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://registry.npmjs.org/opencode-linux-arm64/-/opencode-linux-arm64-1.16.2.tgz"
+      }
+    },
+    "opencode-linux-x64": {
+      "flake": false,
+      "locked": {
+        "lastModified": 499162500,
+        "narHash": "sha256-uOvZkG4eLH3QYPeGPaVyIQsEswakUyX1kDqJSsV4mJI=",
+        "type": "tarball",
+        "url": "https://registry.npmjs.org/opencode-linux-x64/-/opencode-linux-x64-1.16.2.tgz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://registry.npmjs.org/opencode-linux-x64/-/opencode-linux-x64-1.16.2.tgz"
+      }
+    },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "opencode-darwin-arm64": "opencode-darwin-arm64",
+        "opencode-darwin-x64": "opencode-darwin-x64",
+        "opencode-linux-arm64": "opencode-linux-arm64",
+        "opencode-linux-x64": "opencode-linux-x64"
       }
     }
   },

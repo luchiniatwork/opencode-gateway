@@ -25,6 +25,15 @@ test("starts and stops a Telegram bot", async () => {
   expect(fakeBot.stopped).toBe(true);
 });
 
+test("fails startup when Telegram authentication fails", async () => {
+  const fakeBot = new FakeTelegramBot();
+  fakeBot.getMeError = new Error("Call to 'getMe' failed! (404: Not Found)");
+  const adapter = createTelegramAdapter({ botFactory: () => fakeBot });
+
+  await expect(adapter.start(startContext())).rejects.toThrow("Telegram bot authentication failed");
+  expect(fakeBot.started).toBe(false);
+});
+
 test("emits normalized DM messages", async () => {
   const fakeBot = new FakeTelegramBot();
   const events: ChannelEvent[] = [];
@@ -211,9 +220,13 @@ class FakeTelegramBot implements TelegramBotLike {
   started = false;
   stopped = false;
   nextMessageId = 1;
+  getMeError: Error | undefined;
 
   readonly api = {
-    getMe: async () => ({ username: "GatewayBot" }),
+    getMe: async () => {
+      if (this.getMeError) throw this.getMeError;
+      return { username: "GatewayBot" };
+    },
     sendMessage: async (chatId: number | string, text: string, options?: TelegramSendMessageOptions) => {
       this.sentMessages.push({ chatId, text, options });
 

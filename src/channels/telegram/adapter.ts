@@ -81,11 +81,12 @@ export function createTelegramAdapter(options: TelegramAdapterOptions = {}): Cha
         throw new Error("Telegram token is required when Telegram channel is enabled");
       }
 
-      started = true;
       stopRequested = false;
-      bot = botFactory(ctx.config.token);
-      const activeBot = bot;
+      const activeBot = botFactory(ctx.config.token);
       const botUsername = await loadBotUsername(activeBot, ctx.logger);
+
+      bot = activeBot;
+      started = true;
 
       activeBot.catch?.((error) => {
         ctx.logger.error("telegram bot error", { error: formatError(error) });
@@ -209,8 +210,8 @@ async function loadBotUsername(bot: TelegramBotLike, logger: ChannelLogger): Pro
   try {
     return (await bot.api.getMe()).username;
   } catch (error) {
-    logger.warn("telegram bot username unavailable", { error: formatError(error) });
-    return undefined;
+    logger.error("telegram bot authentication failed", { error: formatError(error) });
+    throw new Error(`Telegram bot authentication failed: ${formatError(error)}`);
   }
 }
 

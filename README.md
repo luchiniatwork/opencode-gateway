@@ -74,6 +74,16 @@ Run the current entry point:
 bun run index.ts
 ```
 
+Run the real Phase 1 smoke workflow against a local config:
+
+```bash
+TELEGRAM_BOT_TOKEN=... TELEGRAM_ALLOW_FROM=123456789 \
+OPENAI_API_KEY=... \
+  bun run smoke:real -- --config examples/config.smoke.jsonc
+```
+
+The smoke script validates the real config and Telegram bot token, sends a real prompt through the OpenCode SDK wrapper, then starts the gateway so an allowlisted Telegram account can verify `/status`, a normal OpenCode turn, and restart/session reuse. It expects OpenCode `1.16.2` at `http://127.0.0.1:4096`; update `examples/config.smoke.jsonc` or pass another config path if your server is elsewhere. The example selects `openai/gpt-5.5` and uses `examples/opencode-smoke/opencode.json` to configure OpenAI's US regional base URL, `https://us.api.openai.com/v1`.
+
 Build the installable package CLI:
 
 ```bash
