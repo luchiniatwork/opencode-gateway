@@ -4,15 +4,17 @@ import type { TelegramChannelConfig } from "../../config/schema.ts";
 import type { ChannelEvent, ChannelLogger, ChannelStartContext, OutboundTarget } from "../types.ts";
 import {
   createTelegramAdapter,
+  editTelegramMessage,
   sendTelegramMessage,
   sendTelegramTyping,
   type TelegramChatAction,
   type TelegramBotLike,
   type TelegramContextLike,
+  type TelegramEditMessageTextOptions,
   type TelegramSendMessageOptions,
 } from "./adapter.ts";
 import { TELEGRAM_MAX_TEXT_LENGTH } from "./format.ts";
-import type { TelegramTextMessageRef } from "./normalize.ts";
+import { telegramActionCallbackData, type TelegramCallbackQueryRef, type TelegramTextMessageRef } from "./normalize.ts";
 
 test("starts and stops a Telegram bot", async () => {
   const fakeBot = new FakeTelegramBot();
@@ -147,6 +149,113 @@ test("send passes Telegram topic message thread id", async () => {
   expect(fakeBot.sentMessages[0]?.options).toEqual({ message_thread_id: 42 });
 });
 
+test("send renders actions as Telegram inline keyboard buttons", async () => {
+  const fakeBot = new FakeTelegramBot();
+
+  await sendTelegramMessage(fakeBot, outboundTarget(), {
+    kind: "status",
+    text: "Permission required",
+    actions: [
+      { id: "permission.approve", label: "Approve", style: "primary", value: "permission-1" },
+      { id: "permission.deny", label: "Deny", style: "danger", value: "permission-1" },
+    ],
+  });
+
+  expect(fakeBot.sentMessages[0]?.options).toEqual({
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "Approve",
+            callback_data: telegramActionCallbackData({ actionId: "permission.approve", value: "permission-1" }),
+          },
+          {
+            text: "Deny",
+            callback_data: telegramActionCallbackData({ actionId: "permission.deny", value: "permission-1" }),
+          },
+        ],
+      ],
+    },
+  });
+});
+
+test("send attaches actions only to the first split Telegram message", async () => {
+  const fakeBot = new FakeTelegramBot();
+  const text = "a".repeat(TELEGRAM_MAX_TEXT_LENGTH + 10);
+
+  await sendTelegramMessage(fakeBot, outboundTarget(), {
+    kind: "status",
+    text,
+    actions: [{ id: "approve", label: "Approve" }],
+  });
+
+  expect(fakeBot.sentMessages).toHaveLength(2);
+  expect(fakeBot.sentMessages[0]?.options?.reply_markup).toBeDefined();
+  expect(fakeBot.sentMessages[1]?.options).toBeUndefined();
+});
+
+test("send rejects actions with oversized Telegram callback data", async () => {
+  const fakeBot = new FakeTelegramBot();
+
+  await expect(
+    sendTelegramMessage(fakeBot, outboundTarget(), {
+      kind: "status",
+      text: "Permission required",
+      actions: [{ id: "a".repeat(80), label: "Approve" }],
+    }),
+  ).rejects.toThrow("Telegram action callback data exceeds 64 bytes");
+});
+
+test("edit updates a Telegram message and inline keyboard", async () => {
+  const fakeBot = new FakeTelegramBot();
+  const receipt = await sendTelegramMessage(fakeBot, outboundTarget(), { kind: "progress", text: "Working" });
+
+  const editedReceipt = await editTelegramMessage(
+    fakeBot,
+    receipt,
+    {
+      kind: "progress",
+      text: "Still working",
+      actions: [{ id: "permission.approve", label: "Approve", value: "permission-1" }],
+    },
+    () => new Date("2026-01-01T00:00:00.000Z"),
+  );
+
+  expect(fakeBot.editedMessages).toEqual([
+    {
+      chatId: "123",
+      messageId: 1,
+      text: "Still working",
+      options: {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "Approve",
+                callback_data: telegramActionCallbackData({ actionId: "permission.approve", value: "permission-1" }),
+              },
+            ],
+          ],
+        },
+      },
+    },
+  ]);
+  expect(editedReceipt).toMatchObject({ platformMessageId: "1", timestamp: "2026-01-01T00:00:00.000Z" });
+});
+
+test("edit clears Telegram inline keyboard when no actions are present", async () => {
+  const fakeBot = new FakeTelegramBot();
+  const receipt = await sendTelegramMessage(fakeBot, outboundTarget(), {
+    kind: "progress",
+    text: "Working",
+    actions: [{ id: "approve", label: "Approve" }],
+  });
+
+  await editTelegramMessage(fakeBot, receipt, { kind: "progress", text: "Done" });
+
+  expect(fakeBot.editedMessages[0]?.options).toEqual({ reply_markup: { inline_keyboard: [] } });
+});
+
 test("sendTyping sends Telegram typing chat action", async () => {
   const fakeBot = new FakeTelegramBot();
 
@@ -183,6 +292,63 @@ test("sendTyping ignores idle state", async () => {
   await sendTelegramTyping(fakeBot, outboundTarget(), "idle");
 
   expect(fakeBot.chatActions).toEqual([]);
+});
+
+test("emits normalized Telegram callback actions and answers callback query", async () => {
+  const fakeBot = new FakeTelegramBot();
+  const events: ChannelEvent[] = [];
+  const adapter = createTelegramAdapter({
+    botFactory: () => fakeBot,
+    now: () => new Date("2026-01-01T00:00:00.000Z"),
+  });
+
+  await adapter.start(startContext({ emit: (event) => void events.push(event) }));
+  await fakeBot.emitCallbackQuery(callbackQuery());
+
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({
+    type: "action",
+    action: {
+      id: "callback-1",
+      channel: "telegram",
+      accountId: "default",
+      conversation: { key: "telegram:default:dm:123" },
+      sender: { id: "123", username: "tiago" },
+      message: { id: "20" },
+      actionId: "permission.approve",
+      value: "permission-1",
+      timestamp: "2026-01-01T00:00:00.000Z",
+    },
+  });
+  expect(fakeBot.answeredCallbackQueries).toEqual([{ id: "callback-1", options: undefined }]);
+});
+
+test("answers unsupported callback query data without emitting an action", async () => {
+  const fakeBot = new FakeTelegramBot();
+  const events: ChannelEvent[] = [];
+  const adapter = createTelegramAdapter({ botFactory: () => fakeBot });
+
+  await adapter.start(startContext({ emit: (event) => void events.push(event) }));
+  await fakeBot.emitCallbackQuery(callbackQuery({ data: "unsupported" }));
+
+  expect(events).toEqual([]);
+  expect(fakeBot.answeredCallbackQueries).toEqual([{ id: "callback-1", options: { text: "Unsupported action" } }]);
+});
+
+test("answers callback query with failure when action emit fails", async () => {
+  const fakeBot = new FakeTelegramBot();
+  const adapter = createTelegramAdapter({ botFactory: () => fakeBot });
+
+  await adapter.start(
+    startContext({
+      emit: () => {
+        throw new Error("emit failed");
+      },
+    }),
+  );
+  await fakeBot.emitCallbackQuery(callbackQuery());
+
+  expect(fakeBot.answeredCallbackQueries).toEqual([{ id: "callback-1", options: { text: "Action failed" } }]);
 });
 
 function startContext(
@@ -241,6 +407,25 @@ function textMessage(options: Partial<TelegramTextMessageRef> = {}): TelegramTex
   };
 }
 
+function callbackQuery(options: Partial<TelegramCallbackQueryRef> = {}): TelegramCallbackQueryRef {
+  return {
+    id: "callback-1",
+    from: {
+      id: 123,
+      is_bot: false,
+      username: "tiago",
+      first_name: "Tiago",
+    },
+    data: telegramActionCallbackData({ actionId: "permission.approve", value: "permission-1" }),
+    message: {
+      message_id: 20,
+      date: 1_767_225_600,
+      chat: { id: 123, type: "private" },
+    },
+    ...options,
+  };
+}
+
 function testLogger(): ChannelLogger {
   return {
     debug: () => undefined,
@@ -251,17 +436,25 @@ function testLogger(): ChannelLogger {
 }
 
 class FakeTelegramBot implements TelegramBotLike {
-  readonly handlers: Array<(ctx: TelegramContextLike) => unknown | Promise<unknown>> = [];
+  readonly messageHandlers: Array<(ctx: TelegramContextLike) => unknown | Promise<unknown>> = [];
+  readonly callbackHandlers: Array<(ctx: TelegramContextLike) => unknown | Promise<unknown>> = [];
   readonly sentMessages: Array<{
     chatId: number | string;
     text: string;
     options?: TelegramSendMessageOptions;
+  }> = [];
+  readonly editedMessages: Array<{
+    chatId: number | string;
+    messageId: number;
+    text: string;
+    options?: TelegramEditMessageTextOptions;
   }> = [];
   readonly chatActions: Array<{
     chatId: number | string;
     action: TelegramChatAction;
     options?: TelegramSendMessageOptions;
   }> = [];
+  readonly answeredCallbackQueries: Array<{ id: string; options?: unknown }> = [];
   started = false;
   stopped = false;
   nextMessageId = 1;
@@ -284,10 +477,32 @@ class FakeTelegramBot implements TelegramBotLike {
     sendChatAction: async (chatId: number | string, action: TelegramChatAction, options?: TelegramSendMessageOptions) => {
       this.chatActions.push({ chatId, action, options });
     },
+    editMessageText: async (
+      chatId: number | string,
+      messageId: number,
+      text: string,
+      options?: TelegramEditMessageTextOptions,
+    ) => {
+      this.editedMessages.push({ chatId, messageId, text, options });
+
+      return {
+        message_id: messageId,
+        date: 1_767_225_600,
+        chat: { id: chatId },
+      };
+    },
+    answerCallbackQuery: async (id: string, options?: unknown) => {
+      this.answeredCallbackQueries.push({ id, options });
+    },
   };
 
-  on(_filter: "message:text", handler: (ctx: TelegramContextLike) => unknown | Promise<unknown>): void {
-    this.handlers.push(handler);
+  on(filter: "message:text" | "callback_query:data", handler: (ctx: TelegramContextLike) => unknown | Promise<unknown>): void {
+    if (filter === "message:text") {
+      this.messageHandlers.push(handler);
+      return;
+    }
+
+    this.callbackHandlers.push(handler);
   }
 
   catch(): void {
@@ -303,8 +518,14 @@ class FakeTelegramBot implements TelegramBotLike {
   }
 
   async emitMessage(message: TelegramTextMessageRef): Promise<void> {
-    for (const handler of this.handlers) {
+    for (const handler of this.messageHandlers) {
       await handler({ message });
+    }
+  }
+
+  async emitCallbackQuery(callbackQuery: TelegramCallbackQueryRef): Promise<void> {
+    for (const handler of this.callbackHandlers) {
+      await handler({ callbackQuery });
     }
   }
 }
