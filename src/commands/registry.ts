@@ -178,10 +178,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       const sessions = await runtime.listSessions({ target: context.target, limit: 10 });
       if (sessions.length === 0) return `No recent sessions found for target ${context.target.id}.`;
 
-      return [
-        `Recent sessions for ${context.target.name} (${context.target.id}):`,
-        ...sessions.map((session) => formatSessionLine(session, context.binding?.opencodeSessionId)),
-      ].join("\n");
+      return sessions.map((session) => formatSessionLine(session, context.binding?.opencodeSessionId)).join("\n");
     } catch (error) {
       return `Unable to list sessions: ${formatError(error)}`;
     }
@@ -325,11 +322,13 @@ function formatRun(run: RunRecord | undefined): string {
 }
 
 function formatSessionLine(session: RuntimeSession, currentSessionId: string | undefined): string {
-  const marker = session.id === currentSessionId ? "*" : "-";
-  const title = session.title ? ` - ${session.title}` : "";
-  const updated = session.updatedAt ? ` (${session.updatedAt})` : "";
+  const current = session.id === currentSessionId ? " (current)" : "";
 
-  return `${marker} ${session.id}${title}${updated}`;
+  return `- ${session.id} "${formatSessionShortName(session.title)}"${current}`;
+}
+
+function formatSessionShortName(title: string | undefined): string {
+  return (title ?? "").replaceAll('"', '\\"');
 }
 
 function formatProfileLine(profile: ProfileRecord, currentProfileId: string): string {

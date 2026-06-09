@@ -313,7 +313,6 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
   ): Promise<RuntimeSession> {
     return runtime.ensureSession({
       target,
-      title: sessionTitle(message),
       profileId: profile.id,
       agent: effectiveAgent(undefined, profile, target),
       model: effectiveModel(undefined, profile, target),
@@ -395,13 +394,6 @@ function mapAttachments(attachments: InboundAttachment[]): RuntimeAttachment[] |
     contentType: attachment.contentType,
     url: attachment.url,
   }));
-}
-
-function sessionTitle(message: InboundMessage): string {
-  if (message.conversation.title) return message.conversation.title;
-  if (message.sender.displayName) return `${message.sender.displayName} via ${message.channel}`;
-  if (message.sender.username) return `@${message.sender.username} via ${message.channel}`;
-  return message.conversation.key;
 }
 
 function messageMetadata(message: InboundMessage): Record<string, unknown> {

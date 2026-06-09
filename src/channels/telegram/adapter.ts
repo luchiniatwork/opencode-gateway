@@ -8,6 +8,7 @@ import type {
   ChannelStartContext,
   OutboundTarget,
   SendReceipt,
+  TypingState,
 } from "../types.ts";
 import { splitTelegramText, telegramOutboundText } from "./format.ts";
 import {
@@ -37,7 +38,14 @@ export interface TelegramBotApiLike {
     text: string,
     options?: TelegramSendMessageOptions,
   ): Promise<TelegramSentMessageRef>;
+  sendChatAction(
+    chatId: number | string,
+    action: TelegramChatAction,
+    options?: TelegramSendMessageOptions,
+  ): Promise<unknown>;
 }
+
+export type TelegramChatAction = "typing" | "upload_document";
 
 export interface TelegramContextLike {
   message?: TelegramTextMessageRef;
@@ -164,6 +172,12 @@ export function createTelegramAdapter(options: TelegramAdapterOptions = {}): Cha
 
       return sendTelegramMessage(bot, target, message, now);
     },
+
+    async sendTyping(target, state): Promise<void> {
+      if (!bot) throw new Error("Telegram adapter is not started");
+
+      await sendTelegramTyping(bot, target, state);
+    },
   };
 }
 
@@ -195,6 +209,24 @@ export async function sendTelegramMessage(
     timestamp: first.date === undefined ? now().toISOString() : new Date(first.date * 1_000).toISOString(),
     raw: { messages: sentMessages },
   };
+}
+
+export async function sendTelegramTyping(
+  bot: TelegramBotLike,
+  target: OutboundTarget,
+  state: TypingState,
+): Promise<void> {
+  const action = telegramChatAction(state);
+
+  if (!action) return;
+
+  await bot.api.sendChatAction(target.conversationId, action, telegramSendOptions(target));
+}
+
+function telegramChatAction(state: TypingState): TelegramChatAction | undefined {
+  if (state === "typing") return "typing";
+  if (state === "uploading") return "upload_document";
+  return undefined;
 }
 
 function telegramSendOptions(target: OutboundTarget): TelegramSendMessageOptions | undefined {

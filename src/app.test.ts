@@ -12,6 +12,7 @@ import type {
   InboundMessage,
   OutboundTarget,
   SendReceipt,
+  TypingState,
 } from "./channels/types.ts";
 import type { GatewayConfig } from "./config/schema.ts";
 import type { OutboundMessage } from "./messages/types.ts";
@@ -162,6 +163,42 @@ test("gateway app dispatches non-command messages to OpenCode and sends final re
   }
 });
 
+test("gateway app sends typing feedback while handling messages", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new SlowRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    const emitPromise = channel.emit(inboundMessage({ text: "Take your time" }));
+
+    await runtime.sendStarted;
+
+    expect(channel.typing.map((entry) => entry.state)).toEqual(["typing"]);
+
+    runtime.finishSend({
+      id: "message-slow",
+      sessionId: "session-1",
+      status: "completed",
+      text: "slow answer",
+    });
+    await emitPromise;
+
+    expect(channel.typing.map((entry) => entry.state)).toEqual(["typing", "idle"]);
+    expect(channel.sent[0]?.message.text).toBe("slow answer");
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("gateway app serves health JSON", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
@@ -301,8 +338,8 @@ test("gateway app /new rebinds while old sessions remain listable", async () => 
     expect(channel.sent).toHaveLength(3);
     expect(channel.sent[1]?.message.text).toContain("Previous session: session-1");
     expect(channel.sent[1]?.message.text).toContain("Current session: session-2");
-    expect(channel.sent[2]?.message.text).toContain("- session-1 - Tiago via telegram");
-    expect(channel.sent[2]?.message.text).toContain("* session-2 - Tiago via telegram");
+    expect(channel.sent[2]?.message.text).toContain('- session-1 "Generated: first"');
+    expect(channel.sent[2]?.message.text).toContain('- session-2 "" (current)');
   } finally {
     await app.stop();
     await rm(dir, { recursive: true, force: true });
@@ -421,6 +458,7 @@ function fixedNow(): Date {
 class FakeChannel implements ChannelAdapter<unknown> {
   readonly id = "telegram";
   readonly sent: Array<{ target: OutboundTarget; message: OutboundMessage }> = [];
+  readonly typing: Array<{ target: OutboundTarget; state: TypingState }> = [];
   started = false;
   stopped = false;
   private context: ChannelStartContext<unknown> | undefined;
@@ -445,6 +483,10 @@ class FakeChannel implements ChannelAdapter<unknown> {
       platformMessageId: `sent-${this.sent.length}`,
       timestamp: "2026-01-01T00:00:00.000Z",
     };
+  }
+
+  async sendTyping(target: OutboundTarget, state: TypingState): Promise<void> {
+    this.typing.push({ target, state });
   }
 
   async emit(message: InboundMessage): Promise<void> {
@@ -500,6 +542,11 @@ class FakeRuntime implements AgentRuntime {
     this.calls.send.push(input);
 
     const messageNumber = this.nextMessageNumber++;
+    const session = this.sessions.find((candidate) => candidate.id === input.sessionId);
+
+    if (session && !session.title) {
+      session.title = `Generated: ${input.text}`;
+    }
 
     return {
       id: `message-${messageNumber}`,
@@ -516,5 +563,29 @@ class FakeRuntime implements AgentRuntime {
   async listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]> {
     this.calls.listSessions.push(input);
     return this.sessions;
+  }
+}
+
+class SlowRuntime extends FakeRuntime {
+  private resolveSendStarted: (() => void) | undefined;
+  private resolveSend: ((turn: RuntimeTurn) => void) | undefined;
+
+  readonly sendStarted = new Promise<void>((resolve) => {
+    this.resolveSendStarted = resolve;
+  });
+
+  private readonly sendFinished = new Promise<RuntimeTurn>((resolve) => {
+    this.resolveSend = resolve;
+  });
+
+  override async send(input: SendRuntimeMessageInput): Promise<RuntimeTurn> {
+    this.calls.send.push(input);
+    this.resolveSendStarted?.();
+
+    return this.sendFinished;
+  }
+
+  finishSend(turn: RuntimeTurn): void {
+    this.resolveSend?.(turn);
   }
 }

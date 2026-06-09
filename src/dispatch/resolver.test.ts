@@ -66,7 +66,7 @@ test("first message creates a durable binding and later messages reuse it", asyn
     expect(first.resolution.binding.opencodeSessionId).toBe("session-1");
     expect(second.resolution.binding.opencodeSessionId).toBe("session-1");
     expect(harness.runtime.calls.ensureSession).toHaveLength(1);
-    expect(harness.runtime.calls.ensureSession[0]?.title).toBe("Tiago via telegram");
+    expect(harness.runtime.calls.ensureSession[0]).not.toHaveProperty("title");
   } finally {
     harness.database.close();
   }

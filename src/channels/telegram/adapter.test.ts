@@ -5,6 +5,8 @@ import type { ChannelEvent, ChannelLogger, ChannelStartContext, OutboundTarget }
 import {
   createTelegramAdapter,
   sendTelegramMessage,
+  sendTelegramTyping,
+  type TelegramChatAction,
   type TelegramBotLike,
   type TelegramContextLike,
   type TelegramSendMessageOptions,
@@ -145,6 +147,44 @@ test("send passes Telegram topic message thread id", async () => {
   expect(fakeBot.sentMessages[0]?.options).toEqual({ message_thread_id: 42 });
 });
 
+test("sendTyping sends Telegram typing chat action", async () => {
+  const fakeBot = new FakeTelegramBot();
+
+  await sendTelegramTyping(fakeBot, outboundTarget(), "typing");
+
+  expect(fakeBot.chatActions).toEqual([
+    {
+      chatId: "123",
+      action: "typing",
+      options: undefined,
+    },
+  ]);
+});
+
+test("sendTyping passes Telegram topic message thread id", async () => {
+  const fakeBot = new FakeTelegramBot();
+
+  await sendTelegramTyping(
+    fakeBot,
+    outboundTarget({
+      conversationKey: "telegram:default:group:-100123:topic:42",
+      conversationId: "-100123",
+      topicId: "42",
+    }),
+    "typing",
+  );
+
+  expect(fakeBot.chatActions[0]?.options).toEqual({ message_thread_id: 42 });
+});
+
+test("sendTyping ignores idle state", async () => {
+  const fakeBot = new FakeTelegramBot();
+
+  await sendTelegramTyping(fakeBot, outboundTarget(), "idle");
+
+  expect(fakeBot.chatActions).toEqual([]);
+});
+
 function startContext(
   overrides: Omit<Partial<ChannelStartContext<TelegramChannelConfig>>, "emit"> & {
     emit?: (event: ChannelEvent) => void;
@@ -217,6 +257,11 @@ class FakeTelegramBot implements TelegramBotLike {
     text: string;
     options?: TelegramSendMessageOptions;
   }> = [];
+  readonly chatActions: Array<{
+    chatId: number | string;
+    action: TelegramChatAction;
+    options?: TelegramSendMessageOptions;
+  }> = [];
   started = false;
   stopped = false;
   nextMessageId = 1;
@@ -235,6 +280,9 @@ class FakeTelegramBot implements TelegramBotLike {
         date: 1_767_225_600,
         chat: { id: chatId },
       };
+    },
+    sendChatAction: async (chatId: number | string, action: TelegramChatAction, options?: TelegramSendMessageOptions) => {
+      this.chatActions.push({ chatId, action, options });
     },
   };
 

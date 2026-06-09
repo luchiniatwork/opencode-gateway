@@ -1,5 +1,12 @@
 import { getConfigSeeds } from "./config/load.ts";
-import type { ChannelAdapter, ChannelEvent, ChannelLogger, InboundMessage, OutboundTarget } from "./channels/types.ts";
+import type {
+  ChannelAdapter,
+  ChannelEvent,
+  ChannelLogger,
+  InboundMessage,
+  OutboundTarget,
+  TypingState,
+} from "./channels/types.ts";
 import { createTelegramAdapter } from "./channels/telegram/index.ts";
 import { createCommandRouter } from "./commands/registry.ts";
 import type { GatewayConfig, TelegramChannelConfig } from "./config/schema.ts";
@@ -22,6 +29,8 @@ import {
 } from "./observability/logging.ts";
 import { OpenCodeRuntime } from "./opencode/client.ts";
 import type { AgentRuntime } from "./opencode/types.ts";
+
+const TYPING_KEEPALIVE_MS = 4_000;
 
 export type { GatewayLogEntry, GatewayLogLevel } from "./observability/logging.ts";
 
@@ -231,6 +240,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
 
     const { message } = event;
     const target = outboundTargetFromMessage(message);
+    const stopTyping = startTyping(channel, target, message);
 
     try {
       const responses = await routeMessage(message);
@@ -251,7 +261,41 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
         format: "plain",
         text: `Gateway error: ${formatError(error)}`,
       });
+    } finally {
+      stopTyping();
     }
+  }
+
+  function startTyping(
+    channel: GatewayChannelRegistration<any>,
+    target: OutboundTarget,
+    message: InboundMessage,
+  ): () => void {
+    if (!channel.adapter.sendTyping) return () => undefined;
+
+    const sendTyping = channel.adapter.sendTyping.bind(channel.adapter);
+    let stopped = false;
+
+    function sendTypingState(state: TypingState): void {
+      Promise.resolve(sendTyping(target, state)).catch((error) => {
+        log("warn", "channel typing update failed", {
+          ...messageLogContext(message),
+          state,
+          error: formatError(error),
+        });
+      });
+    }
+
+    sendTypingState("typing");
+    const timer = setInterval(() => {
+      if (!stopped) sendTypingState("typing");
+    }, TYPING_KEEPALIVE_MS);
+
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      sendTypingState("idle");
+    };
   }
 
   async function stopStartedChannels(): Promise<void> {

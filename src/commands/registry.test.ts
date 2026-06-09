@@ -186,9 +186,7 @@ test("sessions command lists runtime sessions and marks the current one", async 
     const result = await harness.router.handle(inboundMessage({ text: "/sessions" }));
     const text = responseText(result);
 
-    expect(text).toContain("Recent sessions for Default workspace (default):");
-    expect(text).toContain("- session-2 - Other");
-    expect(text).toContain("* session-1 - Current");
+    expect(text).toBe(['- session-2 "Other"', '- session-1 "Current" (current)'].join("\n"));
     expect(harness.runtime.calls.listSessions).toEqual([expect.objectContaining({ limit: 10 })]);
   } finally {
     harness.database.close();
