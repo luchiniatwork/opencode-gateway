@@ -30,8 +30,11 @@ export interface FinishRunInput {
 
 export interface RunRepository {
   create(input: CreateRunInput): RunRecord;
+  getById(id: string): RunRecord | undefined;
   getActiveByBindingId(bindingId: string): RunRecord | undefined;
+  setOpenCodeMessageId(id: string, opencodeMessageId: string): RunRecord | undefined;
   finish(input: FinishRunInput): RunRecord | undefined;
+  finishIfActive(input: FinishRunInput): RunRecord | undefined;
   markAborted(id: string): RunRecord | undefined;
 }
 
@@ -63,10 +66,29 @@ export function createRunRepository(
       return mapRunRow(row);
     },
 
+    getById(id): RunRecord | undefined {
+      const row = db.query("SELECT * FROM runs WHERE id = ?").get(id) as RunRow | null;
+
+      return row ? mapRunRow(row) : undefined;
+    },
+
     getActiveByBindingId(bindingId): RunRecord | undefined {
       const row = db
         .query("SELECT * FROM runs WHERE binding_id = ? AND status = 'active'")
         .get(bindingId) as RunRow | null;
+
+      return row ? mapRunRow(row) : undefined;
+    },
+
+    setOpenCodeMessageId(id, opencodeMessageId): RunRecord | undefined {
+      const row = db
+        .query(
+          `UPDATE runs SET
+            opencode_message_id = ?
+          WHERE id = ?
+          RETURNING *`,
+        )
+        .get(opencodeMessageId, id) as RunRow | null;
 
       return row ? mapRunRow(row) : undefined;
     },
@@ -80,6 +102,28 @@ export function createRunRepository(
             error = ?,
             finished_at = ?
           WHERE id = ?
+          RETURNING *`,
+        )
+        .get(
+          input.status,
+          input.opencodeMessageId ?? null,
+          input.error ?? null,
+          now().toISOString(),
+          input.id,
+        ) as RunRow | null;
+
+      return row ? mapRunRow(row) : undefined;
+    },
+
+    finishIfActive(input): RunRecord | undefined {
+      const row = db
+        .query(
+          `UPDATE runs SET
+            status = ?,
+            opencode_message_id = COALESCE(?, opencode_message_id),
+            error = ?,
+            finished_at = ?
+          WHERE id = ? AND status = 'active'
           RETURNING *`,
         )
         .get(

@@ -18,7 +18,9 @@ import { createProfileRepository } from "./db/repositories/profiles.ts";
 import { createRunRepository } from "./db/repositories/runs.ts";
 import { seedDatabaseFromConfig } from "./db/repositories/seeds.ts";
 import { createTargetRepository } from "./db/repositories/targets.ts";
-import { createDispatchResolver, type DispatchMessageResult } from "./dispatch/resolver.ts";
+import type { ProgressDelivery } from "./delivery/renderer.ts";
+import { createDispatchResolver } from "./dispatch/resolver.ts";
+import { createTurnRunner, type StartTurnResult, type TurnRunner } from "./gateway/turn-runner.ts";
 import type { OutboundMessage } from "./messages/types.ts";
 import { createHealthSnapshot, type ChannelHealthStatus, type GatewayHealthSnapshot } from "./observability/health.ts";
 import {
@@ -70,6 +72,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
   let database: GatewayDatabase | undefined;
   let abortController: AbortController | undefined;
   let healthServer: ReturnType<typeof Bun.serve> | undefined;
+  let turnRunner: TurnRunner | undefined;
   const startedChannels: GatewayChannelRegistration<any>[] = [];
   const channelStatuses = new Map<string, ChannelHealthStatus>();
 
@@ -129,11 +132,13 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
           };
           const runtime = options.runtime ?? new OpenCodeRuntime();
           const resolver = createDispatchResolver({ config: options.config, repositories, runtime });
+          turnRunner = createTurnRunner({ runtime, runs: repositories.runs, log });
           const commandRouter = createCommandRouter({
             config: options.config,
             repositories,
             resolver,
             runtime,
+            turnRunner,
             getHealth: () => {
               const snapshot = healthSnapshot();
 
@@ -156,7 +161,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
                 signal: abortController.signal,
                 logger: channelLogger(channel.adapter.id, channel.accountId),
                 emit: async (event) => {
-                  await handleChannelEvent(channel, event, async (message) => {
+                  await handleChannelEvent(channel, event, async (message, delivery) => {
                     log("info", "inbound message received", messageLogContext(message));
 
                     const commandResult = await commandRouter.handle(message);
@@ -170,10 +175,28 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
                       return commandResult.messages;
                     }
 
-                    const dispatchResult = await resolver.dispatchMessage(message);
-                    logDispatchResult(dispatchResult, message);
+                    const bindingResult = await resolver.ensureBindingForMessage(message);
 
-                    return dispatchMessages(dispatchResult);
+                    if (bindingResult.status === "denied") {
+                      log("warn", "dispatch denied", {
+                        ...messageLogContext(message),
+                        reason: bindingResult.decision.reason,
+                      });
+
+                      return deniedMessages(bindingResult.decision.reason);
+                    }
+
+                    if (!turnRunner) throw new Error("Turn runner is not initialized");
+
+                    const startResult = await turnRunner.start({
+                      message,
+                      resolution: bindingResult.resolution,
+                      delivery,
+                      signal: abortController?.signal,
+                    });
+                    logTurnStartResult(startResult, message);
+
+                    return turnStartMessages(startResult);
                   });
                 },
               });
@@ -197,6 +220,8 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
 
           startHealthServer(options.config);
         } catch (error) {
+          await turnRunner?.stop();
+          turnRunner = undefined;
           await stopStartedChannels();
           stopHealthServer();
           abortController = undefined;
@@ -215,6 +240,8 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
 
       started = false;
       abortController?.abort();
+      await turnRunner?.stop();
+      turnRunner = undefined;
       abortController = undefined;
       await stopStartedChannels();
       stopHealthServer();
@@ -227,7 +254,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
   async function handleChannelEvent(
     channel: GatewayChannelRegistration<any>,
     event: ChannelEvent,
-    routeMessage: (message: InboundMessage) => Promise<OutboundMessage[]>,
+    routeMessage: (message: InboundMessage, delivery: ProgressDelivery) => Promise<OutboundMessage[]>,
   ): Promise<void> {
     if (event.type !== "message") {
       log("debug", "channel action ignored in phase 1", {
@@ -241,12 +268,13 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
     const { message } = event;
     const target = outboundTargetFromMessage(message);
     const stopTyping = startTyping(channel, target, message);
+    const delivery = channelDelivery(channel, target);
 
     try {
-      const responses = await routeMessage(message);
+      const responses = await routeMessage(message, delivery);
 
       for (const response of responses) {
-        await channel.adapter.send(target, response);
+        await delivery.send(response);
       }
     } catch (error) {
       log("error", "channel message handling failed", {
@@ -296,6 +324,19 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       clearInterval(timer);
       sendTypingState("idle");
     };
+  }
+
+  function channelDelivery(channel: GatewayChannelRegistration<any>, target: OutboundTarget): ProgressDelivery {
+    const delivery: ProgressDelivery = {
+      send: (message) => channel.adapter.send(target, message),
+    };
+
+    if (channel.adapter.edit) {
+      const edit = channel.adapter.edit.bind(channel.adapter);
+      delivery.edit = (receipt, message) => edit(receipt, message);
+    }
+
+    return delivery;
   }
 
   async function stopStartedChannels(): Promise<void> {
@@ -368,29 +409,22 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
     });
   }
 
-  function logDispatchResult(result: DispatchMessageResult, message: InboundMessage): void {
-    if (result.status === "denied") {
-      log("warn", "dispatch denied", {
-        ...messageLogContext(message),
-        reason: result.decision.reason,
-      });
-      return;
-    }
-
+  function logTurnStartResult(result: StartTurnResult, message: InboundMessage): void {
     const context = {
       ...messageLogContext(message),
       profileId: result.resolution.profile.id,
       targetId: result.resolution.target.id,
       sessionId: result.resolution.binding.opencodeSessionId,
       runId: result.run.id,
+      opencodeMessageId: result.status === "started" ? result.handle.id : result.run.opencodeMessageId,
     };
 
     if (result.status === "error") {
-      log("error", "dispatch failed", { ...context, error: result.error });
+      log("error", "async turn start failed", { ...context, error: result.error });
       return;
     }
 
-    log(result.status === "busy" ? "warn" : "info", `dispatch ${result.status}`, context);
+    log(result.status === "busy" ? "warn" : "info", `async turn ${result.status}`, context);
   }
 }
 
@@ -440,30 +474,16 @@ function validatePhase1RuntimeTargets(config: GatewayConfig): void {
   throw new Error(`Phase 1 only supports attach-mode OpenCode targets for profile routing: ${labels}`);
 }
 
-function dispatchMessages(result: DispatchMessageResult): OutboundMessage[] {
+function turnStartMessages(result: StartTurnResult): OutboundMessage[] {
   switch (result.status) {
-    case "sent":
-      return [
-        {
-          kind: "final",
-          format: "markdown",
-          text: result.turn.text?.trim() || "OpenCode completed without a text response.",
-        },
-      ];
+    case "started":
+      return [];
     case "busy":
       return [
         {
           kind: "status",
           format: "plain",
           text: `Session ${result.resolution.binding.opencodeSessionId} is busy. Use /stop to abort the active run.`,
-        },
-      ];
-    case "denied":
-      return [
-        {
-          kind: "error",
-          format: "plain",
-          text: deniedDecisionText(result.decision.reason),
         },
       ];
     case "error":
@@ -475,6 +495,16 @@ function dispatchMessages(result: DispatchMessageResult): OutboundMessage[] {
         },
       ];
   }
+}
+
+function deniedMessages(reason: "unknown_sender" | "blocked"): OutboundMessage[] {
+  return [
+    {
+      kind: "error",
+      format: "plain",
+      text: deniedDecisionText(reason),
+    },
+  ];
 }
 
 function outboundTargetFromMessage(message: InboundMessage): OutboundTarget {

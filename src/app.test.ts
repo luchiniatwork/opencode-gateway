@@ -23,8 +23,10 @@ import type {
   ListRuntimeSessionsInput,
   ObserveRuntimeTurnInput,
   PermissionResponseInput,
+  RuntimeEvent,
   RuntimeSession,
   RuntimeTurn,
+  RuntimeTurnHandle,
   SendRuntimeMessageInput,
 } from "./opencode/types.ts";
 
@@ -81,6 +83,7 @@ test("gateway app handles commands before runtime dispatch", async () => {
 
     expect(runtime.calls.ensureSession).toHaveLength(0);
     expect(runtime.calls.send).toHaveLength(0);
+    expect(runtime.calls.sendAsync).toHaveLength(0);
     expect(channel.sent).toHaveLength(1);
     expect(channel.sent[0]?.message.text).toContain("Gateway profiles:");
   } finally {
@@ -139,11 +142,13 @@ test("gateway app dispatches non-command messages to OpenCode and sends final re
   try {
     await app.start();
     await channel.emit(inboundMessage({ text: "Inspect this repo" }));
+    await waitForSent(channel, 1);
 
     expect(runtime.calls.ensureSession).toHaveLength(1);
-    expect(runtime.calls.send).toHaveLength(1);
-    expect(runtime.calls.send[0]?.text).toBe("Inspect this repo");
-    expect(runtime.calls.send[0]?.sessionId).toBe("session-1");
+    expect(runtime.calls.send).toHaveLength(0);
+    expect(runtime.calls.sendAsync).toHaveLength(1);
+    expect(runtime.calls.sendAsync[0]?.text).toBe("Inspect this repo");
+    expect(runtime.calls.sendAsync[0]?.sessionId).toBe("session-1");
     expect(channel.sent).toEqual([
       {
         target: expect.objectContaining({
@@ -181,17 +186,19 @@ test("gateway app sends typing feedback while handling messages", async () => {
     await app.start();
     const emitPromise = channel.emit(inboundMessage({ text: "Take your time" }));
 
-    await runtime.sendStarted;
+    await runtime.sendAsyncStarted;
 
     expect(channel.typing.map((entry) => entry.state)).toEqual(["typing"]);
 
-    runtime.finishSend({
+    runtime.finishSendAsync({
       id: "message-slow",
       sessionId: "session-1",
-      status: "completed",
+      targetId: "default",
+      status: "running",
       text: "slow answer",
     });
     await emitPromise;
+    await waitForSent(channel, 1);
 
     expect(channel.typing.map((entry) => entry.state)).toEqual(["typing", "idle"]);
     expect(channel.sent[0]?.message.text).toBe("slow answer");
@@ -287,6 +294,7 @@ test("gateway app reuses persisted session binding after restart", async () => {
   try {
     await firstApp.start();
     await firstChannel.emit(inboundMessage({ text: "first" }));
+    await waitForSent(firstChannel, 1);
     await firstApp.stop();
 
     const secondChannel = new FakeChannel();
@@ -302,10 +310,11 @@ test("gateway app reuses persisted session binding after restart", async () => {
     try {
       await secondApp.start();
       await secondChannel.emit(inboundMessage({ id: "message-2", text: "second" }));
+      await waitForSent(secondChannel, 1);
 
       expect(secondRuntime.calls.ensureSession).toHaveLength(0);
-      expect(secondRuntime.calls.send).toHaveLength(1);
-      expect(secondRuntime.calls.send[0]?.sessionId).toBe("session-1");
+      expect(secondRuntime.calls.sendAsync).toHaveLength(1);
+      expect(secondRuntime.calls.sendAsync[0]?.sessionId).toBe("session-1");
       expect(secondChannel.sent[0]?.message.text).toBe("answer-1");
     } finally {
       await secondApp.stop();
@@ -331,10 +340,11 @@ test("gateway app /new rebinds while old sessions remain listable", async () => 
   try {
     await app.start();
     await channel.emit(inboundMessage({ text: "first" }));
+    await waitForSent(channel, 1);
     await channel.emit(inboundMessage({ id: "message-2", text: "/new", commandText: "/new" }));
     await channel.emit(inboundMessage({ id: "message-3", text: "/sessions", commandText: "/sessions" }));
 
-    expect(runtime.calls.send).toHaveLength(1);
+    expect(runtime.calls.sendAsync).toHaveLength(1);
     expect(runtime.calls.ensureSession).toHaveLength(2);
     expect(runtime.calls.listSessions).toEqual([expect.objectContaining({ limit: 10 })]);
     expect(channel.sent).toHaveLength(3);
@@ -457,6 +467,16 @@ function fixedNow(): Date {
   return new Date("2026-01-01T00:00:00.000Z");
 }
 
+async function waitForSent(channel: FakeChannel, count: number): Promise<void> {
+  const deadline = Date.now() + 1_000;
+
+  while (channel.sent.length < count && Date.now() < deadline) {
+    await Bun.sleep(5);
+  }
+
+  expect(channel.sent.length).toBeGreaterThanOrEqual(count);
+}
+
 class FakeChannel implements ChannelAdapter<unknown> {
   readonly id = "telegram";
   readonly sent: Array<{ target: OutboundTarget; message: OutboundMessage }> = [];
@@ -505,11 +525,15 @@ class FakeRuntime implements AgentRuntime {
   readonly calls: {
     ensureSession: EnsureSessionInput[];
     send: SendRuntimeMessageInput[];
+    sendAsync: SendRuntimeMessageInput[];
+    observe: ObserveRuntimeTurnInput[];
     abort: AbortRuntimeTurnInput[];
     listSessions: ListRuntimeSessionsInput[];
   } = {
     ensureSession: [],
     send: [],
+    sendAsync: [],
+    observe: [],
     abort: [],
     listSessions: [],
   };
@@ -517,6 +541,7 @@ class FakeRuntime implements AgentRuntime {
   private nextSessionNumber = 1;
   private nextMessageNumber = 1;
   private sessions: RuntimeSession[] = [];
+  protected readonly asyncAnswers = new Map<string, string>();
 
   async ensureSession(input: EnsureSessionInput): Promise<RuntimeSession> {
     this.calls.ensureSession.push(input);
@@ -558,12 +583,36 @@ class FakeRuntime implements AgentRuntime {
     };
   }
 
-  async sendAsync(input: SendRuntimeMessageInput): Promise<never> {
-    throw new Error("FakeRuntime.sendAsync is not implemented in Phase 1 tests");
+  async sendAsync(input: SendRuntimeMessageInput): Promise<RuntimeTurnHandle> {
+    this.calls.sendAsync.push(input);
+
+    const messageNumber = this.nextMessageNumber++;
+    const id = `message-${messageNumber}`;
+    const session = this.sessions.find((candidate) => candidate.id === input.sessionId);
+
+    if (session && !session.title) {
+      session.title = `Generated: ${input.text}`;
+    }
+
+    this.asyncAnswers.set(id, `answer-${messageNumber}`);
+
+    return {
+      id,
+      sessionId: input.sessionId,
+      targetId: input.target.id,
+      status: "running",
+    };
   }
 
-  async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<never> {
-    throw new Error("FakeRuntime.observe is not implemented in Phase 1 tests");
+  async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent> {
+    this.calls.observe.push(input);
+
+    if (input.signal?.aborted) return;
+
+    yield {
+      type: "final",
+      text: this.asyncAnswers.get(input.turnId ?? "") ?? "answer",
+    };
   }
 
   async abort(input: AbortRuntimeTurnInput): Promise<void> {
@@ -581,25 +630,26 @@ class FakeRuntime implements AgentRuntime {
 }
 
 class SlowRuntime extends FakeRuntime {
-  private resolveSendStarted: (() => void) | undefined;
-  private resolveSend: ((turn: RuntimeTurn) => void) | undefined;
+  private resolveSendAsyncStarted: (() => void) | undefined;
+  private resolveSendAsync: ((turn: RuntimeTurnHandle) => void) | undefined;
 
-  readonly sendStarted = new Promise<void>((resolve) => {
-    this.resolveSendStarted = resolve;
+  readonly sendAsyncStarted = new Promise<void>((resolve) => {
+    this.resolveSendAsyncStarted = resolve;
   });
 
-  private readonly sendFinished = new Promise<RuntimeTurn>((resolve) => {
-    this.resolveSend = resolve;
+  private readonly sendAsyncFinished = new Promise<RuntimeTurnHandle>((resolve) => {
+    this.resolveSendAsync = resolve;
   });
 
-  override async send(input: SendRuntimeMessageInput): Promise<RuntimeTurn> {
-    this.calls.send.push(input);
-    this.resolveSendStarted?.();
+  override async sendAsync(input: SendRuntimeMessageInput): Promise<RuntimeTurnHandle> {
+    this.calls.sendAsync.push(input);
+    this.resolveSendAsyncStarted?.();
 
-    return this.sendFinished;
+    return this.sendAsyncFinished;
   }
 
-  finishSend(turn: RuntimeTurn): void {
-    this.resolveSend?.(turn);
+  finishSendAsync(turn: RuntimeTurnHandle & { text?: string }): void {
+    this.asyncAnswers.set(turn.id, turn.text ?? "slow answer");
+    this.resolveSendAsync?.(turn);
   }
 }

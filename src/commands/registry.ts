@@ -2,6 +2,7 @@ import type { InboundMessage } from "../channels/types.ts";
 import type { GatewayConfig } from "../config/schema.ts";
 import type { DispatchResolver, DispatchResolverRepositories } from "../dispatch/resolver.ts";
 import type { ConversationBindingRecord, ProfileRecord, RunRecord, TargetRecord } from "../db/types.ts";
+import type { TurnRunner } from "../gateway/turn-runner.ts";
 import type { OutboundMessage } from "../messages/types.ts";
 import type { AgentRuntime, RuntimeSession } from "../opencode/types.ts";
 
@@ -17,6 +18,7 @@ export interface CommandRouterOptions {
   repositories: DispatchResolverRepositories;
   resolver: DispatchResolver;
   runtime: AgentRuntime;
+  turnRunner: TurnRunner;
   getHealth?: () => CommandHealthSnapshot;
 }
 
@@ -34,7 +36,7 @@ interface ParsedCommand {
 }
 
 export function createCommandRouter(options: CommandRouterOptions): CommandRouter {
-  const { config, repositories, resolver, runtime } = options;
+  const { config, repositories, resolver, runtime, turnRunner } = options;
 
   return {
     async handle(message): Promise<CommandRouterResult> {
@@ -152,15 +154,16 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
     if (!target) return `OpenCode target not found: ${binding.targetId}`;
 
     try {
-      await runtime.abort({
+      const result = await turnRunner.abortActive({
+        binding,
         target,
-        sessionId: binding.opencodeSessionId,
-        turnId: run.opencodeMessageId,
         reason: "Stopped by gateway /stop command",
       });
-      const aborted = repositories.runs.markAborted(run.id);
 
-      return `Stopped active run ${aborted?.id ?? run.id} for session ${binding.opencodeSessionId}.`;
+      if (result.status === "no_active_run") return "No active run for this conversation.";
+      if (result.status === "error") return `Unable to stop active run ${result.run.id}: ${result.error}`;
+
+      return `Stopped active run ${result.run.id} for session ${binding.opencodeSessionId}.`;
     } catch (error) {
       return `Unable to stop active run ${run.id}: ${formatError(error)}`;
     }

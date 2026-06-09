@@ -11,6 +11,7 @@ import { createRunRepository } from "../db/repositories/runs.ts";
 import { seedDatabaseFromConfig } from "../db/repositories/seeds.ts";
 import { createTargetRepository } from "../db/repositories/targets.ts";
 import { createDispatchResolver, type DispatchResolver } from "../dispatch/resolver.ts";
+import { createTurnRunner } from "../gateway/turn-runner.ts";
 import type {
   AbortRuntimeTurnInput,
   AgentRuntime,
@@ -286,11 +287,13 @@ async function createHarness(options: { accessRules?: AccessRuleSeed[] } = {}): 
   seedDatabaseFromConfig(database.db, testSeeds(options.accessRules), fixedNow);
 
   const resolver = createDispatchResolver({ config, repositories, runtime });
+  const turnRunner = createTurnRunner({ runtime, runs: repositories.runs });
   const router = createCommandRouter({
     config,
     repositories,
     resolver,
     runtime,
+    turnRunner,
     getHealth: () => ({ gateway: "healthy", targets: { default: "healthy", "ops-target": "healthy" } }),
   });
 
