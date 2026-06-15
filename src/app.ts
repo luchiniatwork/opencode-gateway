@@ -14,6 +14,8 @@ import { openGatewayDatabase, type GatewayDatabase } from "./db/client.ts";
 import { runMigrations } from "./db/migrations.ts";
 import { createAccessRuleRepository } from "./db/repositories/access-rules.ts";
 import { createConversationBindingRepository } from "./db/repositories/conversation-bindings.ts";
+import { createDeliveryReceiptRepository } from "./db/repositories/delivery-receipts.ts";
+import { createPendingPermissionRepository } from "./db/repositories/pending-permissions.ts";
 import { createProfileRepository } from "./db/repositories/profiles.ts";
 import { createRunRepository } from "./db/repositories/runs.ts";
 import { seedDatabaseFromConfig } from "./db/repositories/seeds.ts";
@@ -129,6 +131,8 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
             profiles: createProfileRepository(openedDatabase.db, now),
             targets: createTargetRepository(openedDatabase.db, now),
             runs: createRunRepository(openedDatabase.db, { now }),
+            pendingPermissions: createPendingPermissionRepository(openedDatabase.db, { now }),
+            deliveryReceipts: createDeliveryReceiptRepository(openedDatabase.db, { now }),
           };
           const staleRuns = repositories.runs.finishAllActive({
             status: "aborted",
@@ -144,7 +148,14 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
 
           const runtime = options.runtime ?? new OpenCodeRuntime();
           const resolver = createDispatchResolver({ config: options.config, repositories, runtime });
-          turnRunner = createTurnRunner({ runtime, runs: repositories.runs, log });
+          turnRunner = createTurnRunner({
+            runtime,
+            runs: repositories.runs,
+            pendingPermissions: repositories.pendingPermissions,
+            deliveryReceipts: repositories.deliveryReceipts,
+            now,
+            log,
+          });
           const commandRouter = createCommandRouter({
             config: options.config,
             repositories,

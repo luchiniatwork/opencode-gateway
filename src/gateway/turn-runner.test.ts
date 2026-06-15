@@ -4,6 +4,8 @@ import type { InboundMessage, SendReceipt } from "../channels/types.ts";
 import { openGatewayDatabase, type GatewayDatabase } from "../db/client.ts";
 import { runMigrations } from "../db/migrations.ts";
 import { createConversationBindingRepository } from "../db/repositories/conversation-bindings.ts";
+import { createDeliveryReceiptRepository } from "../db/repositories/delivery-receipts.ts";
+import { createPendingPermissionRepository } from "../db/repositories/pending-permissions.ts";
 import { createProfileRepository } from "../db/repositories/profiles.ts";
 import { createRunRepository } from "../db/repositories/runs.ts";
 import { seedDatabaseFromConfig } from "../db/repositories/seeds.ts";
@@ -198,7 +200,7 @@ test("turn runner timeout completes even if observe never resolves", async () =>
   }
 });
 
-test("turn runner sends no compact progress before final response", async () => {
+test("turn runner sends compact progress before delayed final response", async () => {
   const harness = await createHarness({
     events: [{ type: "status", status: "running" }, { type: "final", text: "done" }],
     eventDelayMs: 5,
@@ -211,10 +213,70 @@ test("turn runner sends no compact progress before final response", async () => 
       resolution: harness.resolution,
       delivery: harness.delivery,
     });
-    await waitForDeliveries(harness.deliveries, 1);
+    await waitForDeliveries(harness.deliveries, 2);
 
     expect(harness.deliveries).toEqual([
+      { kind: "progress", format: "plain", text: "Working..." },
       { kind: "final", format: "markdown", text: "done" },
+    ]);
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
+test("turn runner persists delivery receipts for progress and final messages", async () => {
+  const harness = await createHarness({
+    events: [{ type: "status", status: "running" }, { type: "final", text: "done" }],
+    eventDelayMs: 5,
+    progressDelayMs: 1,
+  });
+
+  try {
+    await harness.runner.start({
+      message: inboundMessage(),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForDeliveries(harness.deliveries, 2);
+
+    expect(deliveryReceiptRows(harness.database)).toEqual([
+      { id: "receipt-1", run_id: "run-1", platform_message_id: "sent-1", kind: "progress" },
+      { id: "receipt-2", run_id: "run-1", platform_message_id: "sent-2", kind: "final" },
+    ]);
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
+test("turn runner persists pending permission requests", async () => {
+  const harness = await createHarness({
+    events: [
+      { type: "permission_request", id: "opencode-permission-1", summary: "Run bash", details: { tool: "bash" } },
+      { type: "final", text: "done" },
+    ],
+    permissionTtlMs: 60_000,
+  });
+
+  try {
+    await harness.runner.start({
+      message: inboundMessage(),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForDeliveries(harness.deliveries, 1);
+
+    expect(pendingPermissionRows(harness.database)).toEqual([
+      {
+        id: "permission-1",
+        run_id: "run-1",
+        opencode_permission_id: "opencode-permission-1",
+        summary: "Run bash",
+        details_json: JSON.stringify({ tool: "bash" }),
+        status: "pending",
+        expires_at: "2026-01-01T00:01:00.000Z",
+      },
     ]);
   } finally {
     await harness.runner.stop();
@@ -265,6 +327,7 @@ interface HarnessOptions {
   eventDelayMs?: number;
   progressDelayMs?: number;
   runTimeoutMs?: number;
+  permissionTtlMs?: number;
   verbosity?: "off" | "compact" | "tools" | "verbose";
 }
 
@@ -301,6 +364,16 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     now: fixedNow,
     createId: () => "run-1",
   });
+  let deliveryReceiptId = 0;
+  const deliveryReceipts = createDeliveryReceiptRepository(database.db, {
+    now: fixedNow,
+    createId: () => `receipt-${(deliveryReceiptId += 1)}`,
+  });
+  let pendingPermissionId = 0;
+  const pendingPermissions = createPendingPermissionRepository(database.db, {
+    now: fixedNow,
+    createId: () => `permission-${(pendingPermissionId += 1)}`,
+  });
   const targets = createTargetRepository(database.db, fixedNow);
   const profiles = createProfileRepository(database.db, fixedNow);
   const binding = bindings.upsert({
@@ -319,7 +392,16 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
   const target = requireRecord(targets.getById("default"), "target");
   const runtime = new FakeRuntime(options);
   const deliveries: OutboundMessage[] = [];
-  const runner = createTurnRunner({ runtime, runs, progressDelayMs: options.progressDelayMs, runTimeoutMs: options.runTimeoutMs });
+  const runner = createTurnRunner({
+    runtime,
+    runs,
+    pendingPermissions,
+    deliveryReceipts,
+    progressDelayMs: options.progressDelayMs,
+    runTimeoutMs: options.runTimeoutMs,
+    permissionTtlMs: options.permissionTtlMs,
+    now: fixedNow,
+  });
 
   return {
     database,
@@ -423,6 +505,42 @@ function runRows(database: GatewayDatabase): Array<{
   return database.db
     .query("SELECT id, status, opencode_message_id, error FROM runs ORDER BY id")
     .all() as Array<{ id: string; status: string; opencode_message_id: string | null; error: string | null }>;
+}
+
+function deliveryReceiptRows(database: GatewayDatabase): Array<{
+  id: string;
+  run_id: string | null;
+  platform_message_id: string;
+  kind: string;
+}> {
+  return database.db
+    .query("SELECT id, run_id, platform_message_id, kind FROM delivery_receipts ORDER BY id")
+    .all() as Array<{ id: string; run_id: string | null; platform_message_id: string; kind: string }>;
+}
+
+function pendingPermissionRows(database: GatewayDatabase): Array<{
+  id: string;
+  run_id: string;
+  opencode_permission_id: string;
+  summary: string;
+  details_json: string | null;
+  status: string;
+  expires_at: string;
+}> {
+  return database.db
+    .query(
+      `SELECT id, run_id, opencode_permission_id, summary, details_json, status, expires_at
+      FROM pending_permissions ORDER BY id`,
+    )
+    .all() as Array<{
+      id: string;
+      run_id: string;
+      opencode_permission_id: string;
+      summary: string;
+      details_json: string | null;
+      status: string;
+      expires_at: string;
+    }>;
 }
 
 function requireRecord<T>(record: T | undefined, label: string): T {

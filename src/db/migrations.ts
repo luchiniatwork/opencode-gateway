@@ -78,6 +78,42 @@ export const migrations: Migration[] = [
       )`,
     ],
   },
+  {
+    id: "002_phase_2_operational_ux",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS pending_permissions (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        opencode_permission_id TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        details_json TEXT,
+        action_message_receipt_id TEXT,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied', 'expired')),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        resolved_at TEXT
+      )`,
+      `CREATE INDEX IF NOT EXISTS pending_permissions_run_id
+        ON pending_permissions(run_id)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS pending_permissions_opencode_permission_id
+        ON pending_permissions(opencode_permission_id)`,
+      `CREATE TABLE IF NOT EXISTS delivery_receipts (
+        id TEXT PRIMARY KEY,
+        run_id TEXT REFERENCES runs(id),
+        channel TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        conversation_key TEXT NOT NULL,
+        platform_message_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('ack', 'progress', 'final', 'error', 'status')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE INDEX IF NOT EXISTS delivery_receipts_run_id
+        ON delivery_receipts(run_id)`,
+      `CREATE INDEX IF NOT EXISTS delivery_receipts_conversation_key
+        ON delivery_receipts(conversation_key)`,
+    ],
+  },
 ];
 
 export function runMigrations(db: Database, now: () => Date = () => new Date()): void {

@@ -9,12 +9,14 @@ import { openGatewayDatabase, type GatewayDatabase } from "./client.ts";
 import { runMigrations } from "./migrations.ts";
 import { createAccessRuleRepository } from "./repositories/access-rules.ts";
 import { createConversationBindingRepository } from "./repositories/conversation-bindings.ts";
+import { createDeliveryReceiptRepository } from "./repositories/delivery-receipts.ts";
+import { createPendingPermissionRepository } from "./repositories/pending-permissions.ts";
 import { createProfileRepository } from "./repositories/profiles.ts";
 import { createRunRepository } from "./repositories/runs.ts";
 import { seedDatabaseFromConfig } from "./repositories/seeds.ts";
 import { createTargetRepository } from "./repositories/targets.ts";
 
-test("migrations create the phase 1 database tables", async () => {
+test("migrations create the phase 2 database tables", async () => {
   const database = await openTestDatabase();
 
   try {
@@ -27,6 +29,8 @@ test("migrations create the phase 1 database tables", async () => {
 
     expect(tableNames).toContain("access_rules");
     expect(tableNames).toContain("conversation_bindings");
+    expect(tableNames).toContain("delivery_receipts");
+    expect(tableNames).toContain("pending_permissions");
     expect(tableNames).toContain("profiles");
     expect(tableNames).toContain("runs");
     expect(tableNames).toContain("schema_migrations");
@@ -47,7 +51,87 @@ test("migrations are idempotent", async () => {
       count: number;
     };
 
-    expect(row.count).toBe(1);
+    expect(row.count).toBe(2);
+  } finally {
+    database.close();
+  }
+});
+
+test("pending permissions can be created, queried, listed, and resolved", async () => {
+  const database = await openSeededDatabase();
+
+  try {
+    const run = createTestRun(database);
+    const permissions = createPendingPermissionRepository(database.db, {
+      now: fixedNow,
+      createId: () => "permission-1",
+    });
+
+    const pending = permissions.create({
+      runId: run.id,
+      opencodePermissionId: "opencode-permission-1",
+      summary: "Run bash command",
+      details: { command: "bun test" },
+      expiresAt: "2026-01-01T00:15:00.000Z",
+    });
+
+    expect(pending).toMatchObject({
+      id: "permission-1",
+      runId: run.id,
+      opencodePermissionId: "opencode-permission-1",
+      summary: "Run bash command",
+      details: { command: "bun test" },
+      status: "pending",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      expiresAt: "2026-01-01T00:15:00.000Z",
+    });
+    expect(permissions.getById("permission-1")?.summary).toBe("Run bash command");
+    expect(permissions.getByOpenCodePermissionId("opencode-permission-1")?.id).toBe("permission-1");
+    expect(permissions.listPendingByRunId(run.id).map((permission) => permission.id)).toEqual(["permission-1"]);
+
+    const resolved = permissions.resolve({ id: "permission-1", status: "approved", actionMessageReceiptId: "receipt-1" });
+
+    expect(resolved?.status).toBe("approved");
+    expect(resolved?.resolvedAt).toBe("2026-01-01T00:00:00.000Z");
+    expect(resolved?.actionMessageReceiptId).toBe("receipt-1");
+    expect(permissions.listPendingByRunId(run.id)).toEqual([]);
+  } finally {
+    database.close();
+  }
+});
+
+test("delivery receipts can be created and listed by run or conversation", async () => {
+  const database = await openSeededDatabase();
+
+  try {
+    const run = createTestRun(database);
+    const receipts = createDeliveryReceiptRepository(database.db, {
+      now: fixedNow,
+      createId: () => "receipt-1",
+    });
+
+    const receipt = receipts.create({
+      runId: run.id,
+      channel: "telegram",
+      accountId: "default",
+      conversationKey: "telegram:default:dm:123",
+      platformMessageId: "platform-message-1",
+      kind: "final",
+    });
+
+    expect(receipt).toMatchObject({
+      id: "receipt-1",
+      runId: run.id,
+      channel: "telegram",
+      accountId: "default",
+      conversationKey: "telegram:default:dm:123",
+      platformMessageId: "platform-message-1",
+      kind: "final",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    expect(receipts.listByRunId(run.id).map((entry) => entry.id)).toEqual(["receipt-1"]);
+    expect(receipts.listByConversationKey("telegram:default:dm:123").map((entry) => entry.id)).toEqual(["receipt-1"]);
   } finally {
     database.close();
   }
@@ -206,6 +290,29 @@ test("app startup opens, migrates, seeds, and closes the configured database", a
   }
 });
 
+function createTestRun(database: GatewayDatabase) {
+  const bindings = createConversationBindingRepository(database.db, {
+    now: fixedNow,
+    createId: () => "binding-1",
+  });
+  const binding = bindings.upsert({
+    conversationKey: "telegram:default:dm:123",
+    channel: "telegram",
+    accountId: "default",
+    profileId: "cto",
+    targetId: "default",
+    opencodeSessionId: "session-1",
+    busyMode: "queue",
+    verbosity: "compact",
+  });
+  const runs = createRunRepository(database.db, {
+    now: fixedNow,
+    createId: () => "run-1",
+  });
+
+  return runs.create({ bindingId: binding.id, opencodeSessionId: binding.opencodeSessionId });
+}
+
 async function openTestDatabase(): Promise<GatewayDatabase> {
   return openGatewayDatabase(":memory:");
 }
@@ -292,7 +399,7 @@ function testConfig(databasePath: string): GatewayConfig {
   return {
     gateway: {
       host: "127.0.0.1",
-      port: 8765,
+        port: 0,
       databasePath,
       logLevel: "info",
     },

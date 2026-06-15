@@ -12,6 +12,7 @@ export interface ProgressRendererOptions extends ProgressDelivery {
   verbosity: Verbosity;
   delayMs?: number;
   onProgress?(message: OutboundMessage, receipt?: SendReceipt): void;
+  onReceipt?(message: OutboundMessage, receipt: SendReceipt): void;
   onError?(error: unknown): void;
 }
 
@@ -22,6 +23,7 @@ export interface ProgressRenderer {
 }
 
 const DEFAULT_PROGRESS_DELAY_MS = 2_000;
+const COMPACT_PROGRESS_TEXT = "Working...";
 const MAX_TOOL_LINES = 8;
 const MAX_VERBOSE_LINES = 12;
 
@@ -35,7 +37,7 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
   let task = Promise.resolve();
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  if (options.verbosity !== "off" && options.verbosity !== "compact") {
+  if (options.verbosity !== "off") {
     timer = setTimeout(() => {
       timer = undefined;
       void enqueueFlush();
@@ -85,7 +87,7 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
   }
 
   async function flushProgress(): Promise<void> {
-    if (finalized || options.verbosity === "off" || options.verbosity === "compact") return;
+    if (finalized || options.verbosity === "off") return;
 
     const message = progressMessage();
     if (!message) return;
@@ -96,6 +98,7 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
       receipt = (await options.edit(receipt, message)) ?? receipt;
       lastEditedText = message.text;
       sentLineCount = detailLines.length;
+      options.onReceipt?.(message, receipt);
       options.onProgress?.(message, receipt);
       return;
     }
@@ -112,6 +115,7 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
 
       receipt = (await options.send(update)) ?? receipt;
       sentLineCount = detailLines.length;
+      options.onReceipt?.(update, receipt);
       options.onProgress?.(update, receipt);
       return;
     }
@@ -119,10 +123,21 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
     receipt = await options.send(message);
     lastEditedText = message.text;
     sentLineCount = detailLines.length;
+    if (receipt) options.onReceipt?.(message, receipt);
     options.onProgress?.(message, receipt);
   }
 
   function progressMessage(): OutboundMessage | undefined {
+    if (options.verbosity === "compact") {
+      if (receipt) return undefined;
+
+      return {
+        kind: "progress",
+        format: "plain",
+        text: COMPACT_PROGRESS_TEXT,
+      };
+    }
+
     const lines = detailLines;
     const text = lines.join("\n").trim();
 

@@ -1,6 +1,6 @@
 import type { ChannelId, ConversationKey } from "../channels/types.ts";
 import type { AccessRole, BusyMode, TargetMode, Verbosity } from "../config/schema.ts";
-import type { RuntimeSessionId, RuntimeTargetId } from "../opencode/types.ts";
+import type { RuntimePermissionId, RuntimeSessionId, RuntimeTargetId } from "../opencode/types.ts";
 
 export interface TargetRecord {
   id: RuntimeTargetId;
@@ -68,4 +68,31 @@ export interface RunRecord {
   startedAt: string;
   finishedAt?: string;
   error?: string;
+}
+
+export type PendingPermissionStatus = "pending" | "approved" | "denied" | "expired";
+
+export interface PendingPermissionRecord {
+  id: string;
+  runId: string;
+  opencodePermissionId: RuntimePermissionId;
+  summary: string;
+  details?: unknown;
+  actionMessageReceiptId?: string;
+  status: PendingPermissionStatus;
+  createdAt: string;
+  expiresAt: string;
+  resolvedAt?: string;
+}
+
+export interface DeliveryReceiptRecord {
+  id: string;
+  runId?: string;
+  channel: ChannelId;
+  accountId: string;
+  conversationKey: ConversationKey;
+  platformMessageId: string;
+  kind: "ack" | "progress" | "final" | "error" | "status";
+  createdAt: string;
+  updatedAt: string;
 }

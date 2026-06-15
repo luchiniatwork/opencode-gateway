@@ -1,4 +1,6 @@
 import type { InboundAttachment, InboundMessage, SendReceipt } from "../channels/types.ts";
+import type { DeliveryReceiptRepository } from "../db/repositories/delivery-receipts.ts";
+import type { PendingPermissionRepository } from "../db/repositories/pending-permissions.ts";
 import type { RunRepository } from "../db/repositories/runs.ts";
 import type { ConversationBindingRecord, RunRecord } from "../db/types.ts";
 import { createProgressRenderer, type ProgressDelivery, type ProgressRenderer } from "../delivery/renderer.ts";
@@ -10,8 +12,12 @@ import type { AgentRuntime, RuntimeAttachment, RuntimeEvent, RuntimeTurnHandle }
 export interface TurnRunnerOptions {
   runtime: AgentRuntime;
   runs: RunRepository;
+  pendingPermissions?: PendingPermissionRepository;
+  deliveryReceipts?: DeliveryReceiptRepository;
   progressDelayMs?: number;
   runTimeoutMs?: number;
+  permissionTtlMs?: number;
+  now?: () => Date;
   log?: (level: GatewayLogLevel, message: string, context?: GatewayLogContext) => void;
 }
 
@@ -53,8 +59,10 @@ interface ActiveObserver {
 }
 
 export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
-  const { runtime, runs } = options;
+  const { runtime, runs, pendingPermissions, deliveryReceipts } = options;
   const runTimeoutMs = options.runTimeoutMs ?? 5 * 60_000;
+  const permissionTtlMs = options.permissionTtlMs ?? 15 * 60_000;
+  const now = options.now ?? (() => new Date());
   const activeByRunId = new Map<string, ActiveObserver>();
   const activeRunIdByBindingId = new Map<string, string>();
 
@@ -222,6 +230,9 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       onProgress: (message) => {
         log("info", "async run progress sent", { ...context, messageKind: message.kind });
       },
+      onReceipt: (message, receipt) => {
+        recordDeliveryReceipt(input.run.id, message, receipt, context);
+      },
       onError: (error) => {
         log("error", "async run progress failed", { ...context, error: formatError(error) });
       },
@@ -321,6 +332,11 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         log("error", "async run failed", { ...context, error: event.message, retryable: event.retryable });
         return true;
       }
+      case "permission_request": {
+        recordPendingPermission(input.run.id, event, context);
+        await progress.handle(event);
+        return false;
+      }
       case "status":
         if (event.status === "aborted") {
           progress.cancel();
@@ -346,12 +362,78 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     }
   }
 
-  async function deliverSafely(input: StartTurnInput, message: OutboundMessage, context: GatewayLogContext): Promise<SendReceipt | undefined> {
+  async function deliverSafely(
+    input: StartTurnInput & { run: RunRecord },
+    message: OutboundMessage,
+    context: GatewayLogContext,
+  ): Promise<SendReceipt | undefined> {
     try {
-      return await input.delivery.send(message);
+      const receipt = await input.delivery.send(message);
+      if (receipt) recordDeliveryReceipt(input.run.id, message, receipt, context);
+      return receipt;
     } catch (error) {
       log("error", "async run delivery failed", { ...context, error: formatError(error), messageKind: message.kind });
       return undefined;
+    }
+  }
+
+  function recordPendingPermission(
+    runId: string,
+    event: Extract<RuntimeEvent, { type: "permission_request" }>,
+    context: GatewayLogContext,
+  ): void {
+    if (!pendingPermissions) return;
+    if (pendingPermissions.getByOpenCodePermissionId(event.id)) return;
+
+    const expiresAt = new Date(now().getTime() + permissionTtlMs).toISOString();
+
+    try {
+      const permission = pendingPermissions.create({
+        runId,
+        opencodePermissionId: event.id,
+        summary: event.summary,
+        details: event.details,
+        expiresAt,
+      });
+
+      log("info", "async run permission requested", {
+        ...context,
+        permissionId: permission.id,
+        opencodePermissionId: event.id,
+      });
+    } catch (error) {
+      log("error", "async run permission persistence failed", {
+        ...context,
+        opencodePermissionId: event.id,
+        error: formatError(error),
+      });
+    }
+  }
+
+  function recordDeliveryReceipt(
+    runId: string,
+    message: OutboundMessage,
+    receipt: SendReceipt,
+    context: GatewayLogContext,
+  ): void {
+    if (!deliveryReceipts) return;
+
+    try {
+      deliveryReceipts.create({
+        runId,
+        channel: receipt.channel,
+        accountId: receipt.accountId,
+        conversationKey: receipt.conversationKey,
+        platformMessageId: receipt.platformMessageId,
+        kind: message.kind,
+      });
+    } catch (error) {
+      log("error", "async run delivery receipt persistence failed", {
+        ...context,
+        messageKind: message.kind,
+        platformMessageId: receipt.platformMessageId,
+        error: formatError(error),
+      });
     }
   }
 
