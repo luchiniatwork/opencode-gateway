@@ -53,6 +53,7 @@ export interface UpdateBindingProfileInput {
 }
 
 export interface ConversationBindingRepository {
+  getById(id: string): ConversationBindingRecord | undefined;
   getByConversationKey(conversationKey: string): ConversationBindingRecord | undefined;
   upsert(input: UpsertConversationBindingInput): ConversationBindingRecord;
   updateSession(input: UpdateBindingSessionInput): ConversationBindingRecord | undefined;
@@ -67,6 +68,12 @@ export function createConversationBindingRepository(
   const createId = options.createId ?? randomUUID;
 
   return {
+    getById(id): ConversationBindingRecord | undefined {
+      const row = db.query("SELECT * FROM conversation_bindings WHERE id = ?").get(id) as ConversationBindingRow | null;
+
+      return row ? mapConversationBindingRow(row) : undefined;
+    },
+
     getByConversationKey(conversationKey): ConversationBindingRecord | undefined {
       const row = db
         .query("SELECT * FROM conversation_bindings WHERE conversation_key = ?")

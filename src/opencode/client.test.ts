@@ -11,7 +11,7 @@ test("creates a session when no session id is provided", async () => {
       time: { created: 1_700_000_000_000, updated: 1_700_000_000_500 },
     },
   });
-  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, observeReconcileIntervalMs: 1 });
 
   const session = await runtime.ensureSession({ target: attachTarget, title: "New chat" });
 
@@ -175,6 +175,59 @@ test("starts observing events before sending an async prompt", async () => {
   expect(turn.handle.id).toMatch(/^msg_[0-9a-f]{32}$/);
   expect(sdk.calls.subscribe).toEqual([{ query: { directory: "/work/repo" }, signal: undefined }]);
   expect(sdk.calls.promptAsync).toHaveLength(1);
+});
+
+test("startTurn reconciles final response when OpenCode uses a different user message id", async () => {
+  const sdk = createFakeSdkClient({
+    events: [],
+    messageSnapshots: [
+      [{ info: { id: "existing-assistant", sessionID: "session-1", role: "assistant", finish: "stop" }, parts: [{ type: "text", text: "Old" }] }],
+      [
+        { info: { id: "existing-assistant", sessionID: "session-1", role: "assistant", finish: "stop" }, parts: [{ type: "text", text: "Old" }] },
+        { info: { id: "actual-user", sessionID: "session-1", role: "user" }, parts: [{ type: "text", text: "Hello" }] },
+        {
+          info: { id: "assistant-final", sessionID: "session-1", role: "assistant", parentID: "actual-user", finish: "stop" },
+          parts: [{ type: "text", text: "New final" }],
+        },
+      ],
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const turn = await runtime.startTurn({ target: attachTarget, sessionId: "session-1", text: "Hello" });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([{ type: "final", text: "New final", costUsd: undefined, tokens: undefined }]);
+  expect(sdk.calls.messages).toHaveLength(2);
+});
+
+test("startTurn reconciles assistant errors when OpenCode uses a different user message id", async () => {
+  const sdk = createFakeSdkClient({
+    events: [],
+    messageSnapshots: [
+      [],
+      [
+        { info: { id: "actual-user", sessionID: "session-1", role: "user" }, parts: [{ type: "text", text: "Hello" }] },
+        {
+          info: {
+            id: "assistant-error",
+            sessionID: "session-1",
+            role: "assistant",
+            parentID: "actual-user",
+            error: { data: { message: "input exceeds context window of this model" } },
+          },
+          parts: [],
+        },
+      ],
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const turn = await runtime.startTurn({ target: attachTarget, sessionId: "session-1", text: "Hello" });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([{ type: "error", message: "input exceeds context window of this model", retryable: undefined }]);
+  expect(sdk.calls.messages).toHaveLength(2);
 });
 
 test("does not send an async prompt when pre-send observation fails", async () => {
@@ -448,6 +501,55 @@ test("observes permission requests without leaking raw SDK payloads", async () =
   ]);
 });
 
+test("observe does not fail idle events while a permission request is pending", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "permission.updated",
+        properties: {
+          id: "permission-1",
+          sessionID: "session-1",
+          messageID: "assistant-1",
+          callID: "call-1",
+          type: "tool",
+          title: "Run shell command",
+        },
+      },
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, observeReconcileIntervalMs: 1 });
+
+  const events = await collectRuntimeEvents(
+    runtime.observe({ target: attachTarget, sessionId: "session-1", turnId: "message-user" }),
+  );
+
+  expect(events).toEqual([
+    expect.objectContaining({ type: "permission_request", id: "permission-1" }),
+    { type: "status", status: "idle" },
+  ]);
+});
+
+test("observe clears pending permission state on permission replies", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      { type: "permission.updated", properties: { id: "permission-1", sessionID: "session-1", title: "Run shell command" } },
+      { type: "permission.replied", properties: { id: "permission-1", sessionID: "session-1" } },
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, observeReconcileIntervalMs: 1 });
+
+  const events = await collectRuntimeEvents(
+    runtime.observe({ target: attachTarget, sessionId: "session-1", turnId: "message-user" }),
+  );
+
+  expect(events).toEqual([
+    expect.objectContaining({ type: "permission_request", id: "permission-1" }),
+    { type: "status", status: "idle" },
+  ]);
+});
+
 test("observe filters events from other sessions and user prompt parts", async () => {
   const sdk = createFakeSdkClient({
     events: [
@@ -619,6 +721,20 @@ test("observe backfills final response from messages on idle", async () => {
   expect(sdk.calls.messages).toHaveLength(1);
 });
 
+test("observe keeps idle events non-terminal when no final response is available", async () => {
+  const sdk = createFakeSdkClient({
+    events: [{ type: "session.idle", properties: { sessionID: "session-1" } }],
+    messages: [],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, observeReconcileIntervalMs: 1 });
+
+  const events = await collectRuntimeEvents(
+    runtime.observe({ target: attachTarget, sessionId: "session-1", turnId: "message-user" }),
+  );
+
+  expect(events).toEqual([{ type: "status", status: "idle" }]);
+});
+
 test("observe backfills final response immediately when terminal events were missed", async () => {
   const sdk = createFakeSdkClient({
     events: [],
@@ -777,6 +893,48 @@ test("aborts a session", async () => {
   ]);
 });
 
+test("responds to permissions with once always and reject mappings", async () => {
+  const sdk = createFakeSdkClient();
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  await runtime.respondToPermission({
+    target: attachTarget,
+    sessionId: "session-1",
+    permissionId: "permission-1",
+    decision: "approve",
+  });
+  await runtime.respondToPermission({
+    target: attachTarget,
+    sessionId: "session-1",
+    permissionId: "permission-2",
+    decision: "always",
+  });
+  await runtime.respondToPermission({
+    target: attachTarget,
+    sessionId: "session-1",
+    permissionId: "permission-3",
+    decision: "deny",
+  });
+
+  expect(sdk.calls.respondToPermission).toEqual([
+    {
+      path: { id: "session-1", permissionID: "permission-1" },
+      query: { directory: "/work/repo" },
+      body: { response: "once" },
+    },
+    {
+      path: { id: "session-1", permissionID: "permission-2" },
+      query: { directory: "/work/repo" },
+      body: { response: "always" },
+    },
+    {
+      path: { id: "session-1", permissionID: "permission-3" },
+      query: { directory: "/work/repo" },
+      body: { response: "reject" },
+    },
+  ]);
+});
+
 test("lists sessions sorted by updated time and applies limit", async () => {
   const sdk = createFakeSdkClient({
     sessions: [
@@ -866,7 +1024,10 @@ interface FakePromptResponse {
 }
 
 function createFakeSdkClient(options: FakeSdkOptions = {}) {
-  const calls: Record<"create" | "get" | "list" | "messages" | "prompt" | "promptAsync" | "abort" | "subscribe", unknown[]> = {
+  const calls: Record<
+    "create" | "get" | "list" | "messages" | "prompt" | "promptAsync" | "abort" | "subscribe" | "respondToPermission",
+    unknown[]
+  > = {
     create: [],
     get: [],
     list: [],
@@ -875,6 +1036,7 @@ function createFakeSdkClient(options: FakeSdkOptions = {}) {
     promptAsync: [],
     abort: [],
     subscribe: [],
+    respondToPermission: [],
   };
   const responses = {
     createSession: options.createSession ?? { id: "session-created" },
@@ -890,6 +1052,10 @@ function createFakeSdkClient(options: FakeSdkOptions = {}) {
     calls,
     responses,
     client: {
+      async postSessionIdPermissionsPermissionId(input: unknown) {
+        calls.respondToPermission.push(input);
+        return { data: true };
+      },
       session: {
         async create(input: unknown) {
           calls.create.push(input);

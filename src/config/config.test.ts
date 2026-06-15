@@ -74,7 +74,34 @@ test("loads JSONC config with defaults, env expansion, and home expansion", () =
     verbosity: "compact",
     inboundDebounceMs: 1500,
   });
+  expect(config.interactive.permissions).toEqual({
+    mode: "buttons",
+    fallbackCommands: true,
+    allowAlways: false,
+  });
   expect(config.channels.telegram?.token).toBe("secret-token");
+});
+
+test("can enable always-allow permission responses explicitly", () => {
+  const config = parseGatewayConfig(
+    minimalConfig(`
+      "interactive": {
+        "permissions": {
+          "allowAlways": true,
+        },
+      },
+    `),
+    {
+      env,
+      homeDir: "/home/alice",
+    },
+  );
+
+  expect(config.interactive.permissions).toEqual({
+    mode: "buttons",
+    fallbackCommands: true,
+    allowAlways: true,
+  });
 });
 
 test("loads file-backed config paths relative to the config file", async () => {

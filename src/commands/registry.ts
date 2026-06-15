@@ -3,6 +3,7 @@ import type { GatewayConfig } from "../config/schema.ts";
 import type { DispatchResolver, DispatchResolverRepositories } from "../dispatch/resolver.ts";
 import type { ConversationBindingRecord, ProfileRecord, RunRecord, TargetRecord } from "../db/types.ts";
 import type { TurnRunner } from "../gateway/turn-runner.ts";
+import type { PermissionDecision, PermissionInteractionService } from "../interactive/permissions.ts";
 import type { OutboundMessage } from "../messages/types.ts";
 import type { AgentRuntime, RuntimeSession } from "../opencode/types.ts";
 
@@ -19,6 +20,7 @@ export interface CommandRouterOptions {
   resolver: DispatchResolver;
   runtime: AgentRuntime;
   turnRunner: TurnRunner;
+  permissionService?: PermissionInteractionService;
   getHealth?: () => CommandHealthSnapshot;
 }
 
@@ -47,11 +49,11 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       if (denied) return { handled: true, command: parsed.name, messages: [markdown(denied)] };
 
       const response = await executeCommand(parsed, message);
-      return { handled: true, command: parsed.name, messages: [markdown(response)] };
+      return { handled: true, command: parsed.name, messages: [typeof response === "string" ? markdown(response) : response] };
     },
   };
 
-  async function executeCommand(command: ParsedCommand, message: InboundMessage): Promise<string> {
+  async function executeCommand(command: ParsedCommand, message: InboundMessage): Promise<string | OutboundMessage> {
     switch (command.name) {
       case "help":
         return helpText();
@@ -70,6 +72,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
         return profilesText(message);
       case "profile":
         return command.args.length === 0 ? currentProfileText(message) : switchProfileText(message, command.args[0]);
+      case "permission":
+        return permissionText(message, command.args);
       default:
         return unknownCommandText(command.name);
     }
@@ -95,6 +99,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       "`/use-session <id>` - Rebind this conversation to an existing session.",
       "`/profiles` - List available gateway profiles.",
       "`/profile [id]` - Show or switch the active profile.",
+      "`/permission approve|deny|always <id>` - Respond to an OpenCode permission request.",
     ].join("\n");
   }
 
@@ -295,6 +300,17 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       .join("\n");
   }
 
+  async function permissionText(message: InboundMessage, args: string[]): Promise<OutboundMessage> {
+    if (!options.permissionService) return markdown("Permission responses are not enabled.");
+
+    const decision = permissionDecisionArg(args[0]);
+    if (!decision) {
+      return markdown("Usage: `/permission approve <id>`, `/permission deny <id>`, or `/permission always <id>`");
+    }
+
+    return options.permissionService.handleFallbackCommand(message, decision, args[1]);
+  }
+
   function getConversationRuntimeContext(message: InboundMessage): {
     binding?: ConversationBindingRecord;
     profile?: ProfileRecord;
@@ -381,6 +397,13 @@ function formatProfileLine(profile: ProfileRecord, currentProfileId: string): st
 
 function titleCase(value: string): string {
   return `${value.slice(0, 1).toUpperCase()}${value.slice(1)}`;
+}
+
+function permissionDecisionArg(value: string | undefined): PermissionDecision | undefined {
+  if (value === "approve") return "approve";
+  if (value === "always") return "always";
+  if (value === "deny") return "deny";
+  return undefined;
 }
 
 function formatError(error: unknown): string {

@@ -114,7 +114,7 @@ export interface PermissionResponseInput {
   target: RuntimeTarget;
   sessionId: RuntimeSessionId;
   permissionId: RuntimePermissionId;
-  decision: "approve" | "deny";
+  decision: "approve" | "always" | "deny";
   message?: string;
 }
 

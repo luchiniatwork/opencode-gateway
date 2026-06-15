@@ -32,11 +32,17 @@ export interface ResolvePendingPermissionInput {
   actionMessageReceiptId?: string;
 }
 
+export interface UpdatePendingPermissionActionReceiptInput {
+  id: string;
+  actionMessageReceiptId: string;
+}
+
 export interface PendingPermissionRepository {
   create(input: CreatePendingPermissionInput): PendingPermissionRecord;
   getById(id: string): PendingPermissionRecord | undefined;
   getByOpenCodePermissionId(opencodePermissionId: string): PendingPermissionRecord | undefined;
   listPendingByRunId(runId: string): PendingPermissionRecord[];
+  setActionMessageReceiptId(input: UpdatePendingPermissionActionReceiptInput): PendingPermissionRecord | undefined;
   resolve(input: ResolvePendingPermissionInput): PendingPermissionRecord | undefined;
 }
 
@@ -92,6 +98,19 @@ export function createPendingPermissionRepository(
         .all(runId) as PendingPermissionRow[];
 
       return rows.map(mapPendingPermissionRow);
+    },
+
+    setActionMessageReceiptId(input): PendingPermissionRecord | undefined {
+      const row = db
+        .query(
+          `UPDATE pending_permissions SET
+            action_message_receipt_id = ?
+          WHERE id = ?
+          RETURNING *`,
+        )
+        .get(input.actionMessageReceiptId, input.id) as PendingPermissionRow | null;
+
+      return row ? mapPendingPermissionRow(row) : undefined;
     },
 
     resolve(input): PendingPermissionRecord | undefined {

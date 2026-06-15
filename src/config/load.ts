@@ -183,6 +183,9 @@ function normalizeConfig(rawConfig: RawGatewayConfig, homeDir: string, baseDir: 
       entries: profiles,
     },
     channels: telegram ? { telegram } : {},
+    interactive: {
+      permissions: rawConfig.interactive.permissions,
+    },
     defaults: {
       profile: defaultProfile,
       target: defaultTarget,

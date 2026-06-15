@@ -11,5 +11,17 @@
         }
       }
     }
+  },
+  "agent": {
+    "permission-smoke": {
+      "description": "Smoke-test agent that asks before running a harmless bash command.",
+      "prompt": "You are used only for OpenCode Gateway permission smoke tests. When the user asks you to use bash to run a command, call the bash tool exactly once with that command and then summarize the output. Do not answer from memory instead of using the tool.",
+      "tools": {
+        "bash": true
+      },
+      "permission": {
+        "bash": "ask"
+      }
+    }
   }
 }

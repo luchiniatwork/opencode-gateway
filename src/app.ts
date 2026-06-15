@@ -1,6 +1,7 @@
 import { getConfigSeeds } from "./config/load.ts";
 import type {
   ChannelAdapter,
+  ChannelAction,
   ChannelEvent,
   ChannelLogger,
   InboundMessage,
@@ -23,6 +24,7 @@ import { createTargetRepository } from "./db/repositories/targets.ts";
 import type { ProgressDelivery } from "./delivery/renderer.ts";
 import { createDispatchResolver } from "./dispatch/resolver.ts";
 import { createTurnRunner, type StartTurnResult, type TurnRunner } from "./gateway/turn-runner.ts";
+import { createPermissionInteractionService, type PermissionInteractionService } from "./interactive/permissions.ts";
 import type { OutboundMessage } from "./messages/types.ts";
 import { createHealthSnapshot, type ChannelHealthStatus, type GatewayHealthSnapshot } from "./observability/health.ts";
 import {
@@ -65,6 +67,7 @@ export interface GatewayAppOptions {
   runtime?: AgentRuntime;
   channels?: GatewayChannelRegistration<any>[];
   createTelegramAdapter?: () => ChannelAdapter<TelegramChannelConfig>;
+  turnRunTimeoutMs?: number;
 }
 
 export function createApp(options: GatewayAppOptions = {}): GatewayApp {
@@ -75,6 +78,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
   let abortController: AbortController | undefined;
   let healthServer: ReturnType<typeof Bun.serve> | undefined;
   let turnRunner: TurnRunner | undefined;
+  let permissionService: PermissionInteractionService | undefined;
   const startedChannels: GatewayChannelRegistration<any>[] = [];
   const channelStatuses = new Map<string, ChannelHealthStatus>();
 
@@ -148,11 +152,20 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
 
           const runtime = options.runtime ?? new OpenCodeRuntime();
           const resolver = createDispatchResolver({ config: options.config, repositories, runtime });
+          permissionService = createPermissionInteractionService({
+            config: options.config.interactive.permissions,
+            repositories,
+            runtime,
+            now,
+            log,
+          });
           turnRunner = createTurnRunner({
             runtime,
             runs: repositories.runs,
             pendingPermissions: repositories.pendingPermissions,
             deliveryReceipts: repositories.deliveryReceipts,
+            onPermissionRequest: (input) => permissionService?.sendPermissionRequest(input),
+            runTimeoutMs: options.turnRunTimeoutMs,
             now,
             log,
           });
@@ -162,6 +175,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
             resolver,
             runtime,
             turnRunner,
+            permissionService,
             getHealth: () => {
               const snapshot = healthSnapshot();
 
@@ -245,6 +259,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
         } catch (error) {
           await turnRunner?.stop();
           turnRunner = undefined;
+          permissionService = undefined;
           await stopStartedChannels();
           stopHealthServer();
           abortController = undefined;
@@ -265,6 +280,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       abortController?.abort();
       await turnRunner?.stop();
       turnRunner = undefined;
+      permissionService = undefined;
       abortController = undefined;
       await stopStartedChannels();
       stopHealthServer();
@@ -279,12 +295,36 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
     event: ChannelEvent,
     routeMessage: (message: InboundMessage, delivery: ProgressDelivery) => Promise<OutboundMessage[]>,
   ): Promise<void> {
-    if (event.type !== "message") {
-      log("debug", "channel action ignored in phase 1", {
-        channel: event.action.channel,
-        accountId: event.action.accountId,
-        conversationKey: event.action.conversation.key,
-      });
+    if (event.type === "action") {
+      const { action } = event;
+      const target = outboundTargetFromAction(action);
+      const delivery = channelDelivery(channel, target);
+
+      try {
+        const handled = await permissionService?.handleAction(action, delivery);
+
+        log(handled ? "info" : "debug", handled ? "channel action handled" : "channel action ignored", {
+          channel: action.channel,
+          accountId: action.accountId,
+          conversationKey: action.conversation.key,
+          actionId: action.actionId,
+        });
+      } catch (error) {
+        log("error", "channel action handling failed", {
+          channel: action.channel,
+          accountId: action.accountId,
+          conversationKey: action.conversation.key,
+          actionId: action.actionId,
+          error: formatError(error),
+        });
+
+        await channel.adapter.send(target, {
+          kind: "error",
+          format: "plain",
+          text: `Gateway error: ${formatError(error)}`,
+        });
+      }
+
       return;
     }
 
@@ -547,6 +587,18 @@ function outboundTargetFromMessage(message: InboundMessage): OutboundTarget {
     threadId: message.conversation.threadId,
     topicId: message.conversation.topicId,
     raw: message.raw,
+  };
+}
+
+function outboundTargetFromAction(action: ChannelAction): OutboundTarget {
+  return {
+    channel: action.channel,
+    accountId: action.accountId,
+    conversationKey: action.conversation.key,
+    conversationId: action.conversation.id,
+    threadId: action.conversation.threadId,
+    topicId: action.conversation.topicId,
+    raw: action.raw,
   };
 }
 

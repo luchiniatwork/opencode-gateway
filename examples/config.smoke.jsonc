@@ -1,5 +1,5 @@
 {
-  // Real Phase 1 smoke config.
+  // Real smoke config for normal gateway and optional permission UX acceptance.
   // Required environment:
   // - TELEGRAM_BOT_TOKEN: token from BotFather
   // - TELEGRAM_ALLOW_FROM: numeric Telegram user id allowed to use the bot
@@ -28,10 +28,19 @@
       {
         "id": "default",
         "displayName": "Default",
-        "description": "Phase 1 real smoke profile",
+        "description": "Real smoke profile",
         "defaultTarget": "default",
         "defaultModel": "openai/gpt-5.5",
         "defaults": { "verbosity": "compact", "busyMode": "queue" }
+      },
+      {
+        "id": "permission-smoke",
+        "displayName": "Permission Smoke",
+        "description": "Triggers OpenCode permission requests for Telegram approval smoke tests",
+        "defaultTarget": "default",
+        "defaultAgent": "permission-smoke",
+        "defaultModel": "openai/gpt-5.5",
+        "defaults": { "verbosity": "tools", "busyMode": "queue" }
       }
     ]
   },
@@ -41,6 +50,13 @@
       "token": "{env:TELEGRAM_BOT_TOKEN}",
       "allowFrom": ["{env:TELEGRAM_ALLOW_FROM}"],
       "groups": {}
+    }
+  },
+  "interactive": {
+    "permissions": {
+      "mode": "buttons",
+      "fallbackCommands": true,
+      "allowAlways": false
     }
   },
   "defaults": {

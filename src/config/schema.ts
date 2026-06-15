@@ -48,6 +48,27 @@ const telegramGroupSchema = z
   })
   .strict();
 
+const permissionInteractionSchema = z
+  .object({
+    mode: z.enum(["buttons", "fallbackCommands", "off"]).default("buttons"),
+    fallbackCommands: z.boolean().default(true),
+    allowAlways: z.boolean().default(false),
+  })
+  .strict();
+
+const defaultPermissionInteraction = {
+  mode: "buttons" as const,
+  fallbackCommands: true,
+  allowAlways: false,
+};
+
+const interactiveSchema = z
+  .object({
+    permissions: permissionInteractionSchema.default(defaultPermissionInteraction),
+  })
+  .strict()
+  .default({ permissions: defaultPermissionInteraction });
+
 export const rawGatewayConfigSchema = z
   .object({
     gateway: z
@@ -89,6 +110,7 @@ export const rawGatewayConfigSchema = z
       })
       .strict()
       .default({}),
+    interactive: interactiveSchema,
     defaults: z
       .object({
         profile: z.string().min(1).optional(),
@@ -148,6 +170,16 @@ export interface TelegramChannelConfig {
   groups: Record<string, { requireMention: boolean }>;
 }
 
+export interface InteractivePermissionsConfig {
+  mode: "buttons" | "fallbackCommands" | "off";
+  fallbackCommands: boolean;
+  allowAlways: boolean;
+}
+
+export interface InteractiveConfig {
+  permissions: InteractivePermissionsConfig;
+}
+
 export interface GatewayConfig {
   gateway: {
     host: string;
@@ -165,6 +197,7 @@ export interface GatewayConfig {
   channels: {
     telegram?: TelegramChannelConfig;
   };
+  interactive: InteractiveConfig;
   defaults: {
     profile: string;
     target: string;

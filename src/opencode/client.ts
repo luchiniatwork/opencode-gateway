@@ -76,7 +76,7 @@ interface SdkMessageEntry {
 }
 
 interface SdkSessionOptions {
-  path?: { id: string };
+  path?: { id: string; permissionID?: string };
   query?: { directory?: string };
   body?: unknown;
 }
@@ -91,6 +91,7 @@ interface SdkEventSubscription {
 }
 
 interface OpenCodeSdkClient {
+  postSessionIdPermissionsPermissionId?(options: SdkSessionOptions): Promise<SdkResult<boolean>>;
   session: {
     create(options?: SdkSessionOptions): Promise<SdkResult<SdkSession>>;
     get(options: SdkSessionOptions): Promise<SdkResult<SdkSession>>;
@@ -108,8 +109,11 @@ interface OpenCodeSdkClient {
 interface ObserveState {
   sessionId: string;
   turnId?: string;
+  beforeMessageIds: Set<string>;
+  hasBeforeMessageSnapshot: boolean;
   assistantMessageIds: Set<string>;
   finalizedMessageIds: Set<string>;
+  pendingPermissionIds: Set<string>;
   textPartsByMessageId: Map<string, Map<string, string>>;
   toolStatusesByCallId: Map<string, string>;
   pendingFinal?: Extract<RuntimeEvent, { type: "final" }>;
@@ -240,6 +244,9 @@ function normalizeSdkEvent(
     case "permission.asked":
     case "permission.v2.asked":
       return normalizePermissionRequest(type, properties, state);
+    case "permission.replied":
+    case "permission.v2.replied":
+      return normalizePermissionReplied(properties, state);
     case "session.error":
       return normalizeSessionError(properties, state);
     default:
@@ -341,6 +348,8 @@ function normalizePermissionRequest(
   const id = getObjectString(properties, "id") ?? getObjectString(properties, "requestID");
   if (!id) return noEvents();
 
+  state.pendingPermissionIds.add(id);
+
   return {
     events: [
       {
@@ -363,6 +372,18 @@ function normalizePermissionRequest(
     ],
     terminal: false,
   };
+}
+
+function normalizePermissionReplied(
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  if (!matchesSession(properties, state)) return noEvents();
+
+  const id = getObjectString(properties, "id") ?? getObjectString(properties, "requestID");
+  if (id) state.pendingPermissionIds.delete(id);
+
+  return noEvents();
 }
 
 function normalizeSessionError(
@@ -551,7 +572,7 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
       markReady();
 
       if (input.initialBackfill && input.state.turnId) {
-        const final = await findFinalEventFromMessages(
+        const terminal = await findTerminalEventFromMessages(
           input.client,
           input.target,
           input.state.sessionId,
@@ -559,8 +580,8 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
           input.state,
         );
 
-        if (final) {
-          queue.push(final);
+        if (terminal) {
+          queue.push(terminal);
           queue.end();
           return;
         }
@@ -575,10 +596,10 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
           : { type: "event" as const, result: await nextPromise };
 
         if (outcome.type === "reconcile") {
-          const final = await reconcileFinalFromMessages();
+          const terminal = await reconcileTerminalFromMessages();
 
-          if (final) {
-            queue.push(final);
+          if (terminal) {
+            queue.push(terminal);
             queue.end();
             return;
           }
@@ -589,10 +610,10 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
         const result = outcome.result;
 
         if (result.done) {
-          const final = await reconcileFinalFromMessages();
+          const terminal = await reconcileTerminalFromMessages();
 
-          if (final) {
-            queue.push(final);
+          if (terminal) {
+            queue.push(terminal);
             queue.end();
             return;
           }
@@ -623,10 +644,10 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
 
     for (const event of normalized.events) {
       if (event.type === "status" && event.status === "idle" && input.state.turnId) {
-        const final = await reconcileFinalFromMessages();
+        const terminal = await reconcileTerminalFromMessages();
 
-        if (final) {
-          queue.push(final);
+        if (terminal) {
+          queue.push(terminal);
           queue.end();
           return true;
         }
@@ -643,10 +664,10 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
     return false;
   }
 
-  async function reconcileFinalFromMessages(): Promise<Extract<RuntimeEvent, { type: "final" }> | undefined> {
+  async function reconcileTerminalFromMessages(): Promise<Extract<RuntimeEvent, { type: "final" | "error" }> | undefined> {
     if (!input.state.turnId) return resolvePendingFinal(input.state);
 
-    const final = await findFinalEventFromMessages(
+    const terminal = await findTerminalEventFromMessages(
       input.client,
       input.target,
       input.state.sessionId,
@@ -654,9 +675,9 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
       input.state,
     );
 
-    if (final) {
+    if (terminal) {
       clearPendingFinal(input.state);
-      return final;
+      return terminal;
     }
 
     return resolvePendingFinal(input.state);
@@ -753,6 +774,8 @@ export class OpenCodeRuntime implements AgentRuntime {
     const client = this.getClient(input.target);
     const model = parseModelRef(input.model);
     const messageId = createGatewayMessageId();
+    const beforeMessages = await listMessages(client, input.target, input.sessionId).catch(() => []);
+    const beforeMessageIds = new Set(beforeMessages.map((message) => message.info?.id).filter(isNonEmptyString));
     let subscription: SdkEventSubscription;
 
     try {
@@ -768,7 +791,7 @@ export class OpenCodeRuntime implements AgentRuntime {
       subscription,
       client,
       target: input.target,
-      state: createObserveState(input.sessionId, messageId),
+      state: createObserveState(input.sessionId, messageId, beforeMessageIds),
       signal: input.signal,
       reconcileIntervalMs: this.observeReconcileIntervalMs,
     });
@@ -886,7 +909,23 @@ export class OpenCodeRuntime implements AgentRuntime {
   }
 
   async respondToPermission(input: PermissionResponseInput): Promise<void> {
-    throw new OpenCodeRuntimeError("OpenCodeRuntime.respondToPermission is not implemented yet");
+    const client = this.getClient(input.target);
+    const respond = client.postSessionIdPermissionsPermissionId;
+
+    if (!respond) {
+      throw new OpenCodeRuntimeError("OpenCode SDK client does not expose a permission response endpoint");
+    }
+
+    await unwrapSdkResult(
+      respond.call(client, {
+        path: { id: input.sessionId, permissionID: input.permissionId },
+        query: directoryQuery(input.target),
+        body: {
+          response: permissionSdkResponse(input.decision),
+        },
+      }),
+      `Unable to respond to OpenCode permission ${input.permissionId}`,
+    );
   }
 
   async listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]> {
@@ -917,33 +956,50 @@ export class OpenCodeRuntime implements AgentRuntime {
   }
 }
 
-async function findFinalEventFromMessages(
+async function findTerminalEventFromMessages(
   client: OpenCodeSdkClient,
   target: RuntimeTarget,
   sessionId: string,
   turnId: string,
   state: ObserveState,
-): Promise<Extract<RuntimeEvent, { type: "final" }> | undefined> {
+): Promise<Extract<RuntimeEvent, { type: "final" | "error" }> | undefined> {
   const messages = await listMessages(client, target, sessionId).catch(() => []);
-  let matchingCompleted = messages.filter(
-    (message) => message.info?.role === "assistant" && message.info.parentID === turnId && isCompletedAssistantMessage(message.info),
+  let matchingTerminal = messages.filter(
+    (message) => message.info?.role === "assistant" && message.info.parentID === turnId && isTerminalAssistantMessage(message.info),
   );
 
-  if (matchingCompleted.length === 0) {
+  if (matchingTerminal.length === 0) {
     const turnIndex = messages.findIndex((message) => message.info?.role === "user" && message.info.id === turnId);
 
     if (turnIndex >= 0) {
-      matchingCompleted = messages
+      matchingTerminal = messages
         .slice(turnIndex + 1)
-        .filter((message) => message.info?.role === "assistant" && isCompletedAssistantMessage(message.info));
+        .filter((message) => message.info?.role === "assistant" && isTerminalAssistantMessage(message.info));
     }
   }
 
-  const assistant = [...matchingCompleted].reverse().find((message) => finalAssistantText(message).trim().length > 0) ?? matchingCompleted.at(-1);
+  if (matchingTerminal.length === 0 && state.hasBeforeMessageSnapshot) {
+    matchingTerminal = messages.filter(
+      (message) =>
+        message.info?.role === "assistant" &&
+        isTerminalAssistantMessage(message.info) &&
+        Boolean(message.info.id && !state.beforeMessageIds.has(message.info.id)),
+    );
+  }
+
+  const assistant = [...matchingTerminal].reverse().find((message) => finalAssistantText(message).trim().length > 0 || message.info?.error !== undefined) ?? matchingTerminal.at(-1);
 
   if (!assistant?.info?.id || state.finalizedMessageIds.has(assistant.info.id)) return undefined;
 
   state.finalizedMessageIds.add(assistant.info.id);
+
+  if (assistant.info.error !== undefined) {
+    return {
+      type: "error",
+      message: formatRuntimeError(assistant.info.error),
+      retryable: isRetryableRuntimeError(assistant.info.error),
+    };
+  }
 
   return {
     type: "final",
@@ -976,6 +1032,10 @@ function isCompletedAssistantMessage(info: SdkAssistantMessage | undefined): boo
   if (info.finish === "tool-calls") return false;
 
   return info.time?.completed !== undefined || info.finish !== undefined;
+}
+
+function isTerminalAssistantMessage(info: SdkAssistantMessage | undefined): boolean {
+  return Boolean(info?.error !== undefined || isCompletedAssistantMessage(info));
 }
 
 function finalAssistantText(message: SdkMessageEntry): string {
@@ -1141,12 +1201,15 @@ function createGatewayMessageId(): string {
   return `msg_${crypto.randomUUID().replaceAll("-", "")}`;
 }
 
-function createObserveState(sessionId: string, turnId: string | undefined): ObserveState {
+function createObserveState(sessionId: string, turnId: string | undefined, beforeMessageIds?: Set<string>): ObserveState {
   return {
     sessionId,
     turnId,
+    beforeMessageIds: beforeMessageIds ?? new Set(),
+    hasBeforeMessageSnapshot: beforeMessageIds !== undefined,
     assistantMessageIds: new Set(),
     finalizedMessageIds: new Set(),
+    pendingPermissionIds: new Set(),
     textPartsByMessageId: new Map(),
     toolStatusesByCallId: new Map(),
   };
@@ -1164,6 +1227,12 @@ function createRuntimeTurnHandle(
     status: "running",
     raw,
   };
+}
+
+function permissionSdkResponse(decision: PermissionResponseInput["decision"]): "once" | "always" | "reject" {
+  if (decision === "approve") return "once";
+  if (decision === "always") return "always";
+  return "reject";
 }
 
 function isSdkFieldsResult<T>(value: SdkResult<T>): value is SdkFieldsResult<T> {

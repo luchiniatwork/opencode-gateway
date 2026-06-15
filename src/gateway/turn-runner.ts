@@ -2,7 +2,7 @@ import type { InboundAttachment, InboundMessage, SendReceipt } from "../channels
 import type { DeliveryReceiptRepository } from "../db/repositories/delivery-receipts.ts";
 import type { PendingPermissionRepository } from "../db/repositories/pending-permissions.ts";
 import type { RunRepository } from "../db/repositories/runs.ts";
-import type { ConversationBindingRecord, RunRecord } from "../db/types.ts";
+import type { ConversationBindingRecord, PendingPermissionRecord, RunRecord } from "../db/types.ts";
 import { createProgressRenderer, type ProgressDelivery, type ProgressRenderer } from "../delivery/renderer.ts";
 import type { ResolvedDispatch } from "../dispatch/resolver.ts";
 import type { OutboundMessage } from "../messages/types.ts";
@@ -17,8 +17,18 @@ export interface TurnRunnerOptions {
   progressDelayMs?: number;
   runTimeoutMs?: number;
   permissionTtlMs?: number;
+  onPermissionRequest?(input: TurnRunnerPermissionRequestInput): Promise<void> | void;
   now?: () => Date;
   log?: (level: GatewayLogLevel, message: string, context?: GatewayLogContext) => void;
+}
+
+export interface TurnRunnerPermissionRequestInput {
+  permission: PendingPermissionRecord;
+  event: Extract<RuntimeEvent, { type: "permission_request" }>;
+  run: RunRecord;
+  message: InboundMessage;
+  resolution: ResolvedDispatch;
+  delivery: ProgressDelivery;
 }
 
 export interface StartTurnInput {
@@ -333,7 +343,19 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         return true;
       }
       case "permission_request": {
-        recordPendingPermission(input.run.id, event, context);
+        const permission = recordPendingPermission(input.run.id, event, context);
+
+        if (permission) {
+          await notifyPermissionRequest({
+            permission,
+            event,
+            run: input.run,
+            message: input.message,
+            resolution: input.resolution,
+            delivery: input.delivery,
+          }, context);
+        }
+
         await progress.handle(event);
         return false;
       }
@@ -381,9 +403,9 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     runId: string,
     event: Extract<RuntimeEvent, { type: "permission_request" }>,
     context: GatewayLogContext,
-  ): void {
-    if (!pendingPermissions) return;
-    if (pendingPermissions.getByOpenCodePermissionId(event.id)) return;
+  ): PendingPermissionRecord | undefined {
+    if (!pendingPermissions) return undefined;
+    if (pendingPermissions.getByOpenCodePermissionId(event.id)) return undefined;
 
     const expiresAt = new Date(now().getTime() + permissionTtlMs).toISOString();
 
@@ -401,10 +423,31 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         permissionId: permission.id,
         opencodePermissionId: event.id,
       });
+
+      return permission;
     } catch (error) {
       log("error", "async run permission persistence failed", {
         ...context,
         opencodePermissionId: event.id,
+        error: formatError(error),
+      });
+      return undefined;
+    }
+  }
+
+  async function notifyPermissionRequest(
+    input: TurnRunnerPermissionRequestInput,
+    context: GatewayLogContext,
+  ): Promise<void> {
+    if (!options.onPermissionRequest) return;
+
+    try {
+      await options.onPermissionRequest(input);
+    } catch (error) {
+      log("error", "async run permission notification failed", {
+        ...context,
+        permissionId: input.permission.id,
+        opencodePermissionId: input.event.id,
         error: formatError(error),
       });
     }

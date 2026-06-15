@@ -66,6 +66,13 @@ function testConfig(): GatewayConfig {
         groups: {},
       },
     },
+    interactive: {
+      permissions: {
+        mode: "buttons",
+        fallbackCommands: true,
+        allowAlways: false,
+      },
+    },
     defaults: {
       profile: "cto",
       target: "default",
