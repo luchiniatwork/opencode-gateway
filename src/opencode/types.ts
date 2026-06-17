@@ -88,6 +88,8 @@ export interface SendRuntimeMessageInput {
 
 export interface StartRuntimeTurnInput extends SendRuntimeMessageInput {
   signal?: AbortSignal;
+  mode?: "sync" | "async";
+  observePermissions?: boolean;
 }
 
 export interface AbortRuntimeTurnInput {

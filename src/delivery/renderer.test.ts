@@ -16,17 +16,15 @@ test("progress renderer sends no progress in off verbosity", async () => {
   expect(harness.edited).toEqual([]);
 });
 
-test("progress renderer sends delayed working acknowledgement in compact verbosity", async () => {
+test("progress renderer sends no progress in compact verbosity", async () => {
   const harness = createHarness();
   const renderer = createProgressRenderer({ verbosity: "compact", delayMs: 1, ...harness.delivery });
 
   await renderer.handle({ type: "text_delta", text: "ignored" });
-  await waitFor(() => harness.sent.length === 1);
+  await Bun.sleep(5);
   await renderer.finalize();
 
-  expect(harness.sent.map((entry) => entry.message)).toEqual([
-    { kind: "progress", format: "plain", text: "Working..." },
-  ]);
+  expect(harness.sent).toEqual([]);
   expect(harness.edited).toEqual([]);
 });
 

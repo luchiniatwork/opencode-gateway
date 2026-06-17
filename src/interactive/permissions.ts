@@ -246,15 +246,19 @@ export function createPermissionInteractionService(options: PermissionInteractio
 function permissionRequestMessage(input: SendPermissionRequestInput, config: InteractivePermissionsConfig): OutboundMessage {
   const actions = config.mode === "buttons" ? permissionActions(input.permission.id, config.allowAlways) : undefined;
   const commandHints = config.fallbackCommands ? fallbackCommandHints(input.permission.id, config.allowAlways) : [];
+  const details = permissionCardDetails(input.permission);
   const lines = [
-    "OpenCode permission required:",
-    `Summary: ${input.permission.summary}`,
+    "OpenCode permission required",
+    details.action ? `Action: ${details.action}` : `Summary: ${input.permission.summary}`,
+    details.command ? `Command:\n${details.command}` : undefined,
+    !details.command && details.resource ? `Resource: ${details.resource}` : undefined,
+    details.action && details.action !== input.permission.summary ? `Summary: ${input.permission.summary}` : undefined,
     `Target: ${input.resolution.target.name} (${input.resolution.target.id})`,
     `Session: ${input.run.opencodeSessionId}`,
     `Permission: ${input.permission.id}`,
     `Expires: ${input.permission.expiresAt}`,
     ...commandHints,
-  ];
+  ].filter(isNonEmptyString);
 
   return {
     kind: "status",
@@ -262,6 +266,77 @@ function permissionRequestMessage(input: SendPermissionRequestInput, config: Int
     text: lines.join("\n"),
     actions,
   };
+}
+
+interface PermissionCardDetails {
+  action?: string;
+  command?: string;
+  resource?: string;
+}
+
+function permissionCardDetails(permission: PendingPermissionRecord): PermissionCardDetails {
+  const details = asRecord(permission.details);
+  const metadata = asRecord(details?.metadata);
+  const action = firstString(
+    details?.action,
+    details?.permission,
+    details?.tool,
+    details?.type,
+  );
+  const explicitCommand = firstString(details?.command, metadata?.command);
+  const resource = firstResource(details?.resources, details?.resource, details?.pattern, details?.patterns);
+  const command = explicitCommand ?? (isBashAction(action) ? resource : undefined);
+
+  return {
+    action,
+    command,
+    resource,
+  };
+}
+
+function isBashAction(action: string | undefined): boolean {
+  return action === "bash" || action === "shell" || action === "terminal";
+}
+
+function firstResource(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const formatted = formatResource(value);
+    if (formatted) return formatted;
+  }
+
+  return undefined;
+}
+
+function formatResource(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim()) return value.trim();
+
+  if (Array.isArray(value)) {
+    const formatted = value.map(formatResource).filter(isNonEmptyString);
+    if (formatted.length > 0) return formatted.join("\n");
+  }
+
+  const record = asRecord(value);
+  if (record) {
+    return firstString(record.command, record.resource, record.pattern, record.path, record.name);
+  }
+
+  return undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+
+  return undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
 }
 
 function permissionActions(permissionId: string, allowAlways: boolean): OutboundAction[] {

@@ -48,6 +48,7 @@ test("turn runner starts async turns, stores message IDs, and finishes final eve
         text: "inspect",
         agent: "cto-agent",
         model: "provider/model",
+        mode: "sync",
       }),
     ]);
     expect(harness.runtime.calls.observe).toEqual([
@@ -200,7 +201,7 @@ test("turn runner timeout completes even if observe never resolves", async () =>
   }
 });
 
-test("turn runner sends compact progress before delayed final response", async () => {
+test("turn runner sends no progress for compact final-answer-only turns", async () => {
   const harness = await createHarness({
     events: [{ type: "status", status: "running" }, { type: "final", text: "done" }],
     eventDelayMs: 5,
@@ -213,10 +214,9 @@ test("turn runner sends compact progress before delayed final response", async (
       resolution: harness.resolution,
       delivery: harness.delivery,
     });
-    await waitForDeliveries(harness.deliveries, 2);
+    await waitForDeliveries(harness.deliveries, 1);
 
     expect(harness.deliveries).toEqual([
-      { kind: "progress", format: "plain", text: "Working..." },
       { kind: "final", format: "markdown", text: "done" },
     ]);
   } finally {
@@ -230,6 +230,7 @@ test("turn runner persists delivery receipts for progress and final messages", a
     events: [{ type: "status", status: "running" }, { type: "final", text: "done" }],
     eventDelayMs: 5,
     progressDelayMs: 1,
+    verbosity: "verbose",
   });
 
   try {
@@ -284,6 +285,72 @@ test("turn runner persists pending permission requests", async () => {
   }
 });
 
+test("turn runner observes permissions for compact profiles without progress messages", async () => {
+  const harness = await createHarness({
+    events: [
+      { type: "permission_request", id: "opencode-permission-1", summary: "Run bash", details: { tool: "bash" } },
+      { type: "final", text: "done" },
+    ],
+    observePermissions: true,
+    sendPermissionRequests: true,
+    progressDelayMs: 1,
+  });
+
+  try {
+    await harness.runner.start({
+      message: inboundMessage(),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForDeliveries(harness.deliveries, 2);
+
+    expect(harness.runtime.calls.sendAsync[0]).toEqual(expect.objectContaining({ mode: "sync", observePermissions: true }));
+    expect(harness.deliveries).toEqual([
+      { kind: "status", format: "plain", text: "Permission card: permission-1" },
+      { kind: "final", format: "markdown", text: "done" },
+    ]);
+    expect(pendingPermissionRows(harness.database)).toEqual([
+      expect.objectContaining({ id: "permission-1", opencode_permission_id: "opencode-permission-1", status: "pending" }),
+    ]);
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
+test("turn runner resurfaces an already-pending OpenCode permission instead of dropping the card", async () => {
+  const harness = await createHarness({
+    events: [
+      { type: "permission_request", id: "opencode-permission-1", summary: "Run bash", details: { action: "bash", resources: ["printf hello"] } },
+      { type: "final", text: "done" },
+    ],
+    observePermissions: true,
+    sendPermissionRequests: true,
+  });
+
+  try {
+    insertExistingPendingPermission(harness.database, harness.resolution.binding.id);
+
+    await harness.runner.start({
+      message: inboundMessage(),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForDeliveries(harness.deliveries, 2);
+
+    expect(harness.deliveries).toEqual([
+      { kind: "status", format: "plain", text: "Permission card: permission-existing" },
+      { kind: "final", format: "markdown", text: "done" },
+    ]);
+    expect(pendingPermissionRows(harness.database)).toEqual([
+      expect.objectContaining({ id: "permission-existing", opencode_permission_id: "opencode-permission-1", status: "pending" }),
+    ]);
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
 test("turn runner renders tool progress for tools verbosity", async () => {
   const harness = await createHarness({
     events: [
@@ -329,6 +396,8 @@ interface HarnessOptions {
   runTimeoutMs?: number;
   permissionTtlMs?: number;
   verbosity?: "off" | "compact" | "tools" | "verbose";
+  observePermissions?: boolean;
+  sendPermissionRequests?: boolean;
 }
 
 interface Harness {
@@ -400,6 +469,12 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     progressDelayMs: options.progressDelayMs,
     runTimeoutMs: options.runTimeoutMs,
     permissionTtlMs: options.permissionTtlMs,
+    observePermissions: options.observePermissions,
+    onPermissionRequest: options.sendPermissionRequests
+      ? async (input) => {
+          await input.delivery.send({ kind: "status", format: "plain", text: `Permission card: ${input.permission.id}` });
+        }
+      : undefined,
     now: fixedNow,
   });
 
@@ -540,7 +615,29 @@ function pendingPermissionRows(database: GatewayDatabase): Array<{
       details_json: string | null;
       status: string;
       expires_at: string;
-    }>;
+    }>; 
+}
+
+function insertExistingPendingPermission(database: GatewayDatabase, bindingId: string): void {
+  database.db
+    .query(
+      `INSERT INTO runs (id, binding_id, opencode_session_id, opencode_message_id, status, started_at, finished_at, error)
+       VALUES ('run-existing', ?, 'session-1', 'message-existing', 'aborted', '2025-12-31T23:59:00.000Z', '2025-12-31T23:59:30.000Z', NULL)`,
+    )
+    .run(bindingId);
+
+  database.db
+    .query(
+      `INSERT INTO pending_permissions (
+        id, run_id, opencode_permission_id, summary, details_json, action_message_receipt_id,
+        status, created_at, expires_at, resolved_at
+      ) VALUES (
+        'permission-existing', 'run-existing', 'opencode-permission-1', 'Run bash',
+        '{"action":"bash","resources":["printf hello"]}', NULL,
+        'pending', '2025-12-31T23:59:01.000Z', '2026-01-01T00:15:00.000Z', NULL
+      )`,
+    )
+    .run();
 }
 
 function requireRecord<T>(record: T | undefined, label: string): T {

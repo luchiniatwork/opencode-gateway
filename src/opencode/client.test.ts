@@ -152,6 +152,65 @@ test("sends an async prompt with a gateway-owned message id", async () => {
   ]);
 });
 
+test("startTurn can use the reliable sync prompt path for final-answer-only turns", async () => {
+  const sdk = createFakeSdkClient({
+    prompt: {
+      info: { id: "assistant-sync", sessionID: "session-1", role: "assistant", finish: "stop" },
+      parts: [{ type: "text", text: "Sync final" }],
+    },
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const turn = await runtime.startTurn({ target: attachTarget, sessionId: "session-1", text: "Hello", mode: "sync" });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([{ type: "final", text: "Sync final", costUsd: undefined, tokens: undefined }]);
+  expect(sdk.calls.prompt).toHaveLength(1);
+  expect(sdk.calls.promptAsync).toEqual([]);
+  expect(sdk.calls.subscribe).toEqual([]);
+});
+
+test("startTurn sync path can observe permission requests while waiting for final response", async () => {
+  const sdk = createFakeSdkClient({
+    promptDelayMs: 10,
+    prompt: {
+      info: { id: "assistant-sync", sessionID: "session-1", role: "assistant", finish: "stop" },
+      parts: [{ type: "text", text: "Approved final" }],
+    },
+    events: [
+      {
+        type: "permission.updated",
+        properties: {
+          id: "permission-1",
+          sessionID: "session-1",
+          messageID: "assistant-sync",
+          callID: "call-1",
+          type: "tool",
+          title: "Run bash command",
+        },
+      },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, observeReconcileIntervalMs: 1 });
+
+  const turn = await runtime.startTurn({
+    target: attachTarget,
+    sessionId: "session-1",
+    text: "Needs permission",
+    mode: "sync",
+    observePermissions: true,
+  });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([
+    expect.objectContaining({ type: "permission_request", id: "permission-1", summary: "Run bash command" }),
+    { type: "final", text: "Approved final", costUsd: undefined, tokens: undefined },
+  ]);
+  expect(sdk.calls.subscribe).toHaveLength(1);
+  expect(sdk.calls.prompt).toHaveLength(1);
+  expect(sdk.calls.promptAsync).toEqual([]);
+});
+
 test("starts observing events before sending an async prompt", async () => {
   let eventStreamStarted = false;
   const sdk = createFakeSdkClient({
@@ -228,6 +287,268 @@ test("startTurn reconciles assistant errors when OpenCode uses a different user 
 
   expect(events).toEqual([{ type: "error", message: "input exceeds context window of this model", retryable: undefined }]);
   expect(sdk.calls.messages).toHaveLength(2);
+});
+
+test("startTurn finalizes live assistant events when OpenCode reports a different user parent id", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "message.part.updated",
+        properties: {
+          part: { id: "part-final", sessionID: "session-1", messageID: "assistant-final", type: "text", text: "Follow-up done" },
+          delta: "Follow-up done",
+        },
+      },
+      {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "assistant-final",
+            sessionID: "session-1",
+            role: "assistant",
+            parentID: "actual-user-id-from-opencode",
+            finish: "stop",
+            time: { completed: 1 },
+          },
+        },
+      },
+    ],
+    messageSnapshots: [[], []],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, observeReconcileIntervalMs: 1 });
+
+  const turn = await runtime.startTurn({ target: attachTarget, sessionId: "session-1", text: "Follow up" });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([
+    { type: "text_delta", text: "Follow-up done" },
+    { type: "final", text: "Follow-up done", costUsd: undefined, tokens: undefined },
+  ]);
+});
+
+test("startTurn finalizes when assistant completion arrives before its text part", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "assistant-final",
+            sessionID: "session-1",
+            role: "assistant",
+            parentID: "actual-user-id-from-opencode",
+            finish: "stop",
+            time: { completed: 1 },
+          },
+        },
+      },
+      {
+        type: "message.part.updated",
+        properties: {
+          part: { id: "part-final", sessionID: "session-1", messageID: "assistant-final", type: "text", text: "Late text" },
+          delta: "Late text",
+        },
+      },
+    ],
+    messageSnapshots: [[], [], []],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, observeReconcileIntervalMs: 1 });
+
+  const turn = await runtime.startTurn({ target: attachTarget, sessionId: "session-1", text: "Follow up" });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([
+    { type: "text_delta", text: "Late text" },
+    { type: "final", text: "Late text", costUsd: undefined, tokens: undefined },
+  ]);
+});
+
+test("startTurn observes payload-based message part deltas from the OpenCode API event shape", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "message.part.delta",
+        payload: {
+          sessionID: "session-1",
+          messageID: "assistant-final",
+          partID: "part-final",
+          field: "text",
+          delta: "Payload ",
+        },
+      },
+      {
+        type: "message.part.delta",
+        payload: {
+          sessionID: "session-1",
+          messageID: "assistant-final",
+          partID: "part-final",
+          field: "text",
+          delta: "delta",
+        },
+      },
+      {
+        type: "message.updated",
+        payload: {
+          sessionID: "session-1",
+          info: {
+            id: "assistant-final",
+            role: "assistant",
+            parentID: "actual-user-id-from-opencode",
+            finish: "stop",
+            time: { completed: 1 },
+          },
+        },
+      },
+    ],
+    messageSnapshots: [[], []],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, observeReconcileIntervalMs: 1 });
+
+  const turn = await runtime.startTurn({ target: attachTarget, sessionId: "session-1", text: "Follow up" });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([
+    { type: "text_delta", text: "Payload " },
+    { type: "text_delta", text: "delta" },
+    { type: "final", text: "Payload delta", costUsd: undefined, tokens: undefined },
+  ]);
+});
+
+test("observe accepts message.updated session id from the event properties", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "message.part.updated",
+        properties: {
+          sessionID: "session-1",
+          part: { id: "part-final", messageID: "assistant-final", type: "text", text: "Properties session" },
+        },
+      },
+      {
+        type: "message.updated",
+        properties: {
+          sessionID: "session-1",
+          info: {
+            id: "assistant-final",
+            role: "assistant",
+            parentID: "message-user",
+            finish: "stop",
+            time: { completed: 1 },
+          },
+        },
+      },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, observeReconcileIntervalMs: 1 });
+
+  const events = await collectRuntimeEvents(runtime.observe({ target: attachTarget, sessionId: "session-1", turnId: "message-user" }));
+
+  expect(events).toEqual([
+    { type: "text_delta", text: "Properties session" },
+    { type: "final", text: "Properties session", costUsd: undefined, tokens: undefined },
+  ]);
+});
+
+test("startTurn keeps consuming events when periodic message reconciliation hangs", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "message.part.delta",
+        payload: {
+          sessionID: "session-1",
+          messageID: "assistant-final",
+          partID: "part-final",
+          field: "text",
+          delta: "Still observed",
+        },
+      },
+      {
+        type: "message.updated",
+        payload: {
+          sessionID: "session-1",
+          info: {
+            id: "assistant-final",
+            role: "assistant",
+            parentID: "actual-user-id-from-opencode",
+            finish: "stop",
+            time: { completed: 1 },
+          },
+        },
+      },
+    ],
+    eventDelayMs: 5,
+    hangMessagesAfterCall: 1,
+  });
+  const runtime = new OpenCodeRuntime({
+    createClient: () => sdk.client,
+    observeReconcileIntervalMs: 1,
+    observeReconcileTimeoutMs: 1,
+  });
+
+  const turn = await runtime.startTurn({ target: attachTarget, sessionId: "session-1", text: "Follow up" });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([
+    { type: "text_delta", text: "Still observed" },
+    { type: "final", text: "Still observed", costUsd: undefined, tokens: undefined },
+  ]);
+  expect(sdk.calls.messages.length).toBeGreaterThan(1);
+});
+
+test("startTurn ignores replayed assistant events from the pre-prompt message snapshot", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "message.part.updated",
+        properties: {
+          part: { id: "old-part", sessionID: "session-1", messageID: "old-assistant", type: "text", text: "Old reply" },
+          delta: "Old reply",
+        },
+      },
+      {
+        type: "message.updated",
+        properties: {
+          info: { id: "old-assistant", sessionID: "session-1", role: "assistant", parentID: "old-user", finish: "stop", time: { completed: 1 } },
+        },
+      },
+      {
+        type: "message.part.updated",
+        properties: {
+          part: { id: "new-part", sessionID: "session-1", messageID: "new-assistant", type: "text", text: "New reply" },
+          delta: "New reply",
+        },
+      },
+      {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "new-assistant",
+            sessionID: "session-1",
+            role: "assistant",
+            parentID: "actual-new-user",
+            finish: "stop",
+            time: { completed: 2 },
+          },
+        },
+      },
+    ],
+    messageSnapshots: [
+      [
+        { info: { id: "old-user", sessionID: "session-1", role: "user" }, parts: [{ type: "text", text: "Earlier" }] },
+        { info: { id: "old-assistant", sessionID: "session-1", role: "assistant", parentID: "old-user", finish: "stop" }, parts: [{ type: "text", text: "Old reply" }] },
+      ],
+      [],
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, observeReconcileIntervalMs: 1 });
+
+  const turn = await runtime.startTurn({ target: attachTarget, sessionId: "session-1", text: "Follow up" });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([
+    { type: "text_delta", text: "New reply" },
+    { type: "final", text: "New reply", costUsd: undefined, tokens: undefined },
+  ]);
 });
 
 test("does not send an async prompt when pre-send observation fails", async () => {
@@ -473,6 +794,8 @@ test("observes permission requests without leaking raw SDK payloads", async () =
           messageID: "assistant-1",
           callID: "call-1",
           type: "tool",
+          action: "bash",
+          resources: ["printf 'hello from permission'"],
           pattern: "bash:*",
           title: "Run shell command",
           metadata: { tool: "bash" },
@@ -492,6 +815,8 @@ test("observes permission requests without leaking raw SDK payloads", async () =
       details: {
         eventType: "permission.updated",
         type: "tool",
+        action: "bash",
+        resources: ["printf 'hello from permission'"],
         pattern: "bash:*",
         messageID: "assistant-1",
         callID: "call-1",
@@ -990,12 +1315,15 @@ interface FakeSdkOptions {
   getSession?: FakeSession;
   sessions?: FakeSession[];
   prompt?: FakePromptResponse;
+  promptDelayMs?: number;
   promptAsyncError?: unknown;
   messages?: FakePromptResponse[];
   messageSnapshots?: FakePromptResponse[][];
   events?: unknown[];
   eventSubscribeError?: unknown;
   eventStreamError?: unknown;
+  eventDelayMs?: number;
+  hangMessagesAfterCall?: number;
   onEventStreamStarted?: () => void;
   onPromptAsync?: () => void | Promise<void>;
 }
@@ -1072,10 +1400,14 @@ function createFakeSdkClient(options: FakeSdkOptions = {}) {
         },
         async messages(input: unknown) {
           calls.messages.push(input);
+          if (options.hangMessagesAfterCall !== undefined && calls.messages.length > options.hangMessagesAfterCall) {
+            return new Promise<never>(() => undefined);
+          }
           return { data: responses.messageSnapshots?.[calls.messages.length - 1] ?? responses.messages };
         },
         async prompt(input: unknown) {
           calls.prompt.push(input);
+          if (options.promptDelayMs) await sleep(options.promptDelayMs);
           return { data: responses.prompt };
         },
         async promptAsync(input: unknown) {
@@ -1093,7 +1425,7 @@ function createFakeSdkClient(options: FakeSdkOptions = {}) {
         async subscribe(input: unknown) {
           calls.subscribe.push(input);
           if (options.eventSubscribeError) throw options.eventSubscribeError;
-          return { stream: createEventStream(responses.events, options.eventStreamError, options.onEventStreamStarted) };
+          return { stream: createEventStream(responses.events, options.eventStreamError, options.onEventStreamStarted, options.eventDelayMs) };
         },
       },
     },
@@ -1110,12 +1442,17 @@ async function collectRuntimeEvents(events: AsyncIterable<RuntimeEvent>): Promis
   return collected;
 }
 
-async function* createEventStream(events: unknown[], error?: unknown, onStarted?: () => void): AsyncIterable<unknown> {
+async function* createEventStream(events: unknown[], error?: unknown, onStarted?: () => void, delayMs = 0): AsyncIterable<unknown> {
   onStarted?.();
 
   for (const event of events) {
+    if (delayMs > 0) await sleep(delayMs);
     yield event;
   }
 
   if (error) throw error;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

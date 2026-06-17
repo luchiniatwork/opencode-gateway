@@ -23,7 +23,6 @@ export interface ProgressRenderer {
 }
 
 const DEFAULT_PROGRESS_DELAY_MS = 2_000;
-const COMPACT_PROGRESS_TEXT = "Working...";
 const MAX_TOOL_LINES = 8;
 const MAX_VERBOSE_LINES = 12;
 
@@ -37,7 +36,7 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
   let task = Promise.resolve();
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  if (options.verbosity !== "off") {
+  if (options.verbosity === "tools" || options.verbosity === "verbose") {
     timer = setTimeout(() => {
       timer = undefined;
       void enqueueFlush();
@@ -46,7 +45,7 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
 
   return {
     async handle(event): Promise<void> {
-      if (finalized || options.verbosity === "off") return;
+      if (finalized || options.verbosity === "off" || options.verbosity === "compact") return;
 
       const line = progressLine(event, options.verbosity);
       if (!line) return;
@@ -128,16 +127,6 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
   }
 
   function progressMessage(): OutboundMessage | undefined {
-    if (options.verbosity === "compact") {
-      if (receipt) return undefined;
-
-      return {
-        kind: "progress",
-        format: "plain",
-        text: COMPACT_PROGRESS_TEXT,
-      };
-    }
-
     const lines = detailLines;
     const text = lines.join("\n").trim();
 

@@ -56,7 +56,9 @@
     "permissions": {
       "mode": "buttons",
       "fallbackCommands": true,
-      "allowAlways": false
+      // Enabled for the smoke config so the "Always allow" button is visible
+      // during permission UX validation.
+      "allowAlways": true
     }
   },
   "defaults": {

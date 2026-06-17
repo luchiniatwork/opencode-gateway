@@ -164,6 +164,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
             runs: repositories.runs,
             pendingPermissions: repositories.pendingPermissions,
             deliveryReceipts: repositories.deliveryReceipts,
+            observePermissions: options.config.interactive.permissions.mode !== "off",
             onPermissionRequest: (input) => permissionService?.sendPermissionRequest(input),
             runTimeoutMs: options.turnRunTimeoutMs,
             now,

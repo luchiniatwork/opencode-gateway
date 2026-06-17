@@ -125,9 +125,11 @@ interface OpenCodeRuntimeOptions {
   finalResponseTimeoutMs?: number;
   finalResponsePollIntervalMs?: number;
   observeReconcileIntervalMs?: number;
+  observeReconcileTimeoutMs?: number;
 }
 
 const DEFAULT_OBSERVE_RECONCILE_INTERVAL_MS = 1_000;
+const DEFAULT_OBSERVE_RECONCILE_TIMEOUT_MS = 750;
 
 export class OpenCodeRuntimeError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -229,7 +231,7 @@ function normalizeSdkEvent(
   if (!event) return { events: [], terminal: false };
 
   const type = getObjectString(event, "type");
-  const properties = getObject(event, "properties") ?? {};
+  const properties = eventProperties(event);
 
   switch (type) {
     case "session.status":
@@ -240,6 +242,8 @@ function normalizeSdkEvent(
       return normalizeMessageUpdated(properties, state);
     case "message.part.updated":
       return normalizeMessagePartUpdated(properties, state);
+    case "message.part.delta":
+      return normalizeMessagePartDelta(properties, state);
     case "permission.updated":
     case "permission.asked":
     case "permission.v2.asked":
@@ -285,7 +289,8 @@ function normalizeMessageUpdated(
   state: ObserveState,
 ): { events: RuntimeEvent[]; terminal: boolean } {
   const info = getObject(properties, "info");
-  if (!info || getObjectString(info, "sessionID") !== state.sessionId) return noEvents();
+  const sessionId = getObjectString(info, "sessionID") ?? getObjectString(properties, "sessionID");
+  if (!info || sessionId !== state.sessionId) return noEvents();
   if (getObjectString(info, "role") !== "assistant") return noEvents();
 
   const messageId = getObjectString(info, "id");
@@ -321,7 +326,8 @@ function normalizeMessagePartUpdated(
   state: ObserveState,
 ): { events: RuntimeEvent[]; terminal: boolean } {
   const part = getObject(properties, "part");
-  if (!part || getObjectString(part, "sessionID") !== state.sessionId) return noEvents();
+  const sessionId = getObjectString(part, "sessionID") ?? getObjectString(properties, "sessionID");
+  if (!part || sessionId !== state.sessionId) return noEvents();
   if (!partBelongsToObservedTurn(part, state)) return noEvents();
 
   const partType = getObjectString(part, "type");
@@ -336,6 +342,31 @@ function normalizeMessagePartUpdated(
   }
 
   return noEvents();
+}
+
+function normalizeMessagePartDelta(
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  if (getObjectString(properties, "sessionID") !== state.sessionId) return noEvents();
+  if (getObjectString(properties, "field") !== "text") return noEvents();
+
+  const messageId = getObjectString(properties, "messageID");
+  const partId = getObjectString(properties, "partID") ?? getObjectString(properties, "id");
+  const delta = getObjectString(properties, "delta");
+  if (!messageId || delta === undefined) return noEvents();
+
+  const part = {
+    id: partId ?? `${messageId}:text`,
+    sessionID: state.sessionId,
+    messageID: messageId,
+    type: "text",
+  };
+
+  if (!partBelongsToObservedTurn(part, state)) return noEvents();
+
+  const text = updateTextPartAndGetDelta(part, delta, state);
+  return text ? { events: [{ type: "text_delta", text }], terminal: false } : noEvents();
 }
 
 function normalizePermissionRequest(
@@ -360,6 +391,7 @@ function normalizePermissionRequest(
           eventType,
           type: getObjectString(properties, "type"),
           permission: getObjectString(properties, "permission"),
+          resource: properties.resource,
           pattern: properties.pattern,
           patterns: properties.patterns,
           action: getObjectString(properties, "action"),
@@ -485,6 +517,9 @@ function partBelongsToObservedTurn(part: Record<string, unknown>, state: Observe
   const messageId = getObjectString(part, "messageID");
   if (!state.turnId || !messageId) return true;
   if (messageId === state.turnId) return false;
+  // startTurn snapshots the session before prompting. Event streams may replay
+  // old assistant parts; never let those become candidates for the new turn.
+  if (state.hasBeforeMessageSnapshot && state.beforeMessageIds.has(messageId)) return false;
   if (state.assistantMessageIds.size === 0) return true;
   return state.assistantMessageIds.has(messageId);
 }
@@ -496,11 +531,19 @@ function messageBelongsToObservedTurn(
 ): boolean {
   if (!state.turnId) return true;
   if (parentId === state.turnId) return true;
-  return Boolean(messageId && state.assistantMessageIds.has(messageId));
+  if (messageId && state.assistantMessageIds.has(messageId)) return true;
+  // Real OpenCode follow-ups may report the assistant's parent as OpenCode's
+  // own user message id instead of the gateway-supplied messageID. In that
+  // case, a post-snapshot assistant message in the observed session is the turn.
+  return Boolean(messageId && state.hasBeforeMessageSnapshot && !state.beforeMessageIds.has(messageId));
 }
 
 function matchesSession(properties: Record<string, unknown>, state: ObserveState): boolean {
   return getObjectString(properties, "sessionID") === state.sessionId;
+}
+
+function eventProperties(event: Record<string, unknown>): Record<string, unknown> {
+  return getObject(event, "properties") ?? getObject(event, "payload") ?? {};
 }
 
 function unwrapSdkEvent(value: unknown): Record<string, unknown> | undefined {
@@ -525,6 +568,7 @@ interface ObservedEventPumpInput {
   signal?: AbortSignal;
   initialBackfill?: boolean;
   reconcileIntervalMs: number;
+  reconcileTimeoutMs: number;
 }
 
 interface ObservedEventPump {
@@ -572,13 +616,7 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
       markReady();
 
       if (input.initialBackfill && input.state.turnId) {
-        const terminal = await findTerminalEventFromMessages(
-          input.client,
-          input.target,
-          input.state.sessionId,
-          input.state.turnId,
-          input.state,
-        );
+        const terminal = await reconcileWithTimeout();
 
         if (terminal) {
           queue.push(terminal);
@@ -667,13 +705,7 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
   async function reconcileTerminalFromMessages(): Promise<Extract<RuntimeEvent, { type: "final" | "error" }> | undefined> {
     if (!input.state.turnId) return resolvePendingFinal(input.state);
 
-    const terminal = await findTerminalEventFromMessages(
-      input.client,
-      input.target,
-      input.state.sessionId,
-      input.state.turnId,
-      input.state,
-    );
+    const terminal = await reconcileWithTimeout();
 
     if (terminal) {
       clearPendingFinal(input.state);
@@ -682,10 +714,33 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
 
     return resolvePendingFinal(input.state);
   }
+
+  async function reconcileWithTimeout(): Promise<Extract<RuntimeEvent, { type: "final" | "error" }> | undefined> {
+    if (!input.state.turnId) return undefined;
+
+    return promiseWithTimeout(findTerminalEventFromMessages(
+      input.client,
+      input.target,
+      input.state.sessionId,
+      input.state.turnId,
+      input.state,
+    ), input.reconcileTimeoutMs);
+  }
 }
 
 function noEvents(): { events: RuntimeEvent[]; terminal: boolean } {
   return { events: [], terminal: false };
+}
+
+async function forwardPermissionEvents(
+  events: AsyncIterable<RuntimeEvent>,
+  queue: RuntimeEventQueue,
+  signal?: AbortSignal,
+): Promise<void> {
+  for await (const event of events) {
+    if (signal?.aborted) return;
+    if (event.type === "permission_request") queue.push(event);
+  }
 }
 
 export class OpenCodeRuntime implements AgentRuntime {
@@ -693,6 +748,7 @@ export class OpenCodeRuntime implements AgentRuntime {
   private readonly finalResponseTimeoutMs: number;
   private readonly finalResponsePollIntervalMs: number;
   private readonly observeReconcileIntervalMs: number;
+  private readonly observeReconcileTimeoutMs: number;
   private readonly clients = new Map<string, OpenCodeSdkClient>();
 
   constructor(options: OpenCodeRuntimeOptions = {}) {
@@ -702,6 +758,7 @@ export class OpenCodeRuntime implements AgentRuntime {
     this.finalResponseTimeoutMs = options.finalResponseTimeoutMs ?? 60_000;
     this.finalResponsePollIntervalMs = options.finalResponsePollIntervalMs ?? 1_000;
     this.observeReconcileIntervalMs = options.observeReconcileIntervalMs ?? DEFAULT_OBSERVE_RECONCILE_INTERVAL_MS;
+    this.observeReconcileTimeoutMs = options.observeReconcileTimeoutMs ?? DEFAULT_OBSERVE_RECONCILE_TIMEOUT_MS;
   }
 
   async ensureSession(input: EnsureSessionInput): Promise<RuntimeSession> {
@@ -767,6 +824,8 @@ export class OpenCodeRuntime implements AgentRuntime {
   }
 
   async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    if (input.mode === "sync") return this.startSyncTurn(input);
+
     if (input.attachments && input.attachments.length > 0) {
       throw new OpenCodeRuntimeError("OpenCodeRuntime does not support attachments in Phase 2");
     }
@@ -794,6 +853,7 @@ export class OpenCodeRuntime implements AgentRuntime {
       state: createObserveState(input.sessionId, messageId, beforeMessageIds),
       signal: input.signal,
       reconcileIntervalMs: this.observeReconcileIntervalMs,
+      reconcileTimeoutMs: this.observeReconcileTimeoutMs,
     });
 
     await observed.ready;
@@ -848,6 +908,64 @@ export class OpenCodeRuntime implements AgentRuntime {
     return createRuntimeTurnHandle(input, messageId, response);
   }
 
+  private startSyncTurn(input: StartRuntimeTurnInput): RuntimeStartedTurn {
+    const messageId = createGatewayMessageId();
+    const queue = new RuntimeEventQueue();
+
+    void (async () => {
+      let permissionObserver: ObservedEventPump | undefined;
+      let permissionForwarder: Promise<void> | undefined;
+
+      try {
+        if (input.observePermissions) {
+          const client = this.getClient(input.target);
+          const subscription = await this.subscribeToEvents(client, input.target, input.signal);
+
+          permissionObserver = startObservedEventPump({
+            subscription,
+            client,
+            target: input.target,
+            state: createObserveState(input.sessionId, undefined),
+            signal: input.signal,
+            reconcileIntervalMs: this.observeReconcileIntervalMs,
+            reconcileTimeoutMs: this.observeReconcileTimeoutMs,
+          });
+          permissionForwarder = forwardPermissionEvents(permissionObserver.events, queue, input.signal);
+          await permissionObserver.ready;
+        }
+
+        const turn = await this.send(input);
+
+        if (input.signal?.aborted) return;
+
+        if (turn.status === "error") {
+          queue.push({ type: "error", message: turn.text ?? "OpenCode returned an error response", retryable: undefined });
+          return;
+        }
+
+        queue.push({
+          type: "final",
+          text: turn.text ?? "",
+          costUsd: turn.costUsd,
+          tokens: turn.tokens,
+        });
+      } catch (error) {
+        if (!input.signal?.aborted) {
+          queue.push({ type: "error", message: formatRuntimeError(error), retryable: undefined });
+        }
+      } finally {
+        await permissionObserver?.cancel();
+        await permissionForwarder?.catch(() => undefined);
+        queue.end();
+      }
+    })();
+
+    return {
+      handle: createRuntimeTurnHandle(input, messageId, { mode: "sync" }),
+      events: queue,
+    };
+  }
+
   async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent> {
     const client = this.getClient(input.target);
 
@@ -872,6 +990,7 @@ export class OpenCodeRuntime implements AgentRuntime {
       signal: input.signal,
       initialBackfill: true,
       reconcileIntervalMs: this.observeReconcileIntervalMs,
+      reconcileTimeoutMs: this.observeReconcileTimeoutMs,
     });
 
     try {
@@ -1014,12 +1133,14 @@ function resolvePendingFinal(state: ObserveState): Extract<RuntimeEvent, { type:
   const messageId = state.pendingFinalMessageId;
 
   if (!pending || !messageId || state.finalizedMessageIds.has(messageId)) return undefined;
-  if (!pending.text.trim()) return undefined;
+  const collectedText = collectMessageText(messageId, state);
+  const text = collectedText.trim() ? collectedText : pending.text;
+  if (!text.trim()) return undefined;
 
   state.finalizedMessageIds.add(messageId);
   clearPendingFinal(state);
 
-  return pending;
+  return { ...pending, text };
 }
 
 function clearPendingFinal(state: ObserveState): void {
@@ -1195,6 +1316,19 @@ function noAssistantResponseText(timeoutMs: number, messages: SdkMessageEntry[])
 function sleep(ms: number): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function promiseWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  if (timeoutMs <= 0) return promise.catch(() => undefined);
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<undefined>((resolve) => {
+    timeout = setTimeout(() => resolve(undefined), timeoutMs);
+  });
+
+  return Promise.race([promise.catch(() => undefined), timeoutPromise]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
 }
 
 function createGatewayMessageId(): string {

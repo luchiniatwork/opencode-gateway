@@ -56,6 +56,10 @@ async function main(args: string[]): Promise<void> {
   const options = parseArgs(args);
   const config = await loadConfig(options.configPath);
 
+  if (options.permissionAlways) {
+    config.interactive.permissions.allowAlways = true;
+  }
+
   if (options.permissionSmoke && !options.reuseSmokeState) {
     config.gateway.databasePath = await createTemporarySmokeDatabasePath();
   }

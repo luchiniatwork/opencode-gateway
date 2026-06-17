@@ -17,6 +17,7 @@ export interface TurnRunnerOptions {
   progressDelayMs?: number;
   runTimeoutMs?: number;
   permissionTtlMs?: number;
+  observePermissions?: boolean;
   onPermissionRequest?(input: TurnRunnerPermissionRequestInput): Promise<void> | void;
   now?: () => Date;
   log?: (level: GatewayLogLevel, message: string, context?: GatewayLogContext) => void;
@@ -68,10 +69,16 @@ interface ActiveObserver {
   cleanup(): void;
 }
 
+interface RecordedPendingPermission {
+  permission: PendingPermissionRecord;
+  notify: boolean;
+}
+
 export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
   const { runtime, runs, pendingPermissions, deliveryReceipts } = options;
   const runTimeoutMs = options.runTimeoutMs ?? 5 * 60_000;
   const permissionTtlMs = options.permissionTtlMs ?? 15 * 60_000;
+  const observePermissions = options.observePermissions ?? false;
   const now = options.now ?? (() => new Date());
   const activeByRunId = new Map<string, ActiveObserver>();
   const activeRunIdByBindingId = new Map<string, string>();
@@ -109,6 +116,8 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
           agent: resolution.agent,
           model: resolution.model,
           metadata: messageMetadata(message),
+          mode: runtimeTurnMode(resolution),
+          observePermissions,
           signal: controller.signal,
         });
         const { handle } = started;
@@ -343,11 +352,11 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         return true;
       }
       case "permission_request": {
-        const permission = recordPendingPermission(input.run.id, event, context);
+        const recorded = recordPendingPermission(input.run.id, event, context);
 
-        if (permission) {
+        if (recorded?.notify) {
           await notifyPermissionRequest({
-            permission,
+            permission: recorded.permission,
             event,
             run: input.run,
             message: input.message,
@@ -403,14 +412,23 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     runId: string,
     event: Extract<RuntimeEvent, { type: "permission_request" }>,
     context: GatewayLogContext,
-  ): PendingPermissionRecord | undefined {
+  ): RecordedPendingPermission | undefined {
     if (!pendingPermissions) return undefined;
-    if (pendingPermissions.getByOpenCodePermissionId(event.id)) return undefined;
+    const existing = pendingPermissions.getByOpenCodePermissionId(event.id);
+    if (existing?.status === "pending" && existing.runId === runId && existing.actionMessageReceiptId) {
+      log("info", "async run permission request already has an action card", {
+        ...context,
+        permissionId: existing.id,
+        opencodePermissionId: event.id,
+      });
+
+      return { permission: existing, notify: false };
+    }
 
     const expiresAt = new Date(now().getTime() + permissionTtlMs).toISOString();
 
     try {
-      const permission = pendingPermissions.create({
+      const permission = pendingPermissions.upsertByOpenCodePermissionId({
         runId,
         opencodePermissionId: event.id,
         summary: event.summary,
@@ -418,13 +436,15 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         expiresAt,
       });
 
-      log("info", "async run permission requested", {
+      log(existing ? "warn" : "info", existing ? "async run permission request refreshed" : "async run permission requested", {
         ...context,
         permissionId: permission.id,
         opencodePermissionId: event.id,
+        previousRunId: existing?.runId,
+        previousStatus: existing?.status,
       });
 
-      return permission;
+      return { permission, notify: true };
     } catch (error) {
       log("error", "async run permission persistence failed", {
         ...context,
@@ -515,6 +535,10 @@ function messageMetadata(message: InboundMessage): Record<string, unknown> {
     conversationKey: message.conversation.key,
     senderId: message.sender.id,
   };
+}
+
+function runtimeTurnMode(resolution: ResolvedDispatch): "sync" | "async" {
+  return resolution.binding.verbosity === "tools" || resolution.binding.verbosity === "verbose" ? "async" : "sync";
 }
 
 function formatError(error: unknown): string {

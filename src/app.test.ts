@@ -200,6 +200,7 @@ test("gateway app sends permission buttons and approves callback actions", async
 
     expect(card).toMatchObject({
       kind: "status",
+      text: expect.stringContaining("Command:\nprintf 'permission smoke approve once'"),
       actions: [
         { id: "permission.approve", label: "Approve once" },
         { id: "permission.deny", label: "Deny" },
@@ -925,7 +926,7 @@ class PermissionRuntime extends FakeRuntime {
       type: "permission_request",
       id: "opencode-permission-1",
       summary: "Run bash command",
-      details: { tool: "bash" },
+      details: { action: "bash", resources: ["printf 'permission smoke approve once'"] },
     };
     yield {
       type: "final",

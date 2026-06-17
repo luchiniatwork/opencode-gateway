@@ -39,6 +39,7 @@ export interface UpdatePendingPermissionActionReceiptInput {
 
 export interface PendingPermissionRepository {
   create(input: CreatePendingPermissionInput): PendingPermissionRecord;
+  upsertByOpenCodePermissionId(input: CreatePendingPermissionInput): PendingPermissionRecord;
   getById(id: string): PendingPermissionRecord | undefined;
   getByOpenCodePermissionId(opencodePermissionId: string): PendingPermissionRecord | undefined;
   listPendingByRunId(runId: string): PendingPermissionRecord[];
@@ -70,6 +71,38 @@ export function createPendingPermissionRepository(
           input.summary,
           input.details === undefined ? null : JSON.stringify(input.details),
           input.actionMessageReceiptId ?? null,
+          input.status ?? "pending",
+          now().toISOString(),
+          input.expiresAt,
+        ) as PendingPermissionRow;
+
+      return mapPendingPermissionRow(row);
+    },
+
+    upsertByOpenCodePermissionId(input): PendingPermissionRecord {
+      const row = db
+        .query(
+          `INSERT INTO pending_permissions (
+            id, run_id, opencode_permission_id, summary, details_json, action_message_receipt_id,
+            status, created_at, expires_at, resolved_at
+          ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)
+          ON CONFLICT(opencode_permission_id) DO UPDATE SET
+            run_id = excluded.run_id,
+            summary = excluded.summary,
+            details_json = excluded.details_json,
+            action_message_receipt_id = NULL,
+            status = excluded.status,
+            created_at = excluded.created_at,
+            expires_at = excluded.expires_at,
+            resolved_at = NULL
+          RETURNING *`,
+        )
+        .get(
+          createId(),
+          input.runId,
+          input.opencodePermissionId,
+          input.summary,
+          input.details === undefined ? null : JSON.stringify(input.details),
           input.status ?? "pending",
           now().toISOString(),
           input.expiresAt,
