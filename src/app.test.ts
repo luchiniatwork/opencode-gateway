@@ -91,7 +91,7 @@ test("gateway app handles commands before runtime dispatch", async () => {
 
     expect(runtime.calls.ensureSession).toHaveLength(0);
     expect(runtime.calls.send).toHaveLength(0);
-    expect(runtime.calls.sendAsync).toHaveLength(0);
+    expect(runtime.calls.startTurn).toHaveLength(0);
     expect(channel.sent).toHaveLength(1);
     expect(channel.sent[0]?.message.text).toContain("Gateway profiles:");
   } finally {
@@ -153,10 +153,13 @@ test("gateway app dispatches non-command messages to OpenCode and sends final re
     await waitForSent(channel, 1);
 
     expect(runtime.calls.ensureSession).toHaveLength(1);
-    expect(runtime.calls.send).toHaveLength(0);
-    expect(runtime.calls.sendAsync).toHaveLength(1);
-    expect(runtime.calls.sendAsync[0]?.text).toBe("Inspect this repo");
-    expect(runtime.calls.sendAsync[0]?.sessionId).toBe("session-1");
+    expect(runtime.calls.startTurn).toHaveLength(1);
+    expect(runtime.calls.startTurn[0]).toEqual(expect.objectContaining({
+      text: "Inspect this repo",
+      sessionId: "session-1",
+      mode: "sync",
+      observePermissions: true,
+    }));
     expect(channel.sent).toEqual([
       {
         target: expect.objectContaining({
@@ -298,7 +301,7 @@ test("gateway app can enable always allow permission actions", async () => {
   }
 });
 
-test("gateway app accepts a second message after the first async turn completes", async () => {
+test("gateway app accepts a second message after the first turn completes", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
   const runtime = new FakeRuntime();
@@ -317,8 +320,39 @@ test("gateway app accepts a second message after the first async turn completes"
     await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
     await waitForSent(channel, 2);
 
-    expect(runtime.calls.sendAsync.map((call) => call.text)).toEqual(["first", "second"]);
+    expect(runtime.calls.startTurn.map((call) => call.text)).toEqual(["first", "second"]);
     expect(channel.sent.map((entry) => entry.message.text)).toEqual(["answer-1", "answer-2"]);
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app accepts a second message after a timed-out turn", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new StuckThenFinalRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+    turnRunTimeoutMs: 1,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await waitForSent(channel, 1);
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await waitForSent(channel, 2);
+
+    expect(runtime.calls.startTurn.map((call) => call.text)).toEqual(["first", "second"]);
+    expect(channel.sent.map((entry) => entry.message.text)).toEqual([
+      "OpenCode error: OpenCode did not produce a final response within 1ms.",
+      "answer-1",
+    ]);
   } finally {
     await app.stop();
     await rm(dir, { recursive: true, force: true });
@@ -341,21 +375,20 @@ test("gateway app sends typing feedback while handling messages", async () => {
     await app.start();
     const emitPromise = channel.emit(inboundMessage({ text: "Take your time" }));
 
-    await runtime.sendAsyncStarted;
+    await runtime.sendStarted;
 
-    expect(channel.typing.map((entry) => entry.state)).toEqual(["typing"]);
+    expect(channel.typing[0]?.state).toBe("typing");
 
-    runtime.finishSendAsync({
+    runtime.finishSend({
       id: "message-slow",
       sessionId: "session-1",
-      targetId: "default",
       status: "running",
       text: "slow answer",
     });
     await emitPromise;
     await waitForSent(channel, 1);
 
-    expect(channel.typing.map((entry) => entry.state)).toEqual(["typing", "idle"]);
+    expect(channel.typing.map((entry) => entry.state)).toContain("idle");
     expect(channel.sent[0]?.message.text).toBe("slow answer");
   } finally {
     await app.stop();
@@ -392,6 +425,7 @@ test("gateway app serves health JSON", async () => {
       channels: { "telegram:default": "running" },
       opencodeTargets: { default: "configured" },
       profiles: { default: "cto", active: ["cto"] },
+      runtime: { activeRuns: [], pendingPermissions: [] },
     });
 
     const missing = await fetch(new URL("/missing", healthUrl).toString());
@@ -468,8 +502,8 @@ test("gateway app reuses persisted session binding after restart", async () => {
       await waitForSent(secondChannel, 1);
 
       expect(secondRuntime.calls.ensureSession).toHaveLength(0);
-      expect(secondRuntime.calls.sendAsync).toHaveLength(1);
-      expect(secondRuntime.calls.sendAsync[0]?.sessionId).toBe("session-1");
+      expect(secondRuntime.calls.startTurn).toHaveLength(1);
+      expect(secondRuntime.calls.startTurn[0]?.sessionId).toBe("session-1");
       expect(secondChannel.sent[0]?.message.text).toBe("answer-1");
     } finally {
       await secondApp.stop();
@@ -563,7 +597,7 @@ test("gateway app /new rebinds while old sessions remain listable", async () => 
     await channel.emit(inboundMessage({ id: "message-2", text: "/new", commandText: "/new" }));
     await channel.emit(inboundMessage({ id: "message-3", text: "/sessions", commandText: "/sessions" }));
 
-    expect(runtime.calls.sendAsync).toHaveLength(1);
+    expect(runtime.calls.startTurn).toHaveLength(1);
     expect(runtime.calls.ensureSession).toHaveLength(2);
     expect(runtime.calls.listSessions).toEqual([expect.objectContaining({ limit: 10 })]);
     expect(channel.sent).toHaveLength(3);
@@ -796,6 +830,7 @@ class FakeRuntime implements AgentRuntime {
   readonly calls: {
     ensureSession: EnsureSessionInput[];
     send: SendRuntimeMessageInput[];
+    startTurn: StartRuntimeTurnInput[];
     sendAsync: SendRuntimeMessageInput[];
     observe: ObserveRuntimeTurnInput[];
     abort: AbortRuntimeTurnInput[];
@@ -804,6 +839,7 @@ class FakeRuntime implements AgentRuntime {
   } = {
     ensureSession: [],
     send: [],
+    startTurn: [],
     sendAsync: [],
     observe: [],
     abort: [],
@@ -878,6 +914,20 @@ class FakeRuntime implements AgentRuntime {
   }
 
   async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    this.calls.startTurn.push(input);
+
+    if (input.mode === "sync") {
+      return {
+        handle: {
+          id: "message-sync",
+          sessionId: input.sessionId,
+          targetId: input.target.id,
+          status: "running",
+        },
+        events: this.syncEvents(input),
+      };
+    }
+
     const handle = await this.sendAsync(input);
 
     return {
@@ -888,6 +938,24 @@ class FakeRuntime implements AgentRuntime {
         turnId: handle.id,
         signal: input.signal,
       }),
+    };
+  }
+
+  protected async *syncEvents(input: StartRuntimeTurnInput): AsyncIterable<RuntimeEvent> {
+    const turn = await this.send(input);
+
+    if (input.signal?.aborted) return;
+
+    if (turn.status === "error") {
+      yield { type: "error", message: turn.text ?? "OpenCode returned an error response" };
+      return;
+    }
+
+    yield {
+      type: "final",
+      text: turn.text ?? "",
+      costUsd: turn.costUsd,
+      tokens: turn.tokens,
     };
   }
 
@@ -917,6 +985,33 @@ class FakeRuntime implements AgentRuntime {
 }
 
 class PermissionRuntime extends FakeRuntime {
+  override async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    this.calls.startTurn.push(input);
+
+    return {
+      handle: {
+        id: "message-sync",
+        sessionId: input.sessionId,
+        targetId: input.target.id,
+        status: "running",
+      },
+      events: this.permissionEvents(input),
+    };
+  }
+
+  private async *permissionEvents(input: StartRuntimeTurnInput): AsyncIterable<RuntimeEvent> {
+    if (input.observePermissions) {
+      yield {
+        type: "permission_request",
+        id: "opencode-permission-1",
+        summary: "Run bash command",
+        details: { action: "bash", resources: ["printf 'permission smoke approve once'"] },
+      };
+    }
+
+    yield* this.syncEvents(input);
+  }
+
   override async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent> {
     this.calls.observe.push(input);
 
@@ -935,27 +1030,51 @@ class PermissionRuntime extends FakeRuntime {
   }
 }
 
-class SlowRuntime extends FakeRuntime {
-  private resolveSendAsyncStarted: (() => void) | undefined;
-  private resolveSendAsync: ((turn: RuntimeTurnHandle) => void) | undefined;
+class StuckThenFinalRuntime extends FakeRuntime {
+  private turnCount = 0;
 
-  readonly sendAsyncStarted = new Promise<void>((resolve) => {
-    this.resolveSendAsyncStarted = resolve;
-  });
+  override async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    this.calls.startTurn.push(input);
+    this.turnCount += 1;
 
-  private readonly sendAsyncFinished = new Promise<RuntimeTurnHandle>((resolve) => {
-    this.resolveSendAsync = resolve;
-  });
-
-  override async sendAsync(input: SendRuntimeMessageInput): Promise<RuntimeTurnHandle> {
-    this.calls.sendAsync.push(input);
-    this.resolveSendAsyncStarted?.();
-
-    return this.sendAsyncFinished;
+    return {
+      handle: {
+        id: `message-stuck-${this.turnCount}`,
+        sessionId: input.sessionId,
+        targetId: input.target.id,
+        status: "running",
+      },
+      events: this.turnCount === 1 ? this.neverFinal(input.signal) : this.syncEvents(input),
+    };
   }
 
-  finishSendAsync(turn: RuntimeTurnHandle & { text?: string }): void {
-    this.asyncAnswers.set(turn.id, turn.text ?? "slow answer");
-    this.resolveSendAsync?.(turn);
+  private async *neverFinal(signal: AbortSignal | undefined): AsyncIterable<RuntimeEvent> {
+    await new Promise<void>((resolve) => {
+      signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+}
+
+class SlowRuntime extends FakeRuntime {
+  private resolveSendStarted: (() => void) | undefined;
+  private resolveSend: ((turn: RuntimeTurn) => void) | undefined;
+
+  readonly sendStarted = new Promise<void>((resolve) => {
+    this.resolveSendStarted = resolve;
+  });
+
+  private readonly sendFinished = new Promise<RuntimeTurn>((resolve) => {
+    this.resolveSend = resolve;
+  });
+
+  override async send(input: SendRuntimeMessageInput): Promise<RuntimeTurn> {
+    this.calls.send.push(input);
+    this.resolveSendStarted?.();
+
+    return this.sendFinished;
+  }
+
+  finishSend(turn: RuntimeTurn): void {
+    this.resolveSend?.(turn);
   }
 }

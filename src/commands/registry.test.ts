@@ -7,6 +7,7 @@ import { runMigrations } from "../db/migrations.ts";
 import { createAccessRuleRepository } from "../db/repositories/access-rules.ts";
 import { createConversationBindingRepository } from "../db/repositories/conversation-bindings.ts";
 import { createProfileRepository } from "../db/repositories/profiles.ts";
+import { createPendingPermissionRepository } from "../db/repositories/pending-permissions.ts";
 import { createRunRepository } from "../db/repositories/runs.ts";
 import { seedDatabaseFromConfig } from "../db/repositories/seeds.ts";
 import { createTargetRepository } from "../db/repositories/targets.ts";
@@ -119,6 +120,35 @@ test("status reports context without creating a binding", async () => {
   }
 });
 
+test("status reports active run and pending permission diagnostics", async () => {
+  const harness = await createHarness();
+
+  try {
+    const bindingResult = await harness.resolver.ensureBindingForMessage(inboundMessage());
+    if (bindingResult.status !== "resolved") throw new Error("expected resolved binding");
+
+    const run = harness.repositories.runs.create({
+      bindingId: bindingResult.resolution.binding.id,
+      opencodeSessionId: bindingResult.resolution.binding.opencodeSessionId,
+      opencodeMessageId: "message-active",
+    });
+    harness.repositories.pendingPermissions.create({
+      runId: run.id,
+      opencodePermissionId: "opencode-permission-1",
+      summary: "Run bash",
+      expiresAt: "2026-01-01T00:15:00.000Z",
+    });
+
+    const result = await harness.router.handle(inboundMessage({ text: "/status" }));
+    const text = responseText(result);
+
+    expect(text).toContain(`Active run: ${run.id} (active) session=session-1 message=message-active`);
+    expect(text).toContain("Pending permissions: 1 pending, 1 without action card");
+  } finally {
+    harness.database.close();
+  }
+});
+
 test("new command creates a fresh session binding", async () => {
   const harness = await createHarness();
 
@@ -170,6 +200,34 @@ test("stop command aborts and marks the active run aborted", async () => {
     const result = await harness.router.handle(inboundMessage({ text: "/stop" }));
 
     expect(responseText(result)).toBe(`Stopped active run ${run.id} for session session-1.`);
+    expect(harness.runtime.calls.abort).toEqual([
+      expect.objectContaining({ sessionId: "session-1", turnId: "message-active" }),
+    ]);
+    expect(harness.repositories.runs.getActiveByBindingId(bindingResult.resolution.binding.id)).toBeUndefined();
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("stop command releases the local run when remote abort fails", async () => {
+  const harness = await createHarness();
+  harness.runtime.abortError = new Error("abort unavailable");
+
+  try {
+    const bindingResult = await harness.resolver.ensureBindingForMessage(inboundMessage());
+    if (bindingResult.status !== "resolved") throw new Error("expected resolved binding");
+
+    const run = harness.repositories.runs.create({
+      bindingId: bindingResult.resolution.binding.id,
+      opencodeSessionId: bindingResult.resolution.binding.opencodeSessionId,
+      opencodeMessageId: "message-active",
+    });
+
+    const result = await harness.router.handle(inboundMessage({ text: "/stop" }));
+    const text = responseText(result);
+
+    expect(text).toContain(`Stopped active run ${run.id} for session session-1.`);
+    expect(text).toContain("Remote OpenCode abort failed: abort unavailable");
     expect(harness.runtime.calls.abort).toEqual([
       expect.objectContaining({ sessionId: "session-1", turnId: "message-active" }),
     ]);
@@ -329,6 +387,7 @@ async function createHarness(options: { accessRules?: AccessRuleSeed[] } = {}): 
     resolver,
     runtime,
     turnRunner,
+    pendingPermissions: repositories.pendingPermissions,
     getHealth: () => ({ gateway: "healthy", targets: { default: "healthy", "ops-target": "healthy" } }),
   });
 
@@ -347,6 +406,7 @@ function createRepositories(database: GatewayDatabase) {
     }),
     profiles: createProfileRepository(database.db, fixedNow),
     targets: createTargetRepository(database.db, fixedNow),
+    pendingPermissions: createPendingPermissionRepository(database.db, { now: fixedNow }),
     runs: createRunRepository(database.db, {
       now: fixedNow,
       createId: () => `run-${(runId += 1)}`,
@@ -485,6 +545,7 @@ class FakeRuntime implements AgentRuntime {
   };
 
   sessions: RuntimeSession[] = [];
+  abortError: Error | undefined;
   private nextSessionNumber = 1;
   private nextMessageNumber = 1;
 
@@ -533,6 +594,7 @@ class FakeRuntime implements AgentRuntime {
 
   async abort(input: AbortRuntimeTurnInput): Promise<void> {
     this.calls.abort.push(input);
+    if (this.abortError) throw this.abortError;
   }
 
   async respondToPermission(input: PermissionResponseInput): Promise<void> {

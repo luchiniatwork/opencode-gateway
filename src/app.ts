@@ -26,7 +26,12 @@ import { createDispatchResolver } from "./dispatch/resolver.ts";
 import { createTurnRunner, type StartTurnResult, type TurnRunner } from "./gateway/turn-runner.ts";
 import { createPermissionInteractionService, type PermissionInteractionService } from "./interactive/permissions.ts";
 import type { OutboundMessage } from "./messages/types.ts";
-import { createHealthSnapshot, type ChannelHealthStatus, type GatewayHealthSnapshot } from "./observability/health.ts";
+import {
+  createHealthSnapshot,
+  type ChannelHealthStatus,
+  type GatewayHealthSnapshot,
+  type GatewayRuntimeHealthSnapshot,
+} from "./observability/health.ts";
 import {
   createJsonLogSink,
   type GatewayLogContext,
@@ -79,6 +84,10 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
   let healthServer: ReturnType<typeof Bun.serve> | undefined;
   let turnRunner: TurnRunner | undefined;
   let permissionService: PermissionInteractionService | undefined;
+  let diagnosticRepositories: {
+    runs: ReturnType<typeof createRunRepository>;
+    pendingPermissions: ReturnType<typeof createPendingPermissionRepository>;
+  } | undefined;
   const startedChannels: GatewayChannelRegistration<any>[] = [];
   const channelStatuses = new Map<string, ChannelHealthStatus>();
 
@@ -152,6 +161,10 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
 
           const runtime = options.runtime ?? new OpenCodeRuntime();
           const resolver = createDispatchResolver({ config: options.config, repositories, runtime });
+          diagnosticRepositories = {
+            runs: repositories.runs,
+            pendingPermissions: repositories.pendingPermissions,
+          };
           permissionService = createPermissionInteractionService({
             config: options.config.interactive.permissions,
             repositories,
@@ -177,6 +190,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
             runtime,
             turnRunner,
             permissionService,
+            pendingPermissions: repositories.pendingPermissions,
             getHealth: () => {
               const snapshot = healthSnapshot();
 
@@ -261,6 +275,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
           await turnRunner?.stop();
           turnRunner = undefined;
           permissionService = undefined;
+          diagnosticRepositories = undefined;
           await stopStartedChannels();
           stopHealthServer();
           abortController = undefined;
@@ -282,6 +297,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       await turnRunner?.stop();
       turnRunner = undefined;
       permissionService = undefined;
+      diagnosticRepositories = undefined;
       abortController = undefined;
       await stopStartedChannels();
       stopHealthServer();
@@ -470,7 +486,29 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       config: options.config,
       started,
       channelStatuses: Object.fromEntries(channelStatuses),
+      runtime: runtimeHealthSnapshot(),
     });
+  }
+
+  function runtimeHealthSnapshot(): GatewayRuntimeHealthSnapshot | undefined {
+    if (!diagnosticRepositories) return undefined;
+
+    return {
+      activeRuns: diagnosticRepositories.runs.listActive().map((run) => ({
+        id: run.id,
+        bindingId: run.bindingId,
+        sessionId: run.opencodeSessionId,
+        opencodeMessageId: run.opencodeMessageId,
+        startedAt: run.startedAt,
+      })),
+      pendingPermissions: diagnosticRepositories.pendingPermissions.listPending().map((permission) => ({
+        id: permission.id,
+        runId: permission.runId,
+        opencodePermissionId: permission.opencodePermissionId,
+        hasActionMessageReceipt: Boolean(permission.actionMessageReceiptId),
+        expiresAt: permission.expiresAt,
+      })),
+    };
   }
 
   function logTurnStartResult(result: StartTurnResult, message: InboundMessage): void {
@@ -484,11 +522,11 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
     };
 
     if (result.status === "error") {
-      log("error", "async turn start failed", { ...context, error: result.error });
+      log("error", "turn start failed", { ...context, error: result.error });
       return;
     }
 
-    log(result.status === "busy" ? "warn" : "info", `async turn ${result.status}`, context);
+    log(result.status === "busy" ? "warn" : "info", `turn ${result.status}`, context);
   }
 }
 

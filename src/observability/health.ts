@@ -14,12 +14,31 @@ export interface GatewayHealthSnapshot {
     default: string;
     active: string[];
   };
+  runtime?: GatewayRuntimeHealthSnapshot;
+}
+
+export interface GatewayRuntimeHealthSnapshot {
+  activeRuns: Array<{
+    id: string;
+    bindingId: string;
+    sessionId: string;
+    opencodeMessageId?: string;
+    startedAt: string;
+  }>;
+  pendingPermissions: Array<{
+    id: string;
+    runId: string;
+    opencodePermissionId: string;
+    hasActionMessageReceipt: boolean;
+    expiresAt: string;
+  }>;
 }
 
 export interface CreateHealthSnapshotInput {
   config?: GatewayConfig;
   started: boolean;
   channelStatuses?: Record<string, ChannelHealthStatus>;
+  runtime?: GatewayRuntimeHealthSnapshot;
   version?: string;
 }
 
@@ -36,6 +55,7 @@ export function createHealthSnapshot(input: CreateHealthSnapshotInput): GatewayH
     channels: channelStatuses,
     opencodeTargets: targetHealth(input.config),
     profiles: profileHealth(input.config),
+    runtime: input.runtime,
   };
 }
 

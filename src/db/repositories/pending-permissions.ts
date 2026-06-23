@@ -42,6 +42,7 @@ export interface PendingPermissionRepository {
   upsertByOpenCodePermissionId(input: CreatePendingPermissionInput): PendingPermissionRecord;
   getById(id: string): PendingPermissionRecord | undefined;
   getByOpenCodePermissionId(opencodePermissionId: string): PendingPermissionRecord | undefined;
+  listPending(): PendingPermissionRecord[];
   listPendingByRunId(runId: string): PendingPermissionRecord[];
   setActionMessageReceiptId(input: UpdatePendingPermissionActionReceiptInput): PendingPermissionRecord | undefined;
   resolve(input: ResolvePendingPermissionInput): PendingPermissionRecord | undefined;
@@ -123,6 +124,14 @@ export function createPendingPermissionRepository(
         .get(opencodePermissionId) as PendingPermissionRow | null;
 
       return row ? mapPendingPermissionRow(row) : undefined;
+    },
+
+    listPending(): PendingPermissionRecord[] {
+      const rows = db
+        .query("SELECT * FROM pending_permissions WHERE status = 'pending' ORDER BY created_at, id")
+        .all() as PendingPermissionRow[];
+
+      return rows.map(mapPendingPermissionRow);
     },
 
     listPendingByRunId(runId): PendingPermissionRecord[] {

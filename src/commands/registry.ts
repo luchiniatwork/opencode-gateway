@@ -1,8 +1,9 @@
 import type { InboundMessage } from "../channels/types.ts";
 import type { GatewayConfig } from "../config/schema.ts";
 import type { DispatchResolver, DispatchResolverRepositories } from "../dispatch/resolver.ts";
+import type { PendingPermissionRepository } from "../db/repositories/pending-permissions.ts";
 import type { ConversationBindingRecord, ProfileRecord, RunRecord, TargetRecord } from "../db/types.ts";
-import type { TurnRunner } from "../gateway/turn-runner.ts";
+import type { ActiveTurnDiagnostics, TurnRunner } from "../gateway/turn-runner.ts";
 import type { PermissionDecision, PermissionInteractionService } from "../interactive/permissions.ts";
 import type { OutboundMessage } from "../messages/types.ts";
 import type { AgentRuntime, RuntimeSession } from "../opencode/types.ts";
@@ -21,6 +22,7 @@ export interface CommandRouterOptions {
   runtime: AgentRuntime;
   turnRunner: TurnRunner;
   permissionService?: PermissionInteractionService;
+  pendingPermissions?: PendingPermissionRepository;
   getHealth?: () => CommandHealthSnapshot;
 }
 
@@ -111,6 +113,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
     const profile = binding ? repositories.profiles.getById(binding.profileId) : getDefaultProfile();
     const target = binding ? repositories.targets.getById(binding.targetId) : getTarget(profile?.defaultTargetId);
     const activeRun = binding ? repositories.runs.getActiveByBindingId(binding.id) : undefined;
+    const activeDiagnostics = binding ? turnRunner.getActiveDiagnostics(binding.id) : undefined;
+    const pendingPermissions = activeRun ? options.pendingPermissions?.listPendingByRunId(activeRun.id) ?? [] : [];
     const health = options.getHealth?.();
     const targetHealth = target ? (health?.targets?.[target.id] ?? "configured") : "unknown";
 
@@ -122,7 +126,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       `Profile: ${formatProfile(profile)}`,
       `Target: ${formatTarget(target)} (${targetHealth})`,
       `Session: ${binding?.opencodeSessionId ?? "none"}${binding?.sessionName ? ` (${binding.sessionName})` : ""}`,
-      `Active run: ${formatRun(activeRun)}`,
+      `Active run: ${formatRun(activeRun, activeDiagnostics)}`,
+      `Pending permissions: ${formatPendingPermissions(pendingPermissions)}`,
       `Gateway health: ${health?.gateway ?? "unknown"}`,
     ].join("\n");
   }
@@ -173,7 +178,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       if (result.status === "no_active_run") return "No active run for this conversation.";
       if (result.status === "error") return `Unable to stop active run ${result.run.id}: ${result.error}`;
 
-      return `Stopped active run ${result.run.id} for session ${result.run.opencodeSessionId}.`;
+      return stopResultText(result.run, result.remoteAbortError);
     } catch (error) {
       return `Unable to stop active run ${run.id}: ${formatError(error)}`;
     }
@@ -205,7 +210,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
 
       return {
         status: "stopped",
-        message: `Stopped active run ${result.run.id} for session ${result.run.opencodeSessionId}.`,
+        message: stopResultText(result.run, result.remoteAbortError),
       };
     } catch (error) {
       return { status: "error", message: `Unable to stop active run ${run.id}: ${formatError(error)}` };
@@ -373,9 +378,49 @@ function formatTarget(target: TargetRecord | undefined): string {
   return `${target.name} (${target.id})`;
 }
 
-function formatRun(run: RunRecord | undefined): string {
+function formatRun(run: RunRecord | undefined, diagnostics?: ActiveTurnDiagnostics): string {
   if (!run) return "none";
-  return `${run.id} (${run.status})`;
+
+  const parts = [
+    `${run.id} (${run.status})`,
+    `session=${run.opencodeSessionId}`,
+    run.opencodeMessageId ? `message=${run.opencodeMessageId}` : undefined,
+    diagnostics ? `age=${formatDuration(diagnostics.ageMs)}` : undefined,
+    diagnostics ? `plan=${formatTurnPlan(diagnostics)}` : undefined,
+    diagnostics?.lastEventType ? `lastEvent=${diagnostics.lastEventType}@${diagnostics.lastEventAt ?? "unknown"}` : undefined,
+  ];
+
+  return parts.filter(isNonEmptyString).join(" ");
+}
+
+function formatTurnPlan(diagnostics: ActiveTurnDiagnostics): string {
+  const { finalSource, progressSource, permissionSource } = diagnostics.plan;
+
+  return `final:${finalSource},progress:${progressSource},permissions:${permissionSource}`;
+}
+
+function formatPendingPermissions(permissions: ReturnType<PendingPermissionRepository["listPendingByRunId"]>): string {
+  if (permissions.length === 0) return "none";
+
+  const missingCards = permissions.filter((permission) => !permission.actionMessageReceiptId).length;
+  return `${permissions.length} pending, ${missingCards} without action card`;
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1_000) return `${ms}ms`;
+
+  const seconds = Math.floor(ms / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return remainingSeconds > 0 ? `${minutes}m${remainingSeconds}s` : `${minutes}m`;
+}
+
+function stopResultText(run: RunRecord, remoteAbortError: string | undefined): string {
+  const text = `Stopped active run ${run.id} for session ${run.opencodeSessionId}.`;
+
+  return remoteAbortError ? `${text}\nRemote OpenCode abort failed: ${remoteAbortError}` : text;
 }
 
 function formatSessionLine(session: RuntimeSession, currentSessionId: string | undefined): string {
@@ -410,4 +455,8 @@ function formatError(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
   return "unknown error";
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
 }

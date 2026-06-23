@@ -32,6 +32,22 @@ export interface TurnRunnerPermissionRequestInput {
   delivery: ProgressDelivery;
 }
 
+export interface RuntimeTurnPlan {
+  finalSource: "prompt" | "events";
+  progressSource: "none" | "events";
+  permissionSource: "none" | "events";
+}
+
+export interface ActiveTurnDiagnostics {
+  runId: string;
+  bindingId: string;
+  startedAt: string;
+  ageMs: number;
+  plan: RuntimeTurnPlan;
+  lastEventType?: RuntimeEvent["type"];
+  lastEventAt?: string;
+}
+
 export interface StartTurnInput {
   message: InboundMessage;
   resolution: ResolvedDispatch;
@@ -51,19 +67,24 @@ export interface AbortActiveTurnInput {
 }
 
 export type AbortActiveTurnResult =
-  | { status: "aborted"; run: RunRecord }
+  | { status: "aborted"; run: RunRecord; remoteAbortError?: string }
   | { status: "no_active_run" }
   | { status: "error"; run: RunRecord; error: string };
 
 export interface TurnRunner {
   start(input: StartTurnInput): Promise<StartTurnResult>;
   abortActive(input: AbortActiveTurnInput): Promise<AbortActiveTurnResult>;
+  getActiveDiagnostics(bindingId: string): ActiveTurnDiagnostics | undefined;
   stop(): Promise<void>;
 }
 
 interface ActiveObserver {
   runId: string;
   bindingId: string;
+  startedAt: string;
+  plan: RuntimeTurnPlan;
+  lastEventType?: RuntimeEvent["type"];
+  lastEventAt?: string;
   controller: AbortController;
   task: Promise<void>;
   cleanup(): void;
@@ -99,8 +120,9 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         opencodeSessionId: resolution.binding.opencodeSessionId,
       });
       const baseContext = runLogContext(message, resolution, run);
+      const plan = createRuntimeTurnPlan(resolution, observePermissions);
 
-      log("info", "async run created", baseContext);
+      log("info", "turn run created", { ...baseContext, turnPlan: plan });
 
       const controller = new AbortController();
       const abortFromParent = () => controller.abort();
@@ -116,19 +138,20 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
           agent: resolution.agent,
           model: resolution.model,
           metadata: messageMetadata(message),
-          mode: runtimeTurnMode(resolution),
-          observePermissions,
+          mode: runtimeTurnMode(plan),
+          observePermissions: plan.permissionSource === "events",
           signal: controller.signal,
         });
         const { handle } = started;
         const runWithMessage = runs.setOpenCodeMessageId(run.id, handle.id) ?? { ...run, opencodeMessageId: handle.id };
 
-        log("info", "async run accepted", { ...baseContext, opencodeMessageId: handle.id });
+        log("info", "turn run accepted", { ...baseContext, opencodeMessageId: handle.id });
         observeRun({
           ...input,
           run: runWithMessage,
           handle,
           events: started.events,
+          plan,
           controller,
           cleanupParentSignal: () => {
             input.signal?.removeEventListener("abort", abortFromParent);
@@ -142,7 +165,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         const messageText = formatError(error);
         const finishedRun = runs.finishIfActive({ id: run.id, status: "error", error: messageText }) ?? run;
 
-        log("error", "async run start failed", { ...baseContext, error: messageText });
+        log("error", "turn run start failed", { ...baseContext, error: messageText });
 
         return { status: "error", resolution, run: finishedRun, error: messageText };
       }
@@ -153,6 +176,8 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
 
       if (!run) return { status: "no_active_run" };
 
+      let remoteAbortError: string | undefined;
+
       try {
         await runtime.abort({
           target: input.target,
@@ -160,32 +185,50 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
           turnId: run.opencodeMessageId,
           reason: input.reason,
         });
-        abortObserver(run.id);
-        const aborted = runs.finishIfActive({ id: run.id, status: "aborted" }) ?? runs.getById(run.id) ?? run;
-
-        log("info", "async run aborted", {
-          source: "channel",
-          targetId: input.target.id,
-          sessionId: run.opencodeSessionId,
-          runId: run.id,
-          opencodeMessageId: run.opencodeMessageId,
-        });
-
-        return { status: "aborted", run: aborted };
       } catch (error) {
-        const messageText = formatError(error);
+        remoteAbortError = formatError(error);
 
-        log("error", "async run abort failed", {
+        log("warn", "remote OpenCode abort failed; releasing local run", {
           source: "channel",
           targetId: input.target.id,
           sessionId: run.opencodeSessionId,
           runId: run.id,
           opencodeMessageId: run.opencodeMessageId,
-          error: messageText,
+          error: remoteAbortError,
         });
-
-        return { status: "error", run, error: messageText };
       }
+
+      abortObserver(run.id);
+      const aborted = runs.finishIfActive({ id: run.id, status: "aborted", error: remoteAbortError }) ?? runs.getById(run.id) ?? run;
+
+      log(remoteAbortError ? "warn" : "info", "turn run aborted", {
+        source: "channel",
+        targetId: input.target.id,
+        sessionId: run.opencodeSessionId,
+        runId: run.id,
+        opencodeMessageId: run.opencodeMessageId,
+        remoteAbortError,
+      });
+
+      return { status: "aborted", run: aborted, remoteAbortError };
+    },
+
+    getActiveDiagnostics(bindingId): ActiveTurnDiagnostics | undefined {
+      const runId = activeRunIdByBindingId.get(bindingId);
+      if (!runId) return undefined;
+
+      const observer = activeByRunId.get(runId);
+      if (!observer) return undefined;
+
+      return {
+        runId: observer.runId,
+        bindingId: observer.bindingId,
+        startedAt: observer.startedAt,
+        ageMs: Math.max(now().getTime() - Date.parse(observer.startedAt), 0),
+        plan: observer.plan,
+        lastEventType: observer.lastEventType,
+        lastEventAt: observer.lastEventAt,
+      };
     },
 
     async stop(): Promise<void> {
@@ -204,6 +247,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       run: RunRecord;
       handle: RuntimeTurnHandle;
       events: AsyncIterable<RuntimeEvent>;
+      plan: RuntimeTurnPlan;
       controller: AbortController;
       cleanupParentSignal: () => void;
     },
@@ -211,6 +255,8 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     const observer: ActiveObserver = {
       runId: input.run.id,
       bindingId: input.resolution.binding.id,
+      startedAt: input.run.startedAt,
+      plan: input.plan,
       controller: input.controller,
       cleanup() {
         input.cleanupParentSignal();
@@ -227,9 +273,10 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     activeByRunId.set(input.run.id, observer);
     activeRunIdByBindingId.set(input.resolution.binding.id, input.run.id);
 
-    log("info", "async run observer started", {
+    log("info", "turn run observer started", {
       ...runLogContext(input.message, input.resolution, input.run),
       opencodeMessageId: input.handle.id,
+      turnPlan: input.plan,
     });
   }
 
@@ -247,13 +294,13 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       send: input.delivery.send,
       edit: input.delivery.edit,
       onProgress: (message) => {
-        log("info", "async run progress sent", { ...context, messageKind: message.kind });
+        log("info", "turn run progress sent", { ...context, messageKind: message.kind });
       },
       onReceipt: (message, receipt) => {
         recordDeliveryReceipt(input.run.id, message, receipt, context);
       },
       onError: (error) => {
-        log("error", "async run progress failed", { ...context, error: formatError(error) });
+        log("error", "turn run progress failed", { ...context, error: formatError(error) });
       },
     });
     let timedOut = false;
@@ -261,17 +308,15 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     const timeout = setTimeout(() => {
       timedOut = true;
       timeoutTask = finishTimedOutRun(input, context, progress);
-      activeByRunId.get(input.run.id)?.controller.abort();
-      activeByRunId.delete(input.run.id);
-      if (activeRunIdByBindingId.get(input.resolution.binding.id) === input.run.id) {
-        activeRunIdByBindingId.delete(input.resolution.binding.id);
-      }
+      abortObserver(input.run.id);
     }, runTimeoutMs);
 
     try {
       for await (const event of input.events) {
         if (timedOut) return;
         if (signal.aborted) return;
+
+        recordObservedEvent(input.run.id, event);
 
         const terminal = await handleRuntimeEvent(event, input, context, progress);
         if (terminal) return;
@@ -284,7 +329,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         const messageText = "OpenCode event stream ended before a final response.";
         runs.finishIfActive({ id: input.run.id, status: "error", error: messageText, opencodeMessageId: input.handle.id });
         await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${messageText}` }, context);
-        log("error", "async run observer ended without final", { ...context, error: messageText });
+        log("error", "turn run observer ended without final", { ...context, error: messageText });
       }
     } catch (error) {
       if (timedOut) {
@@ -298,12 +343,12 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       await progress.finalize();
       runs.finishIfActive({ id: input.run.id, status: "error", error: messageText, opencodeMessageId: input.handle.id });
       await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${messageText}` }, context);
-      log("error", "async run observer failed", { ...context, error: messageText });
+      log("error", "turn run observer failed", { ...context, error: messageText });
     } finally {
       clearTimeout(timeout);
-      await timeoutTask.catch((error) => log("error", "async run timeout handling failed", { ...context, error: formatError(error) }));
+      await timeoutTask.catch((error) => log("error", "turn run timeout handling failed", { ...context, error: formatError(error) }));
       progress.cancel();
-      log("info", "async run observer stopped", context);
+      log("info", "turn run observer stopped", context);
     }
   }
 
@@ -319,7 +364,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     if (!finished) return;
 
     await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${messageText}` }, context);
-    log("error", "async run timed out", { ...context, error: messageText });
+    log("error", "turn run timed out", { ...context, error: messageText });
   }
 
   async function handleRuntimeEvent(
@@ -341,14 +386,14 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
           context,
         );
         runs.finishIfActive({ id: input.run.id, status: "completed", opencodeMessageId: input.handle.id });
-        log("info", "async run final sent", context);
+        log("info", "turn run final sent", context);
         return true;
       }
       case "error": {
         await progress.finalize();
         runs.finishIfActive({ id: input.run.id, status: "error", error: event.message, opencodeMessageId: input.handle.id });
         await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${event.message}` }, context);
-        log("error", "async run failed", { ...context, error: event.message, retryable: event.retryable });
+        log("error", "turn run failed", { ...context, error: event.message, retryable: event.retryable });
         return true;
       }
       case "permission_request": {
@@ -372,7 +417,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         if (event.status === "aborted") {
           progress.cancel();
           runs.finishIfActive({ id: input.run.id, status: "aborted", opencodeMessageId: input.handle.id });
-          log("info", "async run observed abort", context);
+          log("info", "turn run observed abort", context);
           return true;
         }
 
@@ -381,7 +426,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
           const message = "OpenCode session reported an error.";
           runs.finishIfActive({ id: input.run.id, status: "error", error: message, opencodeMessageId: input.handle.id });
           await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${message}` }, context);
-          log("error", "async run observed error status", context);
+          log("error", "turn run observed error status", context);
           return true;
         }
 
@@ -403,7 +448,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       if (receipt) recordDeliveryReceipt(input.run.id, message, receipt, context);
       return receipt;
     } catch (error) {
-      log("error", "async run delivery failed", { ...context, error: formatError(error), messageKind: message.kind });
+      log("error", "turn run delivery failed", { ...context, error: formatError(error), messageKind: message.kind });
       return undefined;
     }
   }
@@ -416,7 +461,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     if (!pendingPermissions) return undefined;
     const existing = pendingPermissions.getByOpenCodePermissionId(event.id);
     if (existing?.status === "pending" && existing.runId === runId && existing.actionMessageReceiptId) {
-      log("info", "async run permission request already has an action card", {
+      log("info", "turn run permission request already has an action card", {
         ...context,
         permissionId: existing.id,
         opencodePermissionId: event.id,
@@ -436,7 +481,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         expiresAt,
       });
 
-      log(existing ? "warn" : "info", existing ? "async run permission request refreshed" : "async run permission requested", {
+      log(existing ? "warn" : "info", existing ? "turn run permission request refreshed" : "turn run permission requested", {
         ...context,
         permissionId: permission.id,
         opencodePermissionId: event.id,
@@ -446,7 +491,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
 
       return { permission, notify: true };
     } catch (error) {
-      log("error", "async run permission persistence failed", {
+      log("error", "turn run permission persistence failed", {
         ...context,
         opencodePermissionId: event.id,
         error: formatError(error),
@@ -464,7 +509,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     try {
       await options.onPermissionRequest(input);
     } catch (error) {
-      log("error", "async run permission notification failed", {
+      log("error", "turn run permission notification failed", {
         ...context,
         permissionId: input.permission.id,
         opencodePermissionId: input.event.id,
@@ -491,7 +536,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         kind: message.kind,
       });
     } catch (error) {
-      log("error", "async run delivery receipt persistence failed", {
+      log("error", "turn run delivery receipt persistence failed", {
         ...context,
         messageKind: message.kind,
         platformMessageId: receipt.platformMessageId,
@@ -501,7 +546,19 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
   }
 
   function abortObserver(runId: string): void {
-    activeByRunId.get(runId)?.controller.abort();
+    const observer = activeByRunId.get(runId);
+    if (!observer) return;
+
+    observer.controller.abort();
+    observer.cleanup();
+  }
+
+  function recordObservedEvent(runId: string, event: RuntimeEvent): void {
+    const observer = activeByRunId.get(runId);
+    if (!observer) return;
+
+    observer.lastEventType = event.type;
+    observer.lastEventAt = now().toISOString();
   }
 }
 
@@ -537,8 +594,18 @@ function messageMetadata(message: InboundMessage): Record<string, unknown> {
   };
 }
 
-function runtimeTurnMode(resolution: ResolvedDispatch): "sync" | "async" {
-  return resolution.binding.verbosity === "tools" || resolution.binding.verbosity === "verbose" ? "async" : "sync";
+function createRuntimeTurnPlan(resolution: ResolvedDispatch, observePermissions: boolean): RuntimeTurnPlan {
+  const observesProgress = resolution.binding.verbosity === "tools" || resolution.binding.verbosity === "verbose";
+
+  return {
+    finalSource: observesProgress ? "events" : "prompt",
+    progressSource: observesProgress ? "events" : "none",
+    permissionSource: observePermissions ? "events" : "none",
+  };
+}
+
+function runtimeTurnMode(plan: RuntimeTurnPlan): "sync" | "async" {
+  return plan.finalSource === "events" ? "async" : "sync";
 }
 
 function formatError(error: unknown): string {
