@@ -24,7 +24,7 @@ Phase 2 turns that durable gateway into an operationally useful chat control sur
 
 - Long-running OpenCode turns are started asynchronously instead of blocking the gateway until a final answer exists.
 - OpenCode events are observed and normalized behind the local `AgentRuntime` boundary.
-- Users see compact progress and final results in chat.
+- Users see transient channel activity indicators for compact turns and final results in chat.
 - OpenCode permission requests are routed to Telegram buttons with text fallbacks.
 - Rapid-fire user messages are debounced before dispatch.
 - `/agent` and `/model` expose persisted per-binding overrides.
@@ -118,15 +118,17 @@ Defer:
 ### 6. Progress Rendering
 
 - Add `src/delivery/renderer.ts`.
-- Send a short working acknowledgement after about 2 seconds if no final answer has arrived.
+- Use channel-native transient activity indicators (for example Telegram `typing...`) instead of sending synthetic “working...” chat messages.
+- Keep the activity indicator alive while a turn is active when the channel supports it.
 - Prefer editing one progress message when the channel supports `edit`.
 - Fall back to sending sparse progress messages when editing is unavailable.
 - Respect binding/profile verbosity:
 - `off`: final answer only.
-- `compact`: working acknowledgement plus final answer.
+- `compact`: activity indicator when available plus final answer; no progress messages.
 - `tools`: include tool start/end summaries.
 - `verbose`: include detailed tool updates and debug-oriented status.
 - Avoid sending every text delta as a chat message.
+- Do not send generic “working...” or heartbeat progress messages; they should be transient channel indicators, not durable chat history.
 - Keep final answer separate from progress output.
 - Preserve Markdown for final answers and split long platform messages safely through the channel adapter.
 
@@ -258,7 +260,7 @@ Phase 2 is done when:
 - `bun run typecheck` passes.
 - `bun test` passes.
 - An allowlisted Telegram DM can start a long-running OpenCode task without blocking the gateway event loop.
-- Progress appears in chat according to the active verbosity mode.
+- Progress appears according to the active verbosity mode: `compact` uses channel activity indicators only, while `tools`/`verbose` may send progress messages.
 - Final answers still render correctly and preserve Markdown where Telegram allows it.
 - `/stop` aborts an active async OpenCode turn.
 - OpenCode permission requests produce Telegram approval buttons.

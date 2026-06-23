@@ -1,4 +1,4 @@
-import type { SendReceipt } from "../channels/types.ts";
+import type { SendReceipt, TypingState } from "../channels/types.ts";
 import type { Verbosity } from "../config/schema.ts";
 import type { OutboundMessage } from "../messages/types.ts";
 import type { RuntimeEvent } from "../opencode/types.ts";
@@ -6,6 +6,7 @@ import type { RuntimeEvent } from "../opencode/types.ts";
 export interface ProgressDelivery {
   send(message: OutboundMessage): Promise<SendReceipt | undefined>;
   edit?(receipt: SendReceipt, message: OutboundMessage): Promise<SendReceipt | undefined>;
+  setTyping?(state: TypingState): Promise<void>;
 }
 
 export interface ProgressRendererOptions extends ProgressDelivery {
@@ -23,8 +24,7 @@ export interface ProgressRenderer {
 }
 
 const DEFAULT_PROGRESS_DELAY_MS = 2_000;
-const MAX_TOOL_LINES = 8;
-const MAX_VERBOSE_LINES = 12;
+const TYPING_KEEPALIVE_MS = 4_000;
 
 export function createProgressRenderer(options: ProgressRendererOptions): ProgressRenderer {
   const delayMs = options.delayMs ?? DEFAULT_PROGRESS_DELAY_MS;
@@ -33,8 +33,17 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
   let finalized = false;
   let sentLineCount = 0;
   let lastEditedText: string | undefined;
+  let editUnavailable = false;
   let task = Promise.resolve();
+  let typingTask = Promise.resolve();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let typingTimer: ReturnType<typeof setInterval> | undefined;
+  let typingStarted = false;
+  let typingStopped = false;
+
+  if (options.verbosity !== "off" && options.setTyping) {
+    startTypingIndicator();
+  }
 
   if (options.verbosity === "tools" || options.verbosity === "verbose") {
     timer = setTimeout(() => {
@@ -51,7 +60,6 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
       if (!line) return;
 
       detailLines.push(line);
-      trimDetailLines(detailLines, options.verbosity);
 
       if (receipt || !timer) {
         await enqueueFlush();
@@ -61,12 +69,16 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
     async finalize(): Promise<void> {
       finalized = true;
       clearProgressTimer();
-      await task.catch((error) => options.onError?.(error));
+      await Promise.all([
+        task.catch((error) => options.onError?.(error)),
+        stopTypingIndicator(),
+      ]);
     },
 
     cancel(): void {
       finalized = true;
       clearProgressTimer();
+      void stopTypingIndicator();
     },
   };
 
@@ -85,37 +97,67 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
     return task;
   }
 
+  function startTypingIndicator(): void {
+    typingStarted = true;
+    void enqueueTyping("typing");
+    typingTimer = setInterval(() => {
+      void enqueueTyping("typing");
+    }, TYPING_KEEPALIVE_MS);
+  }
+
+  function stopTypingIndicator(): Promise<void> {
+    if (!typingStarted) return typingTask;
+    if (typingStopped) return typingTask;
+
+    typingStopped = true;
+    clearTypingTimer();
+    return enqueueTyping("idle");
+  }
+
+  function clearTypingTimer(): void {
+    if (!typingTimer) return;
+
+    clearInterval(typingTimer);
+    typingTimer = undefined;
+  }
+
+  function enqueueTyping(state: TypingState): Promise<void> {
+    const setTyping = options.setTyping;
+    if (!setTyping) return Promise.resolve();
+
+    typingTask = typingTask.then(() => setTyping(state), () => setTyping(state)).catch((error) => {
+      options.onError?.(error);
+    });
+
+    return typingTask;
+  }
+
   async function flushProgress(): Promise<void> {
     if (finalized || options.verbosity === "off") return;
 
     const message = progressMessage();
     if (!message) return;
 
-    if (receipt && options.edit) {
+    if (receipt && options.edit && !editUnavailable) {
       if (message.text === lastEditedText) return;
 
-      receipt = (await options.edit(receipt, message)) ?? receipt;
-      lastEditedText = message.text;
-      sentLineCount = detailLines.length;
-      options.onReceipt?.(message, receipt);
-      options.onProgress?.(message, receipt);
-      return;
+      try {
+        receipt = (await options.edit(receipt, message)) ?? receipt;
+        lastEditedText = message.text;
+        sentLineCount = detailLines.length;
+        options.onReceipt?.(message, receipt);
+        options.onProgress?.(message, receipt);
+        return;
+      } catch (error) {
+        editUnavailable = true;
+        options.onError?.(error);
+        await sendSparseProgress();
+        return;
+      }
     }
 
     if (receipt) {
-      const unsentLines = detailLines.slice(sentLineCount);
-      if (unsentLines.length === 0) return;
-
-      const update: OutboundMessage = {
-        kind: "progress",
-        format: "plain",
-        text: unsentLines.join("\n"),
-      };
-
-      receipt = (await options.send(update)) ?? receipt;
-      sentLineCount = detailLines.length;
-      options.onReceipt?.(update, receipt);
-      options.onProgress?.(update, receipt);
+      await sendSparseProgress();
       return;
     }
 
@@ -124,6 +166,22 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
     sentLineCount = detailLines.length;
     if (receipt) options.onReceipt?.(message, receipt);
     options.onProgress?.(message, receipt);
+  }
+
+  async function sendSparseProgress(): Promise<void> {
+    const unsentLines = detailLines.slice(sentLineCount);
+    if (unsentLines.length === 0) return;
+
+    const update: OutboundMessage = {
+      kind: "progress",
+      format: "plain",
+      text: unsentLines.join("\n"),
+    };
+
+    receipt = (await options.send(update)) ?? receipt;
+    sentLineCount = detailLines.length;
+    if (receipt) options.onReceipt?.(update, receipt);
+    options.onProgress?.(update, receipt);
   }
 
   function progressMessage(): OutboundMessage | undefined {
@@ -145,16 +203,18 @@ function progressLine(event: RuntimeEvent, verbosity: Verbosity): string | undef
 
   switch (event.type) {
     case "tool_start":
-      return `Tool ${event.name} started${summarySuffix(event.summary)}`;
+      return `Tool ${toolLabel(event, verbosity)} started${summarySuffix(event.summary)}`;
     case "tool_end":
-      return `Tool ${event.name} ${event.ok ? "completed" : "failed"}${summarySuffix(event.summary)}`;
+      return `Tool ${toolLabel(event, verbosity)} ${event.ok ? "completed" : "failed"}${summarySuffix(event.summary)}`;
     case "tool_update":
-      return verbosity === "verbose" ? `Tool ${event.name} updated${summarySuffix(event.summary)}` : undefined;
+      return verbosity === "verbose" ? `Tool ${toolLabel(event, verbosity)} updated${summarySuffix(event.summary)}` : undefined;
     case "status":
       return verbosity === "verbose" ? `Status: ${event.status}` : undefined;
-    case "text_delta":
     case "permission_request":
+      return verbosity === "verbose" ? `Permission requested (${event.id}): ${event.summary}` : undefined;
     case "question_request":
+      return verbosity === "verbose" ? `Question requested (${event.id}): ${event.prompt}` : undefined;
+    case "text_delta":
     case "final":
     case "error":
       return undefined;
@@ -167,10 +227,6 @@ function summarySuffix(summary: string | undefined): string {
   return trimmed ? `: ${trimmed}` : "";
 }
 
-function trimDetailLines(lines: string[], verbosity: Verbosity): void {
-  const max = verbosity === "verbose" ? MAX_VERBOSE_LINES : MAX_TOOL_LINES;
-
-  if (lines.length <= max) return;
-
-  lines.splice(0, lines.length - max);
+function toolLabel(event: { id: string; name: string }, verbosity: Verbosity): string {
+  return verbosity === "verbose" ? `${event.name} (${event.id})` : event.name;
 }

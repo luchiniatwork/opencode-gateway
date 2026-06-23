@@ -829,14 +829,20 @@ are safety decisions; questions are product/workflow clarification.
 
 Mobile-friendly default:
 
-- Send a short “working” acknowledgement after ~2 seconds.
+- Prefer channel-native transient activity indicators (for example
+  Telegram's `typing...` chat action) over synthetic “working...”
+  messages. These indicators should be kept alive while a turn is active
+  when the channel supports them.
+- Do not send generic heartbeat/progress messages whose only content is
+  “working”, “still working”, or similar. They age poorly in chat history.
 - Update one progress message if platform supports editing.
 - Avoid spamming every tool call by default.
 
 Verbosity modes:
 
 - `off`: final answer only.
-- `compact`: working heartbeat + final answer.
+- `compact`: channel-native activity indicator when available + final
+  answer; no progress messages in chat.
 - `tools`: include tool start/end summaries.
 - `verbose`: detailed tool updates and debug info.
 

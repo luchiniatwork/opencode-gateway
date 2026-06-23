@@ -416,6 +416,11 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       delivery.edit = (receipt, message) => edit(receipt, message);
     }
 
+    if (channel.adapter.sendTyping) {
+      const sendTyping = channel.adapter.sendTyping.bind(channel.adapter);
+      delivery.setTyping = (state) => sendTyping(target, state);
+    }
+
     return delivery;
   }
 
