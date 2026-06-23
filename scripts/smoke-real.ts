@@ -152,7 +152,7 @@ async function serveGatewayForTelegramSmoke(config: GatewayConfig, options: Smok
     console.log(`Gateway turn timeout: ${options.gatewayRunTimeoutMs}ms`);
 
     if (options.permissionSmoke) {
-      const passed = await runPermissionSmoke(config, options).catch((error) => {
+      const passed = await runPermissionSmoke(config, options, app.healthUrl).catch((error) => {
         console.error(error instanceof Error ? error.message : String(error));
         return false;
       });
@@ -173,7 +173,7 @@ async function serveGatewayForTelegramSmoke(config: GatewayConfig, options: Smok
   }
 }
 
-async function runPermissionSmoke(config: GatewayConfig, options: SmokeOptions): Promise<boolean> {
+async function runPermissionSmoke(config: GatewayConfig, options: SmokeOptions, healthUrl: string | undefined): Promise<boolean> {
   const telegram = config.channels.telegram;
   const senderId = telegram?.allowFrom[0];
 
@@ -199,21 +199,21 @@ async function runPermissionSmoke(config: GatewayConfig, options: SmokeOptions):
     console.log("No /profile or /new command is needed; this smoke script prepares fresh sessions directly.");
 
     try {
-      await runPermissionCase(database, runtime, config, conversationKey, profile, target, options, {
+      await runPermissionCase(database, runtime, config, conversationKey, profile, target, options, healthUrl, {
         name: "Approve once button",
         prompt: "Use bash to run: printf 'permission smoke approve once'",
         instruction: "Click the Approve once button on the permission card.",
         expectedStatus: "approved",
       });
 
-      await runPermissionCase(database, runtime, config, conversationKey, profile, target, options, {
+      await runPermissionCase(database, runtime, config, conversationKey, profile, target, options, healthUrl, {
         name: "Deny button",
         prompt: "Use bash to run: printf 'permission smoke deny'",
         instruction: "Click the Deny button on the permission card.",
         expectedStatus: "denied",
       });
 
-      await runPermissionCase(database, runtime, config, conversationKey, profile, target, options, {
+      await runPermissionCase(database, runtime, config, conversationKey, profile, target, options, healthUrl, {
         name: "Fallback command",
         prompt: "Use bash to run: printf 'permission smoke fallback'",
         instruction: "Type the fallback command shown below after the permission card appears.",
@@ -225,7 +225,7 @@ async function runPermissionSmoke(config: GatewayConfig, options: SmokeOptions):
         if (!config.interactive.permissions.allowAlways) {
           console.log("Skipping always-allow smoke: interactive.permissions.allowAlways is false.");
         } else {
-          await runPermissionCase(database, runtime, config, conversationKey, profile, target, options, {
+          await runPermissionCase(database, runtime, config, conversationKey, profile, target, options, healthUrl, {
             name: "Always allow",
             prompt: "Use bash to run: printf 'permission smoke always'",
             instruction: "Click Always allow, or type the fallback command shown below.",
@@ -235,7 +235,7 @@ async function runPermissionSmoke(config: GatewayConfig, options: SmokeOptions):
         }
       }
     } catch (error) {
-      printPermissionSmokeDiagnostics(database, conversationKey);
+      await printPermissionSmokeDiagnostics(database, conversationKey, target, healthUrl);
       throw error;
     }
 
@@ -255,6 +255,7 @@ async function runPermissionCase(
   profile: GatewayConfig["profiles"]["entries"][number],
   target: GatewayConfig["opencode"]["targets"][number],
   options: SmokeOptions,
+  healthUrl: string | undefined,
   input: {
     name: string;
     prompt: string;
@@ -274,7 +275,18 @@ async function runPermissionCase(
   const permission = await waitForCondition(
     `${input.name} permission card sent`,
     options.permissionTimeoutMs,
-    async () => latestPermissionCard(database, conversationKey, startedAt),
+    async () => {
+      const permission = latestPermissionCard(database, conversationKey, startedAt);
+      if (permission) return permission;
+
+      const latestUserText = await latestOpenCodeUserText(target, sessionId);
+      if (latestUserText && latestUserText !== input.prompt) {
+        return undefined;
+      }
+
+      return undefined;
+    },
+    () => printPermissionSmokeDiagnostics(database, conversationKey, target, healthUrl),
   );
 
   console.log(`Permission ID: ${permission.id}`);
@@ -288,11 +300,13 @@ async function runPermissionCase(
     `${input.name} resolved as ${input.expectedStatus}`,
     options.permissionTimeoutMs,
     async () => permissionStatus(database, permission.id) === input.expectedStatus,
+    () => printPermissionSmokeDiagnostics(database, conversationKey, target, healthUrl),
   );
   await waitForCondition(
     `${input.name} run finished`,
     options.permissionTimeoutMs,
     async () => runStatus(database, permission.run_id) !== "active",
+    () => printPermissionSmokeDiagnostics(database, conversationKey, target, healthUrl),
   );
 
   console.log(`${input.name} passed.`);
@@ -308,6 +322,7 @@ async function preparePermissionSmokeBinding(
   label: string,
 ): Promise<string> {
   finishActiveRunsForConversation(database, conversationKey, `Permission smoke preparing ${label}.`);
+  await abortBusyOpenCodeSessions(runtime, target);
 
   const session = await runtime.ensureSession({
     target,
@@ -351,6 +366,26 @@ async function preparePermissionSmokeBinding(
     );
 
   return session.id;
+}
+
+async function abortBusyOpenCodeSessions(
+  runtime: OpenCodeRuntime,
+  target: GatewayConfig["opencode"]["targets"][number],
+): Promise<void> {
+  const statuses = await fetchOpenCodeSessionStatuses(target).catch(() => ({}));
+  const busySessionIds = Object.entries(statuses)
+    .filter(([, status]) => status.type !== "idle")
+    .map(([sessionId]) => sessionId);
+
+  if (busySessionIds.length === 0) return;
+
+  console.log(`Aborting ${busySessionIds.length} busy OpenCode session(s) before permission smoke: ${busySessionIds.join(", ")}`);
+
+  for (const sessionId of busySessionIds) {
+    await runtime.abort({ target, sessionId, reason: "Permission smoke preparing a fresh case" }).catch((error) => {
+      console.warn(`Unable to abort busy OpenCode session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
 }
 
 function finishActiveRunsForConversation(database: GatewayDatabase, conversationKey: string, error: string): void {
@@ -403,40 +438,153 @@ function runStatus(database: GatewayDatabase, runId: string): string | undefined
   return row?.status;
 }
 
-function printPermissionSmokeDiagnostics(database: GatewayDatabase, conversationKey: string): void {
+async function printPermissionSmokeDiagnostics(
+  database: GatewayDatabase,
+  conversationKey: string,
+  target: GatewayConfig["opencode"]["targets"][number],
+  healthUrl: string | undefined,
+): Promise<void> {
+  printPermissionSmokeDatabaseDiagnostics(database, conversationKey);
+
+  const binding = permissionSmokeBinding(database, conversationKey);
+  if (binding) {
+    await printRecentOpenCodeMessages(target, binding.opencode_session_id);
+  }
+
+  await printOpenCodeSessionStatuses(target);
+
+  if (!healthUrl) return;
+
+  try {
+    const response = await fetch(healthUrl);
+    const body = await response.text();
+
+    console.error(`- Gateway health (${response.status}): ${body}`);
+  } catch (error) {
+    console.error(`- Gateway health: unavailable (${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
+async function printOpenCodeSessionStatuses(target: GatewayConfig["opencode"]["targets"][number]): Promise<void> {
+  const statuses = await fetchOpenCodeSessionStatuses(target).catch((error) => {
+    console.error(`- OpenCode statuses: unavailable (${error instanceof Error ? error.message : String(error)})`);
+    return undefined;
+  });
+
+  if (!statuses) return;
+
+  const entries = Object.entries(statuses).map(([sessionId, status]) => `${sessionId}:${status.type}`);
+  console.error(`- OpenCode statuses: ${entries.length > 0 ? entries.join(" | ") : "none"}`);
+}
+
+async function fetchOpenCodeSessionStatuses(
+  target: GatewayConfig["opencode"]["targets"][number],
+): Promise<Record<string, { type: string }>> {
+  if (!target.serverUrl) return {};
+
+  const url = new URL("/session/status", target.serverUrl.endsWith("/") ? target.serverUrl : `${target.serverUrl}/`);
+  if (target.workdir) url.searchParams.set("directory", target.workdir);
+
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);
+
+  const body = await response.json();
+  return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, { type: string }> : {};
+}
+
+function permissionSmokeBinding(database: GatewayDatabase, conversationKey: string): { opencode_session_id: string } | undefined {
+  const row = database.db
+    .query("SELECT opencode_session_id FROM conversation_bindings WHERE conversation_key = ?")
+    .get(conversationKey) as { opencode_session_id: string } | null;
+
+  return row ?? undefined;
+}
+
+async function latestOpenCodeUserText(target: GatewayConfig["opencode"]["targets"][number], sessionId: string): Promise<string | undefined> {
+  const messages = await fetchOpenCodeMessages(target, sessionId).catch(() => []);
+  const latestUser = [...messages].reverse().find((message) => message.info?.role === "user");
+
+  return latestUser ? messageText(latestUser) : undefined;
+}
+
+async function printRecentOpenCodeMessages(target: GatewayConfig["opencode"]["targets"][number], sessionId: string): Promise<void> {
+  const messages = await fetchOpenCodeMessages(target, sessionId).catch((error) => {
+    console.error(`- OpenCode messages: unavailable (${error instanceof Error ? error.message : String(error)})`);
+    return [];
+  });
+  const recent = messages.slice(-5).map((message) => {
+    const text = oneLine(messageText(message));
+    const agent = message.info?.agent ? ` agent=${message.info.agent}` : "";
+    const finish = message.info?.finish ? ` finish=${message.info.finish}` : "";
+
+    return `${message.info?.role ?? "unknown"}:${message.info?.id ?? "unknown"}${agent}${finish} text=${text || "none"}`;
+  });
+
+  console.error(`- Recent OpenCode messages: ${recent.length > 0 ? recent.join(" | ") : "none"}`);
+}
+
+async function fetchOpenCodeMessages(
+  target: GatewayConfig["opencode"]["targets"][number],
+  sessionId: string,
+): Promise<Array<{ info?: { id?: string; role?: string; agent?: string; finish?: string }; parts?: Array<{ type?: string; text?: string }> }>> {
+  if (!target.serverUrl) return [];
+
+  const url = new URL(`/session/${encodeURIComponent(sessionId)}/message`, target.serverUrl.endsWith("/") ? target.serverUrl : `${target.serverUrl}/`);
+  if (target.workdir) url.searchParams.set("directory", target.workdir);
+
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);
+
+  const body = await response.json();
+  return Array.isArray(body) ? body : [];
+}
+
+function messageText(message: { parts?: Array<{ type?: string; text?: string }> }): string {
+  return (message.parts ?? [])
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n\n")
+    .trim();
+}
+
+function oneLine(value: string): string {
+  return value.replace(/\s+/g, " ").slice(0, 160);
+}
+
+function printPermissionSmokeDatabaseDiagnostics(database: GatewayDatabase, conversationKey: string): void {
   const binding = database.db
     .query(
-      `SELECT id, profile_id, opencode_session_id
+      `SELECT id, profile_id, target_id, opencode_session_id, busy_mode, verbosity
       FROM conversation_bindings
       WHERE conversation_key = ?`,
     )
-    .get(conversationKey) as { id: string; profile_id: string; opencode_session_id: string } | null;
-  const run = database.db
+    .get(conversationKey) as { id: string; profile_id: string; target_id: string; opencode_session_id: string; busy_mode: string; verbosity: string } | null;
+  const runs = database.db
     .query(
       `SELECT r.id, r.status, r.error, r.opencode_message_id
       FROM runs r
       JOIN conversation_bindings b ON b.id = r.binding_id
       WHERE b.conversation_key = ?
       ORDER BY r.started_at DESC
-      LIMIT 1`,
+      LIMIT 5`,
     )
-    .get(conversationKey) as { id: string; status: string; error: string | null; opencode_message_id: string | null } | null;
-  const permission = database.db
+    .all(conversationKey) as Array<{ id: string; status: string; error: string | null; opencode_message_id: string | null }>;
+  const permissions = database.db
     .query(
-      `SELECT p.id, p.status, p.action_message_receipt_id, p.created_at
+      `SELECT p.id, p.run_id, p.status, p.action_message_receipt_id, p.created_at, p.expires_at
       FROM pending_permissions p
       JOIN runs r ON r.id = p.run_id
       JOIN conversation_bindings b ON b.id = r.binding_id
       WHERE b.conversation_key = ?
       ORDER BY p.created_at DESC
-      LIMIT 1`,
+      LIMIT 5`,
     )
-    .get(conversationKey) as { id: string; status: string; action_message_receipt_id: string | null; created_at: string } | null;
+    .all(conversationKey) as Array<{ id: string; run_id: string; status: string; action_message_receipt_id: string | null; created_at: string; expires_at: string }>;
 
   console.error("Permission smoke diagnostics:");
-  console.error(`- Binding: ${binding ? `${binding.id} profile=${binding.profile_id} session=${binding.opencode_session_id}` : "none"}`);
-  console.error(`- Latest run: ${run ? `${run.id} status=${run.status} message=${run.opencode_message_id ?? "none"} error=${run.error ?? "none"}` : "none"}`);
-  console.error(`- Latest permission: ${permission ? `${permission.id} status=${permission.status} receipt=${permission.action_message_receipt_id ?? "none"}` : "none"}`);
+  console.error(`- Binding: ${binding ? `${binding.id} profile=${binding.profile_id} target=${binding.target_id} session=${binding.opencode_session_id} busy=${binding.busy_mode} verbosity=${binding.verbosity}` : "none"}`);
+  console.error(`- Recent runs: ${runs.length > 0 ? runs.map((run) => `${run.id} status=${run.status} message=${run.opencode_message_id ?? "none"} error=${run.error ?? "none"}`).join(" | ") : "none"}`);
+  console.error(`- Recent permissions: ${permissions.length > 0 ? permissions.map((permission) => `${permission.id} run=${permission.run_id} status=${permission.status} receipt=${permission.action_message_receipt_id ?? "none"} created=${permission.created_at} expires=${permission.expires_at}`).join(" | ") : "none"}`);
   console.error("Recovery commands in Telegram: /stop, then /new, then /profile default if you want to leave smoke mode.");
 }
 
@@ -449,7 +597,7 @@ async function waitForCondition<T>(
   label: string,
   timeoutMs: number,
   fn: () => Promise<T | false | undefined> | T | false | undefined,
-  onStillWaiting?: () => void,
+  onStillWaiting?: () => Promise<void> | void,
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   let nextStillWaitingLogAt = Date.now() + 10_000;
@@ -458,7 +606,7 @@ async function waitForCondition<T>(
     const result = await fn();
     if (result) return result;
     if (onStillWaiting && Date.now() >= nextStillWaitingLogAt) {
-      onStillWaiting();
+      await onStillWaiting();
       nextStillWaitingLogAt = Date.now() + 10_000;
     }
     await Bun.sleep(500);

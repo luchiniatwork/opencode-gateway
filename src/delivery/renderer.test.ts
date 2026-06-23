@@ -43,6 +43,18 @@ test("progress renderer does not send compact chat acknowledgement before final"
   expect(harness.typing.map((entry) => entry.state)).toEqual(["typing", "idle"]);
 });
 
+for (const verbosity of ["tools", "verbose"] as const) {
+  test(`progress renderer uses typing indicator in ${verbosity} verbosity`, async () => {
+    const harness = createHarness({ typing: true });
+    const renderer = createProgressRenderer({ verbosity, delayMs: 1, ...harness.delivery });
+
+    await waitFor(() => harness.typing.length === 1);
+    await renderer.finalize();
+
+    expect(harness.typing.map((entry) => entry.state)).toEqual(["typing", "idle"]);
+  });
+}
+
 test("progress renderer edits one progress message when editing is available", async () => {
   const harness = createHarness({ edit: true });
   const renderer = createProgressRenderer({ verbosity: "tools", delayMs: 1, ...harness.delivery });
@@ -73,6 +85,32 @@ test("progress renderer falls back to sparse progress sends without editing", as
   ]);
 });
 
+test("progress renderer only shows tool lifecycle events in tools verbosity", async () => {
+  const harness = createHarness();
+  const renderer = createProgressRenderer({ verbosity: "tools", delayMs: 1, ...harness.delivery });
+
+  await renderer.handle({ type: "status", status: "running" });
+  await renderer.handle({ type: "tool_update", id: "tool-1", name: "bash", summary: "Still running" });
+  await renderer.handle({ type: "permission_request", id: "permission-1", summary: "Run bash" });
+  await renderer.handle({ type: "question_request", id: "question-1", prompt: "Which branch?" });
+  await renderer.handle({ type: "text_delta", text: "streamed text" });
+  await Bun.sleep(5);
+
+  expect(harness.sent).toEqual([]);
+
+  await renderer.handle({ type: "tool_start", id: "tool-1", name: "bash", summary: "Run tests" });
+  await waitFor(() => harness.sent.length === 1);
+  await renderer.handle({ type: "status", status: "idle" });
+  await renderer.handle({ type: "tool_update", id: "tool-1", name: "bash", summary: "Almost done" });
+  await renderer.handle({ type: "tool_end", id: "tool-1", name: "bash", ok: true, summary: "Passed" });
+  await renderer.finalize();
+
+  expect(harness.sent.map((entry) => entry.message.text)).toEqual([
+    "Tool bash started: Run tests",
+    "Tool bash completed: Passed",
+  ]);
+});
+
 test("progress renderer includes verbose status and tool updates", async () => {
   const harness = createHarness({ edit: true });
   const renderer = createProgressRenderer({ verbosity: "verbose", delayMs: 1, ...harness.delivery });
@@ -85,6 +123,32 @@ test("progress renderer includes verbose status and tool updates", async () => {
   expect(harness.edited.at(-1)?.message.text).toBe(
     "Status: running\nTool bash (tool-1) updated: Still running",
   );
+});
+
+test("progress renderer shows verbose diagnostic events and suppresses deltas", async () => {
+  const harness = createHarness({ edit: true });
+  const renderer = createProgressRenderer({ verbosity: "verbose", delayMs: 1, ...harness.delivery });
+
+  await renderer.handle({ type: "status", status: "running" });
+  await waitFor(() => harness.sent.length === 1);
+  await renderer.handle({ type: "tool_start", id: "tool-1", name: "bash", summary: "Run tests" });
+  await renderer.handle({ type: "tool_update", id: "tool-1", name: "bash", summary: "Still running" });
+  await renderer.handle({ type: "permission_request", id: "permission-1", summary: "Run bash" });
+  await renderer.handle({ type: "question_request", id: "question-1", prompt: "Which branch?" });
+  await renderer.handle({ type: "text_delta", text: "streamed text" });
+  await renderer.handle({ type: "final", text: "final answer" });
+  await renderer.handle({ type: "error", message: "runtime failed" });
+  await renderer.handle({ type: "tool_end", id: "tool-1", name: "bash", ok: true, summary: "Passed" });
+  await renderer.finalize();
+
+  expect(harness.edited.at(-1)?.message.text).toBe([
+    "Status: running",
+    "Tool bash (tool-1) started: Run tests",
+    "Tool bash (tool-1) updated: Still running",
+    "Permission requested (permission-1): Run bash",
+    "Question requested (question-1): Which branch?",
+    "Tool bash (tool-1) completed: Passed",
+  ].join("\n"));
 });
 
 test("progress renderer includes verbose permission and question diagnostics", async () => {

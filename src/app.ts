@@ -506,6 +506,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
         opencodeMessageId: run.opencodeMessageId,
         startedAt: run.startedAt,
       })),
+      queuedTurns: turnRunner?.listQueueDiagnostics() ?? [],
       pendingPermissions: diagnosticRepositories.pendingPermissions.listPending().map((permission) => ({
         id: permission.id,
         runId: permission.runId,
@@ -524,6 +525,8 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       sessionId: result.resolution.binding.opencodeSessionId,
       runId: result.run.id,
       opencodeMessageId: result.status === "started" ? result.handle.id : result.run.opencodeMessageId,
+      queuedId: result.status === "queued" ? result.queuedId : undefined,
+      queueSize: result.status === "queued" ? result.queueSize : undefined,
     };
 
     if (result.status === "error") {
@@ -582,9 +585,17 @@ function validatePhase1RuntimeTargets(config: GatewayConfig): void {
 }
 
 function turnStartMessages(result: StartTurnResult): OutboundMessage[] {
-  switch (result.status) {
+    switch (result.status) {
     case "started":
       return [];
+    case "queued":
+      return [
+        {
+          kind: "status",
+          format: "plain",
+          text: `Queued behind active run ${result.run.id}. Queue size: ${result.queueSize}.`,
+        },
+      ];
     case "busy": {
       const activeSessionId = result.run.opencodeSessionId;
       const currentSessionId = result.resolution.binding.opencodeSessionId;

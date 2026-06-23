@@ -87,6 +87,47 @@ test("turn runner marks startTurn failures as run errors", async () => {
   }
 });
 
+test("turn runner times out startTurn hangs and releases the binding", async () => {
+  const harness = await createHarness({ neverResolveStartTurn: true, startTimeoutMs: 1 });
+
+  try {
+    const result = await harness.runner.start({
+      message: inboundMessage(),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+
+    expect(result).toMatchObject({
+      status: "error",
+      error: "OpenCode did not accept the turn within 1ms.",
+    });
+    expect(runRows(harness.database)).toEqual([
+      {
+        id: "run-1",
+        status: "error",
+        opencode_message_id: null,
+        error: "OpenCode did not accept the turn within 1ms.",
+      },
+    ]);
+
+    harness.runtime.setNeverResolveStartTurn(false);
+    harness.runtime.setEvents([{ type: "final", text: "second done" }]);
+
+    const second = await harness.runner.start({
+      message: inboundMessage(),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForDeliveries(harness.deliveries, 1);
+
+    expect(second.status).toBe("started");
+    expect(harness.deliveries).toEqual([{ kind: "final", format: "markdown", text: "second done" }]);
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
 test("turn runner converts runtime error events to error messages and run errors", async () => {
   const harness = await createHarness({ events: [{ type: "error", message: "stream failed", retryable: true }] });
 
@@ -237,6 +278,96 @@ test("turn runner releases the binding after a timeout so later turns can start"
         error: "OpenCode did not produce a final response within 1ms.",
       },
       { id: "run-2", status: "completed", opencode_message_id: "message-1", error: null },
+    ]);
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
+test("turn runner queues follow-up messages and drains after the active turn completes", async () => {
+  const harness = await createHarness({
+    eventBatches: [
+      [{ type: "status", status: "running" }, { type: "final", text: "first done" }],
+      [{ type: "final", text: "second done" }],
+    ],
+    eventDelayMs: 5,
+  });
+
+  try {
+    const first = await harness.runner.start({
+      message: inboundMessage({ id: "message-1", text: "first" }),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    const second = await harness.runner.start({
+      message: inboundMessage({ id: "message-2", text: "second" }),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+
+    expect(first.status).toBe("started");
+    expect(second).toMatchObject({ status: "queued", queueSize: 1 });
+    expect(harness.runner.getQueueDiagnostics(harness.resolution.binding.id)).toEqual({
+      bindingId: harness.resolution.binding.id,
+      size: 1,
+      oldestEnqueuedAt: "2026-01-01T00:00:00.000Z",
+      oldestAgeMs: 0,
+    });
+
+    await waitForDeliveries(harness.deliveries, 2);
+
+    expect(harness.runtime.calls.startTurn.map((call) => call.text)).toEqual(["first", "second"]);
+    expect(harness.deliveries).toEqual([
+      { kind: "final", format: "markdown", text: "first done" },
+      { kind: "final", format: "markdown", text: "second done" },
+    ]);
+    expect(harness.runner.getQueueDiagnostics(harness.resolution.binding.id)).toBeUndefined();
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
+test("turn runner queues permission-producing follow-ups", async () => {
+  const harness = await createHarness({
+    eventBatches: [
+      [{ type: "status", status: "running" }, { type: "final", text: "chat done" }],
+      [
+        { type: "permission_request", id: "opencode-permission-1", summary: "Run bash", details: { action: "bash", resources: ["printf queued"] } },
+        { type: "final", text: "permission done" },
+      ],
+    ],
+    eventDelayMs: 5,
+    observePermissions: true,
+    sendPermissionRequests: true,
+  });
+
+  try {
+    await harness.runner.start({
+      message: inboundMessage({ id: "message-1", text: "Whattup?" }),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    const queued = await harness.runner.start({
+      message: inboundMessage({ id: "message-2", text: "Use bash to run: printf queued" }),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForDeliveries(harness.deliveries, 3);
+
+    expect(queued.status).toBe("queued");
+    expect(harness.runtime.calls.startTurn.map((call) => call.text)).toEqual([
+      "Whattup?",
+      "Use bash to run: printf queued",
+    ]);
+    expect(harness.deliveries).toEqual([
+      { kind: "final", format: "markdown", text: "chat done" },
+      { kind: "status", format: "plain", text: "Permission card: permission-1" },
+      { kind: "final", format: "markdown", text: "permission done" },
+    ]);
+    expect(pendingPermissionRows(harness.database)).toEqual([
+      expect.objectContaining({ id: "permission-1", opencode_permission_id: "opencode-permission-1", status: "pending" }),
     ]);
   } finally {
     await harness.runner.stop();
@@ -474,6 +605,10 @@ test("turn runner renders tool progress for tools verbosity", async () => {
     });
     await waitForDeliveries(harness.deliveries, 3);
 
+    expect(harness.runtime.calls.startTurn[0]).toEqual(expect.objectContaining({
+      mode: "sync",
+      observeProgress: true,
+    }));
     expect(harness.deliveries).toEqual([
       {
         kind: "progress",
@@ -491,13 +626,16 @@ test("turn runner renders tool progress for tools verbosity", async () => {
 
 interface HarnessOptions {
   events?: RuntimeEvent[];
+  eventBatches?: RuntimeEvent[][];
   startTurnError?: Error;
+  neverResolveStartTurn?: boolean;
   abortError?: Error;
   waitForAbort?: boolean;
   neverResolveObserve?: boolean;
   eventDelayMs?: number;
   progressDelayMs?: number;
   runTimeoutMs?: number;
+  startTimeoutMs?: number;
   permissionTtlMs?: number;
   verbosity?: "off" | "compact" | "tools" | "verbose";
   observePermissions?: boolean;
@@ -573,6 +711,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     deliveryReceipts,
     progressDelayMs: options.progressDelayMs,
     runTimeoutMs: options.runTimeoutMs,
+    startTimeoutMs: options.startTimeoutMs,
     permissionTtlMs: options.permissionTtlMs,
     observePermissions: options.observePermissions,
     onPermissionRequest: options.sendPermissionRequests
@@ -619,15 +758,15 @@ function resolved(binding: ConversationBindingRecord, profile: ProfileRecord, ta
   };
 }
 
-function inboundMessage(): InboundMessage {
+function inboundMessage(options: { id?: string; text?: string } = {}): InboundMessage {
   return {
-    id: "message-1",
+    id: options.id ?? "message-1",
     channel: "telegram",
     accountId: "default",
     conversation: { key: conversationKey, type: "dm", id: "123" },
     sender: { id: "123", username: "tiago" },
     timestamp: "2026-01-01T00:00:00.000Z",
-    text: "inspect",
+    text: options.text ?? "inspect",
     attachments: [],
   };
 }
@@ -764,7 +903,9 @@ class FakeRuntime implements AgentRuntime {
   };
 
   private events: RuntimeEvent[];
+  private readonly eventBatches: RuntimeEvent[][] | undefined;
   private readonly startTurnError: Error | undefined;
+  private neverResolveStartTurn: boolean;
   private readonly abortError: Error | undefined;
   private readonly waitForAbort: boolean;
   private neverResolveObserve: boolean;
@@ -772,7 +913,9 @@ class FakeRuntime implements AgentRuntime {
 
   constructor(options: HarnessOptions) {
     this.events = options.events ?? [];
+    this.eventBatches = options.eventBatches;
     this.startTurnError = options.startTurnError;
+    this.neverResolveStartTurn = options.neverResolveStartTurn ?? false;
     this.abortError = options.abortError;
     this.waitForAbort = options.waitForAbort ?? false;
     this.neverResolveObserve = options.neverResolveObserve ?? false;
@@ -800,6 +943,7 @@ class FakeRuntime implements AgentRuntime {
     this.calls.startTurn.push(input);
 
     if (this.startTurnError) throw this.startTurnError;
+    if (this.neverResolveStartTurn) await new Promise<never>(() => undefined);
 
     const handle = {
       id: "message-1",
@@ -834,11 +978,13 @@ class FakeRuntime implements AgentRuntime {
       return;
     }
 
-    for (const [index, event] of this.events.entries()) {
+    const events = this.eventBatches?.[this.calls.observe.length - 1] ?? this.events;
+
+    for (const [index, event] of events.entries()) {
       if (input.signal?.aborted) return;
       yield event;
 
-      if (this.eventDelayMs > 0 && index < this.events.length - 1) {
+      if (this.eventDelayMs > 0 && index < events.length - 1) {
         await Bun.sleep(this.eventDelayMs);
       }
     }
@@ -855,6 +1001,10 @@ class FakeRuntime implements AgentRuntime {
 
   setNeverResolveObserve(neverResolveObserve: boolean): void {
     this.neverResolveObserve = neverResolveObserve;
+  }
+
+  setNeverResolveStartTurn(neverResolveStartTurn: boolean): void {
+    this.neverResolveStartTurn = neverResolveStartTurn;
   }
 
   async respondToPermission(input: PermissionResponseInput): Promise<void> {

@@ -16,6 +16,7 @@ export interface TurnRunnerOptions {
   deliveryReceipts?: DeliveryReceiptRepository;
   progressDelayMs?: number;
   runTimeoutMs?: number;
+  startTimeoutMs?: number;
   permissionTtlMs?: number;
   observePermissions?: boolean;
   onPermissionRequest?(input: TurnRunnerPermissionRequestInput): Promise<void> | void;
@@ -48,6 +49,13 @@ export interface ActiveTurnDiagnostics {
   lastEventAt?: string;
 }
 
+export interface QueueDiagnostics {
+  bindingId: string;
+  size: number;
+  oldestEnqueuedAt?: string;
+  oldestAgeMs?: number;
+}
+
 export interface StartTurnInput {
   message: InboundMessage;
   resolution: ResolvedDispatch;
@@ -57,6 +65,7 @@ export interface StartTurnInput {
 
 export type StartTurnResult =
   | { status: "started"; resolution: ResolvedDispatch; run: RunRecord; handle: RuntimeTurnHandle }
+  | { status: "queued"; resolution: ResolvedDispatch; run: RunRecord; queuedId: string; queueSize: number }
   | { status: "busy"; resolution: ResolvedDispatch; run: RunRecord }
   | { status: "error"; resolution: ResolvedDispatch; run: RunRecord; error: string };
 
@@ -75,6 +84,8 @@ export interface TurnRunner {
   start(input: StartTurnInput): Promise<StartTurnResult>;
   abortActive(input: AbortActiveTurnInput): Promise<AbortActiveTurnResult>;
   getActiveDiagnostics(bindingId: string): ActiveTurnDiagnostics | undefined;
+  getQueueDiagnostics(bindingId: string): QueueDiagnostics | undefined;
+  listQueueDiagnostics(): QueueDiagnostics[];
   stop(): Promise<void>;
 }
 
@@ -95,14 +106,25 @@ interface RecordedPendingPermission {
   notify: boolean;
 }
 
+interface QueuedTurn {
+  id: string;
+  enqueuedAt: string;
+  input: StartTurnInput;
+}
+
 export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
   const { runtime, runs, pendingPermissions, deliveryReceipts } = options;
   const runTimeoutMs = options.runTimeoutMs ?? 5 * 60_000;
+  const startTimeoutMs = options.startTimeoutMs ?? 30_000;
   const permissionTtlMs = options.permissionTtlMs ?? 15 * 60_000;
   const observePermissions = options.observePermissions ?? false;
   const now = options.now ?? (() => new Date());
   const activeByRunId = new Map<string, ActiveObserver>();
   const activeRunIdByBindingId = new Map<string, string>();
+  const queuedByBindingId = new Map<string, QueuedTurn[]>();
+  const drainingBindingIds = new Set<string>();
+  let nextQueuedTurnId = 0;
+  let stopped = false;
 
   function log(level: GatewayLogLevel, message: string, context: GatewayLogContext = {}): void {
     options.log?.(level, message, context);
@@ -110,65 +132,33 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
 
   return {
     async start(input): Promise<StartTurnResult> {
+      stopped = false;
       const { message, resolution } = input;
       const activeRun = runs.getActiveByBindingId(resolution.binding.id);
 
-      if (activeRun) return { status: "busy", resolution, run: activeRun };
+      if (activeRun) {
+        if (resolution.binding.busyMode === "queue") {
+          const queued = enqueueTurn(input);
 
-      const run = runs.create({
-        bindingId: resolution.binding.id,
-        opencodeSessionId: resolution.binding.opencodeSessionId,
-      });
-      const baseContext = runLogContext(message, resolution, run);
-      const plan = createRuntimeTurnPlan(resolution, observePermissions);
+          log("info", "turn queued", {
+            ...runLogContext(message, resolution, activeRun),
+            queuedId: queued.id,
+            queueSize: queueSize(resolution.binding.id),
+          });
 
-      log("info", "turn run created", { ...baseContext, turnPlan: plan });
+          return {
+            status: "queued",
+            resolution,
+            run: activeRun,
+            queuedId: queued.id,
+            queueSize: queueSize(resolution.binding.id),
+          };
+        }
 
-      const controller = new AbortController();
-      const abortFromParent = () => controller.abort();
-
-      input.signal?.addEventListener("abort", abortFromParent, { once: true });
-
-      try {
-        const started = await runtime.startTurn({
-          target: resolution.target,
-          sessionId: resolution.binding.opencodeSessionId,
-          text: message.text,
-          attachments: mapAttachments(message.attachments),
-          agent: resolution.agent,
-          model: resolution.model,
-          metadata: messageMetadata(message),
-          mode: runtimeTurnMode(plan),
-          observePermissions: plan.permissionSource === "events",
-          signal: controller.signal,
-        });
-        const { handle } = started;
-        const runWithMessage = runs.setOpenCodeMessageId(run.id, handle.id) ?? { ...run, opencodeMessageId: handle.id };
-
-        log("info", "turn run accepted", { ...baseContext, opencodeMessageId: handle.id });
-        observeRun({
-          ...input,
-          run: runWithMessage,
-          handle,
-          events: started.events,
-          plan,
-          controller,
-          cleanupParentSignal: () => {
-            input.signal?.removeEventListener("abort", abortFromParent);
-          },
-        });
-
-        return { status: "started", resolution, run: runWithMessage, handle };
-      } catch (error) {
-        input.signal?.removeEventListener("abort", abortFromParent);
-        controller.abort();
-        const messageText = formatError(error);
-        const finishedRun = runs.finishIfActive({ id: run.id, status: "error", error: messageText }) ?? run;
-
-        log("error", "turn run start failed", { ...baseContext, error: messageText });
-
-        return { status: "error", resolution, run: finishedRun, error: messageText };
+        return { status: "busy", resolution, run: activeRun };
       }
+
+      return startNow(input);
     },
 
     async abortActive(input): Promise<AbortActiveTurnResult> {
@@ -210,6 +200,8 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         remoteAbortError,
       });
 
+      await drainQueue(input.binding.id);
+
       return { status: "aborted", run: aborted, remoteAbortError };
     },
 
@@ -231,8 +223,21 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       };
     },
 
+    getQueueDiagnostics(bindingId): QueueDiagnostics | undefined {
+      return queueDiagnostics(bindingId);
+    },
+
+    listQueueDiagnostics(): QueueDiagnostics[] {
+      return [...queuedByBindingId.keys()]
+        .map(queueDiagnostics)
+        .filter((diagnostics): diagnostics is QueueDiagnostics => Boolean(diagnostics));
+    },
+
     async stop(): Promise<void> {
+      stopped = true;
       const observers = [...activeByRunId.values()];
+
+      queuedByBindingId.clear();
 
       for (const observer of observers) {
         observer.controller.abort();
@@ -241,6 +246,153 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       await Promise.allSettled(observers.map((observer) => observer.task));
     },
   };
+
+  async function startNow(input: StartTurnInput): Promise<Exclude<StartTurnResult, { status: "queued" | "busy" }>> {
+    const { message, resolution } = input;
+
+    const run = runs.create({
+      bindingId: resolution.binding.id,
+      opencodeSessionId: resolution.binding.opencodeSessionId,
+    });
+    const baseContext = runLogContext(message, resolution, run);
+    const plan = createRuntimeTurnPlan(resolution, observePermissions);
+
+    log("info", "turn run created", { ...baseContext, turnPlan: plan });
+
+    const controller = new AbortController();
+    const abortFromParent = () => controller.abort();
+
+    input.signal?.addEventListener("abort", abortFromParent, { once: true });
+
+    try {
+      const startTask = runtime.startTurn({
+        target: resolution.target,
+        sessionId: resolution.binding.opencodeSessionId,
+        text: message.text,
+        attachments: mapAttachments(message.attachments),
+        agent: resolution.agent,
+        model: resolution.model,
+          metadata: messageMetadata(message),
+          mode: runtimeTurnMode(plan),
+          observePermissions: plan.permissionSource === "events",
+          observeProgress: plan.progressSource === "events",
+          signal: controller.signal,
+        });
+      const started = await withStartTimeout(startTask, startTimeoutMs, () => {
+        controller.abort();
+      });
+      const { handle } = started;
+      const runWithMessage = runs.setOpenCodeMessageId(run.id, handle.id) ?? { ...run, opencodeMessageId: handle.id };
+
+      log("info", "turn run accepted", { ...baseContext, opencodeMessageId: handle.id });
+      observeRun({
+        ...input,
+        run: runWithMessage,
+        handle,
+        events: started.events,
+        plan,
+        controller,
+        cleanupParentSignal: () => {
+          input.signal?.removeEventListener("abort", abortFromParent);
+        },
+      });
+
+      return { status: "started", resolution, run: runWithMessage, handle };
+    } catch (error) {
+      input.signal?.removeEventListener("abort", abortFromParent);
+      controller.abort();
+      const messageText = formatError(error);
+      const finishedRun = runs.finishIfActive({ id: run.id, status: "error", error: messageText }) ?? run;
+
+      log("error", "turn run start failed", { ...baseContext, error: messageText });
+
+      return { status: "error", resolution, run: finishedRun, error: messageText };
+    }
+  }
+
+  function enqueueTurn(input: StartTurnInput): QueuedTurn {
+    const queued: QueuedTurn = {
+      id: `queued-${(nextQueuedTurnId += 1)}`,
+      enqueuedAt: now().toISOString(),
+      input,
+    };
+    const bindingId = input.resolution.binding.id;
+    const queue = queuedByBindingId.get(bindingId) ?? [];
+
+    queue.push(queued);
+    queuedByBindingId.set(bindingId, queue);
+
+    return queued;
+  }
+
+  async function drainQueue(bindingId: string): Promise<void> {
+    if (stopped) return;
+    if (drainingBindingIds.has(bindingId)) return;
+
+    drainingBindingIds.add(bindingId);
+
+    try {
+      while (!stopped && !runs.getActiveByBindingId(bindingId)) {
+        const queued = dequeueTurn(bindingId);
+        if (!queued) return;
+        if (queued.input.signal?.aborted) continue;
+
+        log("info", "queued turn starting", {
+          ...messageLogContext(queued.input.message, queued.input.resolution),
+          queuedId: queued.id,
+          queueSize: queueSize(bindingId),
+        });
+
+        const result = await startNow(queued.input);
+
+        if (result.status === "started") return;
+
+        await deliverQueuedStartError(queued, result.error);
+      }
+    } finally {
+      drainingBindingIds.delete(bindingId);
+    }
+  }
+
+  function dequeueTurn(bindingId: string): QueuedTurn | undefined {
+    const queue = queuedByBindingId.get(bindingId);
+    if (!queue) return undefined;
+
+    const queued = queue.shift();
+    if (queue.length === 0) queuedByBindingId.delete(bindingId);
+
+    return queued;
+  }
+
+  async function deliverQueuedStartError(queued: QueuedTurn, error: string): Promise<void> {
+    try {
+      await queued.input.delivery.send({ kind: "error", format: "plain", text: `OpenCode error: ${error}` });
+    } catch (deliveryError) {
+      log("error", "queued turn start error delivery failed", {
+        ...messageLogContext(queued.input.message, queued.input.resolution),
+        queuedId: queued.id,
+        error: formatError(deliveryError),
+      });
+    }
+  }
+
+  function queueSize(bindingId: string): number {
+    return queuedByBindingId.get(bindingId)?.length ?? 0;
+  }
+
+  function queueDiagnostics(bindingId: string): QueueDiagnostics | undefined {
+    const queue = queuedByBindingId.get(bindingId);
+    if (!queue || queue.length === 0) return undefined;
+
+    const oldest = queue[0];
+
+    return {
+      bindingId,
+      size: queue.length,
+      oldestEnqueuedAt: oldest?.enqueuedAt,
+      oldestAgeMs: oldest ? Math.max(now().getTime() - Date.parse(oldest.enqueuedAt), 0) : undefined,
+    };
+  }
 
   function observeRun(
     input: StartTurnInput & {
@@ -268,7 +420,10 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       task: Promise.resolve(),
     };
 
-    const task = runObserver(input, input.controller.signal).finally(() => observer.cleanup());
+    const task = runObserver(input, input.controller.signal).finally(async () => {
+      observer.cleanup();
+      await drainQueue(input.resolution.binding.id);
+    });
     observer.task = task;
     activeByRunId.set(input.run.id, observer);
     activeRunIdByBindingId.set(input.resolution.binding.id, input.run.id);
@@ -564,6 +719,13 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
 
 function runLogContext(message: InboundMessage, resolution: ResolvedDispatch, run: RunRecord): GatewayLogContext {
   return {
+    ...messageLogContext(message, resolution),
+    runId: run.id,
+  };
+}
+
+function messageLogContext(message: InboundMessage, resolution: ResolvedDispatch): GatewayLogContext {
+  return {
     source: "channel",
     channel: message.channel,
     accountId: message.accountId,
@@ -571,7 +733,6 @@ function runLogContext(message: InboundMessage, resolution: ResolvedDispatch, ru
     profileId: resolution.profile.id,
     targetId: resolution.target.id,
     sessionId: resolution.binding.opencodeSessionId,
-    runId: run.id,
   };
 }
 
@@ -598,7 +759,7 @@ function createRuntimeTurnPlan(resolution: ResolvedDispatch, observePermissions:
   const observesProgress = resolution.binding.verbosity === "tools" || resolution.binding.verbosity === "verbose";
 
   return {
-    finalSource: observesProgress ? "events" : "prompt",
+    finalSource: "prompt",
     progressSource: observesProgress ? "events" : "none",
     permissionSource: observePermissions ? "events" : "none",
   };
@@ -606,6 +767,24 @@ function createRuntimeTurnPlan(resolution: ResolvedDispatch, observePermissions:
 
 function runtimeTurnMode(plan: RuntimeTurnPlan): "sync" | "async" {
   return plan.finalSource === "events" ? "async" : "sync";
+}
+
+async function withStartTimeout<T>(task: Promise<T>, timeoutMs: number, onTimeout: () => void): Promise<T> {
+  if (timeoutMs <= 0) return task;
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutTask = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      onTimeout();
+      reject(new Error(`OpenCode did not accept the turn within ${timeoutMs}ms.`));
+    }, timeoutMs);
+  });
+
+  task.catch(() => undefined);
+
+  return Promise.race([task, timeoutTask]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
 }
 
 function formatError(error: unknown): string {

@@ -199,21 +199,48 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
 }
 
 function progressLine(event: RuntimeEvent, verbosity: Verbosity): string | undefined {
-  if (verbosity === "off" || verbosity === "compact") return undefined;
+  switch (verbosity) {
+    case "off":
+    case "compact":
+      return undefined;
+    case "tools":
+      return toolProgressLine(event);
+    case "verbose":
+      return verboseProgressLine(event);
+  }
+}
 
+function toolProgressLine(event: RuntimeEvent): string | undefined {
   switch (event.type) {
     case "tool_start":
-      return `Tool ${toolLabel(event, verbosity)} started${summarySuffix(event.summary)}`;
+      return `Tool ${event.name} started${summarySuffix(event.summary)}`;
     case "tool_end":
-      return `Tool ${toolLabel(event, verbosity)} ${event.ok ? "completed" : "failed"}${summarySuffix(event.summary)}`;
-    case "tool_update":
-      return verbosity === "verbose" ? `Tool ${toolLabel(event, verbosity)} updated${summarySuffix(event.summary)}` : undefined;
+      return `Tool ${event.name} ${event.ok ? "completed" : "failed"}${summarySuffix(event.summary)}`;
     case "status":
-      return verbosity === "verbose" ? `Status: ${event.status}` : undefined;
+    case "tool_update":
     case "permission_request":
-      return verbosity === "verbose" ? `Permission requested (${event.id}): ${event.summary}` : undefined;
     case "question_request":
-      return verbosity === "verbose" ? `Question requested (${event.id}): ${event.prompt}` : undefined;
+    case "text_delta":
+    case "final":
+    case "error":
+      return undefined;
+  }
+}
+
+function verboseProgressLine(event: RuntimeEvent): string | undefined {
+  switch (event.type) {
+    case "status":
+      return `Status: ${event.status}`;
+    case "tool_start":
+      return `Tool ${toolLabel(event)} started${summarySuffix(event.summary)}`;
+    case "tool_update":
+      return `Tool ${toolLabel(event)} updated${summarySuffix(event.summary)}`;
+    case "tool_end":
+      return `Tool ${toolLabel(event)} ${event.ok ? "completed" : "failed"}${summarySuffix(event.summary)}`;
+    case "permission_request":
+      return `Permission requested (${event.id}): ${event.summary}`;
+    case "question_request":
+      return `Question requested (${event.id}): ${event.prompt}`;
     case "text_delta":
     case "final":
     case "error":
@@ -227,6 +254,6 @@ function summarySuffix(summary: string | undefined): string {
   return trimmed ? `: ${trimmed}` : "";
 }
 
-function toolLabel(event: { id: string; name: string }, verbosity: Verbosity): string {
-  return verbosity === "verbose" ? `${event.name} (${event.id})` : event.name;
+function toolLabel(event: { id: string; name: string }): string {
+  return `${event.name} (${event.id})`;
 }

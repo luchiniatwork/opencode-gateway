@@ -25,6 +25,12 @@ export interface GatewayRuntimeHealthSnapshot {
     opencodeMessageId?: string;
     startedAt: string;
   }>;
+  queuedTurns: Array<{
+    bindingId: string;
+    size: number;
+    oldestEnqueuedAt?: string;
+    oldestAgeMs?: number;
+  }>;
   pendingPermissions: Array<{
     id: string;
     runId: string;

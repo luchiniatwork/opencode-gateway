@@ -211,6 +211,49 @@ test("startTurn sync path can observe permission requests while waiting for fina
   expect(sdk.calls.promptAsync).toEqual([]);
 });
 
+test("startTurn sync path can observe tool progress while final comes from prompt", async () => {
+  const sdk = createFakeSdkClient({
+    promptDelayMs: 10,
+    prompt: {
+      info: { id: "assistant-sync", sessionID: "session-1", role: "assistant", finish: "stop" },
+      parts: [{ type: "text", text: "Sync final" }],
+    },
+    events: [
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "tool-part-1",
+            sessionID: "session-1",
+            messageID: "assistant-sync",
+            type: "tool",
+            callID: "call-1",
+            tool: "bash",
+            state: { status: "running", title: "Run command" },
+          },
+        },
+      },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, observeReconcileIntervalMs: 1 });
+
+  const turn = await runtime.startTurn({
+    target: attachTarget,
+    sessionId: "session-1",
+    text: "Use bash",
+    mode: "sync",
+    observeProgress: true,
+  });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([
+    { type: "tool_start", id: "call-1", name: "bash", summary: "Run command" },
+    { type: "final", text: "Sync final", costUsd: undefined, tokens: undefined },
+  ]);
+  expect(sdk.calls.prompt).toHaveLength(1);
+  expect(sdk.calls.promptAsync).toEqual([]);
+});
+
 test("starts observing events before sending an async prompt", async () => {
   let eventStreamStarted = false;
   const sdk = createFakeSdkClient({
@@ -234,6 +277,72 @@ test("starts observing events before sending an async prompt", async () => {
   expect(turn.handle.id).toMatch(/^msg_[0-9a-f]{32}$/);
   expect(sdk.calls.subscribe).toEqual([{ query: { directory: "/work/repo" }, signal: undefined }]);
   expect(sdk.calls.promptAsync).toHaveLength(1);
+});
+
+test("startTurn returns permission events while async prompt is still pending", async () => {
+  const sdk = createFakeSdkClient({ neverEndEvents: true, promptAsyncNeverResolve: true });
+  const fetch = createFakeFetch((url) => {
+    if (url.pathname === "/api/session/session-1/permission/request") {
+      return jsonResponse({
+        data: [{ id: "permission-pending-1", sessionID: "session-1", action: "bash", resources: ["printf pending"] }],
+      });
+    }
+
+    return new Response("not found", { status: 404 });
+  });
+  const runtime = new OpenCodeRuntime({
+    createClient: () => sdk.client,
+    fetch: fetch.fetch,
+    permissionPollIntervalMs: 1,
+  });
+  const controller = new AbortController();
+
+  const turn = await runtime.startTurn({ target: attachTarget, sessionId: "session-1", text: "Needs permission", signal: controller.signal });
+  const iterator = turn.events[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  controller.abort();
+  await iterator.return?.();
+
+  expect(sdk.calls.promptAsync).toHaveLength(1);
+  expect(first.value).toEqual(expect.objectContaining({ type: "permission_request", id: "permission-pending-1" }));
+});
+
+test("observe errors when OpenCode is idle after accepting a user prompt without an assistant", async () => {
+  const sdk = createFakeSdkClient({
+    neverEndEvents: true,
+    messages: [
+      {
+        info: { id: "message-user", sessionID: "session-1", role: "user" },
+        parts: [{ type: "text", text: "What can you do?" }],
+      },
+    ],
+  });
+  const fetch = createFakeFetch((url) => {
+    if (url.pathname === "/session/status") return jsonResponse({});
+
+    return new Response("not found", { status: 404 });
+  });
+  const runtime = new OpenCodeRuntime({
+    createClient: () => sdk.client,
+    fetch: fetch.fetch,
+    observeReconcileIntervalMs: 1,
+    observeReconcileTimeoutMs: 20,
+    permissionPollIntervalMs: 0,
+    idleNoAssistantGraceMs: 1,
+  });
+
+  const iterator = runtime.observe({ target: attachTarget, sessionId: "session-1", turnId: "message-user" })[Symbol.asyncIterator]();
+  const first = await iterator.next();
+
+  expect(first).toEqual({
+    done: false,
+    value: {
+      type: "error",
+      message: "OpenCode accepted prompt message-user but is idle without an assistant response.",
+      retryable: true,
+    },
+  });
+  expect(fetch.calls.map((call) => call.url.pathname)).toContain("/session/status");
 });
 
 test("startTurn reconciles final response when OpenCode uses a different user message id", async () => {
@@ -826,6 +935,117 @@ test("observes permission requests without leaking raw SDK payloads", async () =
   ]);
 });
 
+test("observes v2 permission request events", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "permission.v2.asked",
+        properties: {
+          id: "permission-v2-1",
+          sessionID: "session-1",
+          action: "bash",
+          resources: ["printf hello"],
+          source: { type: "tool", messageID: "assistant-1", callID: "call-1" },
+          metadata: { tool: "bash" },
+        },
+      },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const events = await collectRuntimeEvents(runtime.observe({ target: attachTarget, sessionId: "session-1" }));
+
+  expect(events).toEqual([
+    {
+      type: "permission_request",
+      id: "permission-v2-1",
+      summary: "bash",
+      details: {
+        eventType: "permission.v2.asked",
+        type: "tool",
+        action: "bash",
+        resources: ["printf hello"],
+        messageID: "assistant-1",
+        callID: "call-1",
+        metadata: { tool: "bash" },
+      },
+    },
+  ]);
+});
+
+test("polls pending permissions when event stream misses them", async () => {
+  const sdk = createFakeSdkClient({ neverEndEvents: true });
+  const fetch = createFakeFetch((url) => {
+    if (url.pathname === "/api/session/session-1/permission/request") {
+      return jsonResponse({
+        data: [
+          {
+            id: "permission-polled-1",
+            sessionID: "session-1",
+            action: "bash",
+            resources: ["printf polled"],
+            source: { type: "tool", messageID: "assistant-1", callID: "call-1" },
+          },
+        ],
+      });
+    }
+
+    return new Response("not found", { status: 404 });
+  });
+  const runtime = new OpenCodeRuntime({
+    createClient: () => sdk.client,
+    fetch: fetch.fetch,
+    permissionPollIntervalMs: 1,
+  });
+  const controller = new AbortController();
+  const iterator = runtime.observe({ target: attachTarget, sessionId: "session-1", signal: controller.signal })[Symbol.asyncIterator]();
+
+  const first = await iterator.next();
+  controller.abort();
+  await iterator.return?.();
+
+  expect(first).toEqual({
+    done: false,
+    value: expect.objectContaining({ type: "permission_request", id: "permission-polled-1" }),
+  });
+  expect(fetch.calls.map((call) => call.url.pathname)).toContain("/api/session/session-1/permission/request");
+});
+
+test("polls legacy pending permission requests", async () => {
+  const sdk = createFakeSdkClient({ neverEndEvents: true });
+  const fetch = createFakeFetch((url) => {
+    if (url.pathname === "/permission") {
+      return jsonResponse([
+        {
+          id: "permission-legacy-1",
+          sessionID: "session-1",
+          permission: "bash",
+          patterns: ["printf legacy"],
+          metadata: { tool: "bash" },
+          always: [],
+          tool: { messageID: "assistant-1", callID: "call-1" },
+        },
+      ]);
+    }
+
+    return new Response("not found", { status: 404 });
+  });
+  const runtime = new OpenCodeRuntime({
+    createClient: () => sdk.client,
+    fetch: fetch.fetch,
+    permissionPollIntervalMs: 1,
+  });
+  const controller = new AbortController();
+  const iterator = runtime.observe({ target: attachTarget, sessionId: "session-1", signal: controller.signal })[Symbol.asyncIterator]();
+
+  const first = await iterator.next();
+  controller.abort();
+  await iterator.return?.();
+
+  expect(first.value).toEqual(expect.objectContaining({ type: "permission_request", id: "permission-legacy-1", summary: "bash" }));
+  expect(fetch.calls.map((call) => call.url.pathname)).toContain("/permission");
+});
+
 test("observe does not fail idle events while a permission request is pending", async () => {
   const sdk = createFakeSdkClient({
     events: [
@@ -1220,7 +1440,8 @@ test("aborts a session", async () => {
 
 test("responds to permissions with once always and reject mappings", async () => {
   const sdk = createFakeSdkClient();
-  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+  const fetch = createFakeFetch(() => new Response("not found", { status: 404 }));
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, fetch: fetch.fetch });
 
   await runtime.respondToPermission({
     target: attachTarget,
@@ -1258,6 +1479,57 @@ test("responds to permissions with once always and reject mappings", async () =>
       body: { response: "reject" },
     },
   ]);
+});
+
+test("responds to permissions through modern endpoints before deprecated SDK fallback", async () => {
+  const sdk = createFakeSdkClient();
+  const fetch = createFakeFetch((url) => {
+    if (url.pathname === "/api/session/session-1/permission/request/permission-1/reply") {
+      return jsonResponse({ ok: true });
+    }
+
+    return new Response("not found", { status: 404 });
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, fetch: fetch.fetch });
+
+  await runtime.respondToPermission({
+    target: attachTarget,
+    sessionId: "session-1",
+    permissionId: "permission-1",
+    decision: "approve",
+  });
+
+  expect(fetch.calls).toEqual([
+    expect.objectContaining({
+      url: expect.objectContaining({ pathname: "/api/session/session-1/permission/request/permission-1/reply" }),
+      body: { reply: "once" },
+    }),
+  ]);
+  expect(sdk.calls.respondToPermission).toEqual([]);
+});
+
+test("falls back to global permission reply endpoint before deprecated SDK fallback", async () => {
+  const sdk = createFakeSdkClient();
+  const fetch = createFakeFetch((url) => {
+    if (url.pathname === "/permission/permission-1/reply") return jsonResponse({ ok: true });
+
+    return new Response("not found", { status: 404 });
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client, fetch: fetch.fetch });
+
+  await runtime.respondToPermission({
+    target: attachTarget,
+    sessionId: "session-1",
+    permissionId: "permission-1",
+    decision: "deny",
+  });
+
+  expect(fetch.calls.map((call) => call.url.pathname)).toEqual([
+    "/api/session/session-1/permission/request/permission-1/reply",
+    "/permission/permission-1/reply",
+  ]);
+  expect(fetch.calls[1]?.body).toEqual({ reply: "reject" });
+  expect(sdk.calls.respondToPermission).toEqual([]);
 });
 
 test("lists sessions sorted by updated time and applies limit", async () => {
@@ -1317,12 +1589,14 @@ interface FakeSdkOptions {
   prompt?: FakePromptResponse;
   promptDelayMs?: number;
   promptAsyncError?: unknown;
+  promptAsyncNeverResolve?: boolean;
   messages?: FakePromptResponse[];
   messageSnapshots?: FakePromptResponse[][];
   events?: unknown[];
   eventSubscribeError?: unknown;
   eventStreamError?: unknown;
   eventDelayMs?: number;
+  neverEndEvents?: boolean;
   hangMessagesAfterCall?: number;
   onEventStreamStarted?: () => void;
   onPromptAsync?: () => void | Promise<void>;
@@ -1413,6 +1687,7 @@ function createFakeSdkClient(options: FakeSdkOptions = {}) {
         async promptAsync(input: unknown) {
           calls.promptAsync.push(input);
           await options.onPromptAsync?.();
+          if (options.promptAsyncNeverResolve) await new Promise<never>(() => undefined);
           if (options.promptAsyncError) return { error: options.promptAsyncError };
           return { data: undefined };
         },
@@ -1425,11 +1700,39 @@ function createFakeSdkClient(options: FakeSdkOptions = {}) {
         async subscribe(input: unknown) {
           calls.subscribe.push(input);
           if (options.eventSubscribeError) throw options.eventSubscribeError;
+          if (options.neverEndEvents) return { stream: createNeverEndingEventStream(options.onEventStreamStarted) };
           return { stream: createEventStream(responses.events, options.eventStreamError, options.onEventStreamStarted, options.eventDelayMs) };
         },
       },
     },
   };
+}
+
+interface FakeFetchCall {
+  url: URL;
+  init?: RequestInit;
+  body?: unknown;
+}
+
+function createFakeFetch(handler: (url: URL, init?: RequestInit) => Response | Promise<Response>) {
+  const calls: FakeFetchCall[] = [];
+  const fakeFetch = async (input: string | URL, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === "string" ? new URL(input) : input;
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) as unknown : undefined;
+
+    calls.push({ url, init, body });
+    return handler(url, init);
+  };
+
+  return { calls, fetch: fakeFetch };
+}
+
+function jsonResponse(value: unknown, init?: ResponseInit): Response {
+  return new Response(JSON.stringify(value), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+    ...init,
+  });
 }
 
 async function collectRuntimeEvents(events: AsyncIterable<RuntimeEvent>): Promise<RuntimeEvent[]> {
@@ -1451,6 +1754,28 @@ async function* createEventStream(events: unknown[], error?: unknown, onStarted?
   }
 
   if (error) throw error;
+}
+
+function createNeverEndingEventStream(onStarted?: () => void): AsyncIterable<unknown> {
+  let started = false;
+
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          if (!started) {
+            started = true;
+            onStarted?.();
+          }
+
+          return new Promise<IteratorResult<unknown>>(() => undefined);
+        },
+        return() {
+          return Promise.resolve({ done: true, value: undefined });
+        },
+      };
+    },
+  };
 }
 
 function sleep(ms: number): Promise<void> {

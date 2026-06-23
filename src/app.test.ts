@@ -328,6 +328,44 @@ test("gateway app accepts a second message after the first turn completes", asyn
   }
 });
 
+test("gateway app queues a second message while the first turn is active", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new QueueRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    const firstEmit = channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await runtime.firstSendStarted;
+
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await waitForSent(channel, 1);
+
+    expect(channel.sent[0]?.message.text).toContain("Queued behind active run");
+
+    runtime.finishFirstSend();
+    await firstEmit;
+    await waitForSent(channel, 3);
+
+    expect(runtime.calls.startTurn.map((call) => call.text)).toEqual(["first", "second"]);
+    expect(channel.sent.map((entry) => entry.message.text)).toEqual([
+      expect.stringContaining("Queued behind active run"),
+      "answer-1",
+      "answer-2",
+    ]);
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("gateway app accepts a second message after a timed-out turn", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
@@ -1052,6 +1090,39 @@ class StuckThenFinalRuntime extends FakeRuntime {
     await new Promise<void>((resolve) => {
       signal?.addEventListener("abort", () => resolve(), { once: true });
     });
+  }
+}
+
+class QueueRuntime extends FakeRuntime {
+  private resolveFirstSendStarted: (() => void) | undefined;
+  private resolveFirstSend: (() => void) | undefined;
+
+  readonly firstSendStarted = new Promise<void>((resolve) => {
+    this.resolveFirstSendStarted = resolve;
+  });
+  private readonly firstSendFinished = new Promise<void>((resolve) => {
+    this.resolveFirstSend = resolve;
+  });
+
+  override async send(input: SendRuntimeMessageInput): Promise<RuntimeTurn> {
+    this.calls.send.push(input);
+    const messageNumber = this.calls.send.length;
+
+    if (messageNumber === 1) {
+      this.resolveFirstSendStarted?.();
+      await this.firstSendFinished;
+    }
+
+    return {
+      id: `message-${messageNumber}`,
+      sessionId: input.sessionId,
+      status: "completed",
+      text: `answer-${messageNumber}`,
+    };
+  }
+
+  finishFirstSend(): void {
+    this.resolveFirstSend?.();
   }
 }
 

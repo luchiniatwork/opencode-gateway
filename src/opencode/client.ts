@@ -22,6 +22,8 @@ type SdkFieldsResult<T> = { data: T; error?: undefined } | { data?: undefined; e
 
 type SdkResult<T> = SdkFieldsResult<T> | T | undefined;
 
+type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+
 interface SdkSession {
   id: string;
   title?: string;
@@ -116,20 +118,26 @@ interface ObserveState {
   pendingPermissionIds: Set<string>;
   textPartsByMessageId: Map<string, Map<string, string>>;
   toolStatusesByCallId: Map<string, string>;
+  idleNoAssistantSinceMs?: number;
   pendingFinal?: Extract<RuntimeEvent, { type: "final" }>;
   pendingFinalMessageId?: string;
 }
 
 interface OpenCodeRuntimeOptions {
   createClient?: (target: RuntimeTarget) => OpenCodeSdkClient;
+  fetch?: FetchLike;
   finalResponseTimeoutMs?: number;
   finalResponsePollIntervalMs?: number;
   observeReconcileIntervalMs?: number;
   observeReconcileTimeoutMs?: number;
+  permissionPollIntervalMs?: number;
+  idleNoAssistantGraceMs?: number;
 }
 
 const DEFAULT_OBSERVE_RECONCILE_INTERVAL_MS = 1_000;
 const DEFAULT_OBSERVE_RECONCILE_TIMEOUT_MS = 750;
+const DEFAULT_PERMISSION_POLL_INTERVAL_MS = 1_000;
+const DEFAULT_IDLE_NO_ASSISTANT_GRACE_MS = 5_000;
 
 export class OpenCodeRuntimeError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -380,6 +388,7 @@ function normalizePermissionRequest(
   if (!id) return noEvents();
 
   state.pendingPermissionIds.add(id);
+  const source = getObject(properties, "source") ?? getObject(properties, "tool");
 
   return {
     events: [
@@ -389,15 +398,15 @@ function normalizePermissionRequest(
         summary: permissionSummary(properties),
         details: compactObject({
           eventType,
-          type: getObjectString(properties, "type"),
+          type: getObjectString(properties, "type") ?? getObjectString(source, "type"),
           permission: getObjectString(properties, "permission"),
           resource: properties.resource,
           pattern: properties.pattern,
           patterns: properties.patterns,
           action: getObjectString(properties, "action"),
           resources: properties.resources,
-          messageID: getObjectString(properties, "messageID"),
-          callID: getObjectString(properties, "callID"),
+          messageID: getObjectString(properties, "messageID") ?? getObjectString(source, "messageID"),
+          callID: getObjectString(properties, "callID") ?? getObjectString(source, "callID"),
           metadata: properties.metadata,
         }),
       },
@@ -412,7 +421,7 @@ function normalizePermissionReplied(
 ): { events: RuntimeEvent[]; terminal: boolean } {
   if (!matchesSession(properties, state)) return noEvents();
 
-  const id = getObjectString(properties, "id") ?? getObjectString(properties, "requestID");
+  const id = getObjectString(properties, "id") ?? getObjectString(properties, "requestID") ?? getObjectString(properties, "permissionID");
   if (id) state.pendingPermissionIds.delete(id);
 
   return noEvents();
@@ -565,15 +574,19 @@ interface ObservedEventPumpInput {
   client: OpenCodeSdkClient;
   target: RuntimeTarget;
   state: ObserveState;
+  fetch: FetchLike;
   signal?: AbortSignal;
   initialBackfill?: boolean;
   reconcileIntervalMs: number;
   reconcileTimeoutMs: number;
+  permissionPollIntervalMs: number;
+  idleNoAssistantGraceMs: number;
 }
 
 interface ObservedEventPump {
   events: AsyncIterable<RuntimeEvent>;
   ready: Promise<void>;
+  push(event: RuntimeEvent): void;
   cancel(): Promise<void>;
 }
 
@@ -587,10 +600,12 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
   const queue = new RuntimeEventQueue(closeOnce);
 
   void pump();
+  void pollPermissions();
 
   return {
     events: queue,
     ready,
+    push: (event) => queue.push(event),
     cancel: () => queue.cancel(),
   };
 
@@ -642,6 +657,14 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
             return;
           }
 
+          const idleError = await idleNoAssistantError();
+
+          if (idleError) {
+            queue.push(idleError);
+            queue.end();
+            return;
+          }
+
           continue;
         }
 
@@ -674,6 +697,20 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
     } finally {
       markReady();
       await closeOnce();
+    }
+  }
+
+  async function pollPermissions(): Promise<void> {
+    if (input.permissionPollIntervalMs <= 0) return;
+
+    while (!closed && !input.signal?.aborted) {
+      await sleep(input.permissionPollIntervalMs);
+      if (closed || input.signal?.aborted) return;
+
+      const events = await pollPendingPermissionEvents(input.fetch, input.target, input.state).catch(() => []);
+      for (const event of events) {
+        queue.push(event);
+      }
     }
   }
 
@@ -726,39 +763,203 @@ function startObservedEventPump(input: ObservedEventPumpInput): ObservedEventPum
       input.state,
     ), input.reconcileTimeoutMs);
   }
+
+  async function idleNoAssistantError(): Promise<Extract<RuntimeEvent, { type: "error" }> | undefined> {
+    if (!input.state.turnId || input.state.pendingPermissionIds.size > 0) return undefined;
+
+    const detected = await promiseWithTimeout(detectIdleWithoutAssistant(
+      input.fetch,
+      input.client,
+      input.target,
+      input.state.sessionId,
+      input.state.turnId,
+      input.state,
+      input.idleNoAssistantGraceMs,
+    ), input.reconcileTimeoutMs);
+
+    return detected;
+  }
 }
 
 function noEvents(): { events: RuntimeEvent[]; terminal: boolean } {
   return { events: [], terminal: false };
 }
 
-async function forwardPermissionEvents(
+async function pollPendingPermissionEvents(
+  fetchImpl: FetchLike,
+  target: RuntimeTarget,
+  state: ObserveState,
+): Promise<Array<Extract<RuntimeEvent, { type: "permission_request" }>>> {
+  const requests = [
+    ...(await fetchPermissionList(fetchImpl, target, `/api/session/${encodeURIComponent(state.sessionId)}/permission/request`, false)),
+    ...(await fetchPermissionList(fetchImpl, target, "/permission", true)),
+  ];
+  const events: Array<Extract<RuntimeEvent, { type: "permission_request" }>> = [];
+
+  for (const request of requests) {
+    const event = normalizePolledPermissionRequest(request, state);
+    if (event) events.push(event);
+  }
+
+  return events;
+}
+
+async function detectIdleWithoutAssistant(
+  fetchImpl: FetchLike,
+  client: OpenCodeSdkClient,
+  target: RuntimeTarget,
+  sessionId: string,
+  turnId: string,
+  state: ObserveState,
+  graceMs: number,
+): Promise<Extract<RuntimeEvent, { type: "error" }> | undefined> {
+  const messages = await listMessages(client, target, sessionId).catch(() => []);
+  if (!messages.some((message) => message.info?.role === "user" && message.info.id === turnId)) {
+    state.idleNoAssistantSinceMs = undefined;
+    return undefined;
+  }
+
+  if (messages.some((message) => message.info?.role === "assistant" && messageBelongsToObservedTurn(message.info.id, message.info.parentID, state))) {
+    state.idleNoAssistantSinceMs = undefined;
+    return undefined;
+  }
+
+  const idle = await isSessionIdle(fetchImpl, target, sessionId);
+  if (!idle) {
+    state.idleNoAssistantSinceMs = undefined;
+    return undefined;
+  }
+
+  const nowMs = Date.now();
+  state.idleNoAssistantSinceMs ??= nowMs;
+  if (nowMs - state.idleNoAssistantSinceMs < graceMs) return undefined;
+
+  return {
+    type: "error",
+    message: `OpenCode accepted prompt ${turnId} but is idle without an assistant response.`,
+    retryable: true,
+  };
+}
+
+async function isSessionIdle(fetchImpl: FetchLike, target: RuntimeTarget, sessionId: string): Promise<boolean | undefined> {
+  const url = targetApiUrl(target, "/session/status");
+  if (!url) return undefined;
+
+  if (target.workdir) url.searchParams.set("directory", target.workdir);
+
+  const response = await fetchImpl(url);
+  if (!response.ok) return undefined;
+
+  const body = asObject(await response.json().catch(() => undefined));
+  const status = asObject(body?.[sessionId]);
+  const type = status ? getObjectString(status, "type") : undefined;
+
+  return type === undefined || type === "idle";
+}
+
+async function fetchPermissionList(
+  fetchImpl: FetchLike,
+  target: RuntimeTarget,
+  path: string,
+  includeDirectory: boolean,
+): Promise<unknown[]> {
+  const url = targetApiUrl(target, path);
+  if (!url) return [];
+
+  if (includeDirectory && target.workdir) {
+    url.searchParams.set("directory", target.workdir);
+  }
+
+  const response = await fetchImpl(url);
+  if (!response.ok) return [];
+
+  const body = await response.json().catch(() => undefined);
+  if (Array.isArray(body)) return body;
+
+  const record = asObject(body);
+  const data = record?.data;
+  return Array.isArray(data) ? data : [];
+}
+
+function normalizePolledPermissionRequest(
+  value: unknown,
+  state: ObserveState,
+): Extract<RuntimeEvent, { type: "permission_request" }> | undefined {
+  const request = asObject(value);
+  if (!request) return undefined;
+
+  const sessionId = getObjectString(request, "sessionID");
+  if (sessionId !== state.sessionId) return undefined;
+
+  const id = getObjectString(request, "id") ?? getObjectString(request, "requestID");
+  if (!id || state.pendingPermissionIds.has(id)) return undefined;
+
+  const source = getObject(request, "source") ?? getObject(request, "tool");
+  const action = getObjectString(request, "action");
+  const permission = getObjectString(request, "permission");
+  state.pendingPermissionIds.add(id);
+
+  return {
+    type: "permission_request",
+    id,
+    summary: getObjectString(request, "title") ?? permission ?? action ?? "OpenCode permission request",
+    details: compactObject({
+      eventType: "permission.poll",
+      type: getObjectString(source, "type"),
+      permission,
+      action,
+      resources: request.resources,
+      resource: request.resource,
+      patterns: request.patterns,
+      pattern: request.pattern,
+      save: request.save,
+      always: request.always,
+      messageID: getObjectString(source, "messageID"),
+      callID: getObjectString(source, "callID"),
+      metadata: request.metadata,
+    }),
+  };
+}
+
+async function forwardSideChannelEvents(
   events: AsyncIterable<RuntimeEvent>,
   queue: RuntimeEventQueue,
+  options: { progress: boolean; permissions: boolean },
   signal?: AbortSignal,
 ): Promise<void> {
   for await (const event of events) {
     if (signal?.aborted) return;
-    if (event.type === "permission_request") queue.push(event);
+    if (options.permissions && event.type === "permission_request") queue.push(event);
+    if (options.progress && isProgressEvent(event)) queue.push(event);
   }
+}
+
+function isProgressEvent(event: RuntimeEvent): boolean {
+  return event.type === "tool_start" || event.type === "tool_update" || event.type === "tool_end" || event.type === "status";
 }
 
 export class OpenCodeRuntime implements AgentRuntime {
   private readonly createClient: (target: RuntimeTarget) => OpenCodeSdkClient;
+  private readonly fetch: FetchLike;
   private readonly finalResponseTimeoutMs: number;
   private readonly finalResponsePollIntervalMs: number;
   private readonly observeReconcileIntervalMs: number;
   private readonly observeReconcileTimeoutMs: number;
+  private readonly permissionPollIntervalMs: number;
+  private readonly idleNoAssistantGraceMs: number;
   private readonly clients = new Map<string, OpenCodeSdkClient>();
 
   constructor(options: OpenCodeRuntimeOptions = {}) {
     this.createClient =
       options.createClient ??
       ((target) => createOpencodeClient({ baseUrl: target.serverUrl }) as OpenCodeSdkClient);
+    this.fetch = options.fetch ?? fetch;
     this.finalResponseTimeoutMs = options.finalResponseTimeoutMs ?? 60_000;
     this.finalResponsePollIntervalMs = options.finalResponsePollIntervalMs ?? 1_000;
     this.observeReconcileIntervalMs = options.observeReconcileIntervalMs ?? DEFAULT_OBSERVE_RECONCILE_INTERVAL_MS;
     this.observeReconcileTimeoutMs = options.observeReconcileTimeoutMs ?? DEFAULT_OBSERVE_RECONCILE_TIMEOUT_MS;
+    this.permissionPollIntervalMs = options.permissionPollIntervalMs ?? DEFAULT_PERMISSION_POLL_INTERVAL_MS;
+    this.idleNoAssistantGraceMs = options.idleNoAssistantGraceMs ?? DEFAULT_IDLE_NO_ASSISTANT_GRACE_MS;
   }
 
   async ensureSession(input: EnsureSessionInput): Promise<RuntimeSession> {
@@ -851,15 +1052,18 @@ export class OpenCodeRuntime implements AgentRuntime {
       client,
       target: input.target,
       state: createObserveState(input.sessionId, messageId, beforeMessageIds),
+      fetch: this.fetch,
       signal: input.signal,
       reconcileIntervalMs: this.observeReconcileIntervalMs,
       reconcileTimeoutMs: this.observeReconcileTimeoutMs,
+      permissionPollIntervalMs: this.permissionPollIntervalMs,
+      idleNoAssistantGraceMs: this.idleNoAssistantGraceMs,
     });
 
     await observed.ready;
 
     try {
-      const response = await unwrapSdkVoidResult(
+      const promptTask = unwrapSdkVoidResult(
         client.session.promptAsync({
           path: { id: input.sessionId },
           query: directoryQuery(input.target),
@@ -873,8 +1077,14 @@ export class OpenCodeRuntime implements AgentRuntime {
         `Unable to send async prompt to OpenCode session ${input.sessionId}`,
       );
 
+      promptTask.catch((error) => {
+        if (!input.signal?.aborted) {
+          observed.push({ type: "error", message: formatRuntimeError(error), retryable: true });
+        }
+      });
+
       return {
-        handle: createRuntimeTurnHandle(input, messageId, response),
+        handle: createRuntimeTurnHandle(input, messageId, { mode: "async" }),
         events: observed.events,
       };
     } catch (error) {
@@ -917,7 +1127,7 @@ export class OpenCodeRuntime implements AgentRuntime {
       let permissionForwarder: Promise<void> | undefined;
 
       try {
-        if (input.observePermissions) {
+        if (input.observePermissions || input.observeProgress) {
           const client = this.getClient(input.target);
           const subscription = await this.subscribeToEvents(client, input.target, input.signal);
 
@@ -926,11 +1136,19 @@ export class OpenCodeRuntime implements AgentRuntime {
             client,
             target: input.target,
             state: createObserveState(input.sessionId, undefined),
+            fetch: this.fetch,
             signal: input.signal,
             reconcileIntervalMs: this.observeReconcileIntervalMs,
             reconcileTimeoutMs: this.observeReconcileTimeoutMs,
+            permissionPollIntervalMs: this.permissionPollIntervalMs,
+            idleNoAssistantGraceMs: this.idleNoAssistantGraceMs,
           });
-          permissionForwarder = forwardPermissionEvents(permissionObserver.events, queue, input.signal);
+          permissionForwarder = forwardSideChannelEvents(
+            permissionObserver.events,
+            queue,
+            { progress: Boolean(input.observeProgress), permissions: Boolean(input.observePermissions) },
+            input.signal,
+          );
           await permissionObserver.ready;
         }
 
@@ -987,10 +1205,13 @@ export class OpenCodeRuntime implements AgentRuntime {
       client,
       target: input.target,
       state: createObserveState(input.sessionId, input.turnId),
+      fetch: this.fetch,
       signal: input.signal,
       initialBackfill: true,
       reconcileIntervalMs: this.observeReconcileIntervalMs,
       reconcileTimeoutMs: this.observeReconcileTimeoutMs,
+      permissionPollIntervalMs: this.permissionPollIntervalMs,
+      idleNoAssistantGraceMs: this.idleNoAssistantGraceMs,
     });
 
     try {
@@ -1030,20 +1251,40 @@ export class OpenCodeRuntime implements AgentRuntime {
   async respondToPermission(input: PermissionResponseInput): Promise<void> {
     const client = this.getClient(input.target);
     const respond = client.postSessionIdPermissionsPermissionId;
+    const response = permissionSdkResponse(input.decision);
+    const errors: string[] = [];
 
-    if (!respond) {
-      throw new OpenCodeRuntimeError("OpenCode SDK client does not expose a permission response endpoint");
+    const modernEndpoints = [
+      permissionReplyEndpoint(input.target, `/api/session/${encodeURIComponent(input.sessionId)}/permission/request/${encodeURIComponent(input.permissionId)}/reply`, false),
+      permissionReplyEndpoint(input.target, `/permission/${encodeURIComponent(input.permissionId)}/reply`, true),
+    ].filter(isNonEmptyString);
+
+    for (const endpoint of modernEndpoints) {
+      const result = await postPermissionReply(this.fetch, endpoint, response, input.message);
+      if (result.ok) return;
+      errors.push(result.error);
     }
 
-    await unwrapSdkResult(
-      respond.call(client, {
-        path: { id: input.sessionId, permissionID: input.permissionId },
-        query: directoryQuery(input.target),
-        body: {
-          response: permissionSdkResponse(input.decision),
-        },
-      }),
-      `Unable to respond to OpenCode permission ${input.permissionId}`,
+    if (respond) {
+      try {
+        await unwrapSdkResult(
+          respond.call(client, {
+            path: { id: input.sessionId, permissionID: input.permissionId },
+            query: directoryQuery(input.target),
+            body: { response },
+          }),
+          `Unable to respond to OpenCode permission ${input.permissionId}`,
+        );
+        return;
+      } catch (error) {
+        errors.push(formatRuntimeError(error));
+      }
+    } else {
+      errors.push("OpenCode SDK client does not expose a permission response endpoint");
+    }
+
+    throw new OpenCodeRuntimeError(
+      `Unable to respond to OpenCode permission ${input.permissionId}: ${errors.filter(Boolean).join("; ")}`,
     );
   }
 
@@ -1173,6 +1414,50 @@ function validateAttachTarget(target: RuntimeTarget): void {
   if (!target.serverUrl) {
     throw new OpenCodeRuntimeError(`OpenCode target ${target.id} is missing serverUrl`);
   }
+}
+
+function targetApiUrl(target: RuntimeTarget, path: string): URL | undefined {
+  if (!target.serverUrl) return undefined;
+
+  return new URL(path, target.serverUrl.endsWith("/") ? target.serverUrl : `${target.serverUrl}/`);
+}
+
+function permissionReplyEndpoint(target: RuntimeTarget, path: string, includeDirectory: boolean): string | undefined {
+  const url = targetApiUrl(target, path);
+  if (!url) return undefined;
+
+  if (includeDirectory && target.workdir) {
+    url.searchParams.set("directory", target.workdir);
+  }
+
+  return url.toString();
+}
+
+async function postPermissionReply(
+  fetchImpl: FetchLike,
+  endpoint: string,
+  reply: "once" | "always" | "reject",
+  message: string | undefined,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const response = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(compactObject({ reply, message })),
+    });
+
+    if (response.ok) return { ok: true };
+
+    return { ok: false, error: `${endpoint} returned ${response.status}: ${await responseText(response)}` };
+  } catch (error) {
+    return { ok: false, error: `${endpoint} failed: ${formatRuntimeError(error)}` };
+  }
+}
+
+async function responseText(response: Response): Promise<string> {
+  const text = await response.text().catch(() => "");
+
+  return text.trim() || response.statusText || "unknown error";
 }
 
 function directoryQuery(target: RuntimeTarget): { directory?: string } | undefined {

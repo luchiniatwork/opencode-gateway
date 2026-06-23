@@ -90,6 +90,7 @@ export interface StartRuntimeTurnInput extends SendRuntimeMessageInput {
   signal?: AbortSignal;
   mode?: "sync" | "async";
   observePermissions?: boolean;
+  observeProgress?: boolean;
 }
 
 export interface AbortRuntimeTurnInput {

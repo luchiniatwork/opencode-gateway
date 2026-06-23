@@ -114,6 +114,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
     const target = binding ? repositories.targets.getById(binding.targetId) : getTarget(profile?.defaultTargetId);
     const activeRun = binding ? repositories.runs.getActiveByBindingId(binding.id) : undefined;
     const activeDiagnostics = binding ? turnRunner.getActiveDiagnostics(binding.id) : undefined;
+    const queueDiagnostics = binding ? turnRunner.getQueueDiagnostics(binding.id) : undefined;
     const pendingPermissions = activeRun ? options.pendingPermissions?.listPendingByRunId(activeRun.id) ?? [] : [];
     const health = options.getHealth?.();
     const targetHealth = target ? (health?.targets?.[target.id] ?? "configured") : "unknown";
@@ -127,6 +128,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       `Target: ${formatTarget(target)} (${targetHealth})`,
       `Session: ${binding?.opencodeSessionId ?? "none"}${binding?.sessionName ? ` (${binding.sessionName})` : ""}`,
       `Active run: ${formatRun(activeRun, activeDiagnostics)}`,
+      `Queue: ${formatQueue(queueDiagnostics)}`,
       `Pending permissions: ${formatPendingPermissions(pendingPermissions)}`,
       `Gateway health: ${health?.gateway ?? "unknown"}`,
     ].join("\n");
@@ -404,6 +406,13 @@ function formatPendingPermissions(permissions: ReturnType<PendingPermissionRepos
 
   const missingCards = permissions.filter((permission) => !permission.actionMessageReceiptId).length;
   return `${permissions.length} pending, ${missingCards} without action card`;
+}
+
+function formatQueue(diagnostics: ReturnType<TurnRunner["getQueueDiagnostics"]>): string {
+  if (!diagnostics) return "none";
+
+  const age = diagnostics.oldestAgeMs === undefined ? undefined : `, oldest age=${formatDuration(diagnostics.oldestAgeMs)}`;
+  return `${diagnostics.size} pending${age ?? ""}`;
 }
 
 function formatDuration(ms: number): string {
