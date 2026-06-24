@@ -169,7 +169,7 @@ export function createPermissionInteractionService(options: PermissionInteractio
     if (!permission) return { message: errorMessage(`Permission request not found: ${input.permissionId}`), editOriginal: false };
 
     if (permission.status !== "pending") {
-      return { message: statusMessage(`Permission request ${permission.id} is already ${permission.status}.`), editOriginal: false };
+      return { message: statusMessage(`Permission request ${permission.id} is already ${permission.status}.`), editOriginal: true };
     }
 
     if (Date.parse(permission.expiresAt) <= now().getTime()) {
@@ -179,6 +179,14 @@ export function createPermissionInteractionService(options: PermissionInteractio
 
     const context = permissionRuntimeContext(permission);
     if (!context.ok) return { message: errorMessage(context.error), editOriginal: false };
+
+    if (context.run.status !== "active") {
+      repositories.pendingPermissions.resolve({ id: permission.id, status: "expired" });
+      return {
+        message: statusMessage(`Permission request ${permission.id} expired because run ${context.run.id} is ${context.run.status}.`),
+        editOriginal: true,
+      };
+    }
 
     try {
       await runtime.respondToPermission({
@@ -233,11 +241,14 @@ export function createPermissionInteractionService(options: PermissionInteractio
     const run = repositories.runs.getById(permission.runId);
     if (!run) return { ok: false, error: `Run not found for permission ${permission.id}: ${permission.runId}` };
 
-    const binding = repositories.bindings.getById(run.bindingId);
-    if (!binding) return { ok: false, error: `Binding not found for permission ${permission.id}: ${run.bindingId}` };
+    const binding = run.targetId ? undefined : repositories.bindings.getById(run.bindingId);
+    if (!run.targetId && !binding) return { ok: false, error: `Binding not found for permission ${permission.id}: ${run.bindingId}` };
 
-    const target = repositories.targets.getById(binding.targetId);
-    if (!target) return { ok: false, error: `OpenCode target not found for permission ${permission.id}: ${binding.targetId}` };
+    const targetId = run.targetId ?? binding?.targetId;
+    if (!targetId) return { ok: false, error: `OpenCode target not found for permission ${permission.id}` };
+
+    const target = repositories.targets.getById(targetId);
+    if (!target) return { ok: false, error: `OpenCode target not found for permission ${permission.id}: ${targetId}` };
 
     return { ok: true, run, target };
   }

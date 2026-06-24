@@ -196,7 +196,7 @@ test("gateway app sends permission buttons and approves callback actions", async
   try {
     await app.start();
     await channel.emit(inboundMessage({ text: "Need a permission" }));
-    await waitForSent(channel, 2);
+    await waitForSent(channel, 1);
 
     const card = channel.sent[0]?.message;
     const permissionId = card?.actions?.[0]?.value;
@@ -214,6 +214,7 @@ test("gateway app sends permission buttons and approves callback actions", async
 
     await channel.emitAction(permissionAction({ actionId: "permission.approve", value: permissionId, messageId: "sent-1" }));
     await waitForEdited(channel, 1);
+    await waitForSent(channel, 2);
 
     expect(runtime.calls.respondToPermission).toEqual([
       expect.objectContaining({
@@ -224,6 +225,121 @@ test("gateway app sends permission buttons and approves callback actions", async
     ]);
     expect(channel.edited[0]?.message.text).toContain("approved once by Tiago");
     expect(channel.edited[0]?.message.actions).toBeUndefined();
+    expect(channel.sent[1]?.message).toEqual({ kind: "final", format: "markdown", text: "answer-1" });
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app denies callback actions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new PermissionRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ text: "Need a permission" }));
+    await waitForSent(channel, 1);
+
+    const denyAction = channel.sent[0]?.message.actions?.find((action) => action.id === "permission.deny");
+    expect(denyAction).toBeDefined();
+
+    await channel.emitAction(permissionAction({ actionId: "permission.deny", value: denyAction?.value, messageId: "sent-1" }));
+    await waitForEdited(channel, 1);
+
+    expect(runtime.calls.respondToPermission).toEqual([
+      expect.objectContaining({
+        sessionId: "session-1",
+        permissionId: "opencode-permission-1",
+        decision: "deny",
+      }),
+    ]);
+    expect(channel.edited[0]?.message.text).toContain("denied by Tiago");
+    expect(channel.edited[0]?.message.actions).toBeUndefined();
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app accepts permission fallback approve commands", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new PermissionRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ text: "Need a permission" }));
+    await waitForSent(channel, 1);
+
+    const permissionId = channel.sent[0]?.message.actions?.[0]?.value;
+    await channel.emit(
+      inboundMessage({
+        id: "message-2",
+        text: `/permission approve ${permissionId}`,
+        commandText: `/permission approve ${permissionId}`,
+      }),
+    );
+    await waitForSent(channel, 3);
+
+    expect(runtime.calls.respondToPermission).toEqual([
+      expect.objectContaining({
+        sessionId: "session-1",
+        permissionId: "opencode-permission-1",
+        decision: "approve",
+      }),
+    ]);
+    expect(channel.sent[1]?.message.text).toContain("approved once by Tiago");
+    expect(channel.sent[2]?.message).toEqual({ kind: "final", format: "markdown", text: "answer-1" });
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app requires owner or admin for permission callback actions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new PermissionRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ text: "Need a permission" }));
+    await waitForSent(channel, 1);
+
+    const permissionId = channel.sent[0]?.message.actions?.[0]?.value;
+    await channel.emitAction(permissionAction({ actionId: "permission.approve", value: permissionId, messageId: "sent-1", senderId: "456" }));
+    await waitForSent(channel, 2);
+
+    expect(runtime.calls.respondToPermission).toEqual([]);
+    expect(channel.sent[1]?.message).toEqual({
+      kind: "error",
+      format: "plain",
+      text: "Permission responses require owner/admin access.",
+    });
+    expect(channel.edited).toEqual([]);
   } finally {
     await app.stop();
     await rm(dir, { recursive: true, force: true });
@@ -245,7 +361,7 @@ test("gateway app rejects always fallback when always allow is disabled", async 
   try {
     await app.start();
     await channel.emit(inboundMessage({ text: "Need a permission" }));
-    await waitForSent(channel, 2);
+    await waitForSent(channel, 1);
 
     const permissionId = channel.sent[0]?.message.actions?.[0]?.value;
     await channel.emit(
@@ -255,10 +371,10 @@ test("gateway app rejects always fallback when always allow is disabled", async 
         commandText: `/permission always ${permissionId}`,
       }),
     );
-    await waitForSent(channel, 3);
+    await waitForSent(channel, 2);
 
     expect(runtime.calls.respondToPermission).toEqual([]);
-    expect(channel.sent[2]?.message.text).toBe("Always allow is disabled by configuration.");
+    expect(channel.sent[1]?.message.text).toBe("Always allow is disabled by configuration.");
   } finally {
     await app.stop();
     await rm(dir, { recursive: true, force: true });
@@ -280,13 +396,14 @@ test("gateway app can enable always allow permission actions", async () => {
   try {
     await app.start();
     await channel.emit(inboundMessage({ text: "Need a permission" }));
-    await waitForSent(channel, 2);
+    await waitForSent(channel, 1);
 
     const alwaysAction = channel.sent[0]?.message.actions?.find((action) => action.id === "permission.always");
     expect(alwaysAction).toMatchObject({ label: "Always allow" });
 
     await channel.emitAction(permissionAction({ actionId: "permission.always", value: alwaysAction?.value, messageId: "sent-1" }));
     await waitForEdited(channel, 1);
+    await waitForSent(channel, 2);
 
     expect(runtime.calls.respondToPermission).toEqual([
       expect.objectContaining({
@@ -295,6 +412,35 @@ test("gateway app can enable always allow permission actions", async () => {
       }),
     ]);
     expect(channel.edited[0]?.message.text).toContain("approved always by Tiago");
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app rejects permission actions after the run is no longer active", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new PermissionRuntime({ completeWithoutResponse: true });
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ text: "Need a permission" }));
+    await waitForSent(channel, 2);
+
+    const permissionId = channel.sent[0]?.message.actions?.[0]?.value;
+    await channel.emitAction(permissionAction({ actionId: "permission.approve", value: permissionId, messageId: "sent-1" }));
+    await waitForEdited(channel, 1);
+
+    expect(runtime.calls.respondToPermission).toEqual([]);
+    expect(channel.edited[0]?.message.text).toContain(`Permission request ${permissionId} is already expired.`);
   } finally {
     await app.stop();
     await rm(dir, { recursive: true, force: true });
@@ -785,7 +931,7 @@ async function waitForEdited(channel: FakeChannel, count: number): Promise<void>
   expect(channel.edited.length).toBeGreaterThanOrEqual(count);
 }
 
-function permissionAction(options: { actionId: string; value?: string; messageId: string }): ChannelAction {
+function permissionAction(options: { actionId: string; value?: string; messageId: string; senderId?: string }): ChannelAction {
   return {
     id: "callback-1",
     channel: "telegram",
@@ -796,7 +942,7 @@ function permissionAction(options: { actionId: string; value?: string; messageId
       id: "123",
     },
     sender: {
-      id: "123",
+      id: options.senderId ?? "123",
       username: "tiago",
       displayName: "Tiago",
     },
@@ -1023,6 +1169,18 @@ class FakeRuntime implements AgentRuntime {
 }
 
 class PermissionRuntime extends FakeRuntime {
+  private readonly completeWithoutResponse: boolean;
+  private readonly permissionResponseReceived: Promise<void>;
+  private resolvePermissionResponse: (() => void) | undefined;
+
+  constructor(options: { completeWithoutResponse?: boolean } = {}) {
+    super();
+    this.completeWithoutResponse = options.completeWithoutResponse ?? false;
+    this.permissionResponseReceived = new Promise((resolve) => {
+      this.resolvePermissionResponse = resolve;
+    });
+  }
+
   override async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
     this.calls.startTurn.push(input);
 
@@ -1047,7 +1205,31 @@ class PermissionRuntime extends FakeRuntime {
       };
     }
 
+    if (!this.completeWithoutResponse) {
+      await this.waitForPermissionResponse(input.signal);
+      if (input.signal?.aborted) return;
+    }
+
     yield* this.syncEvents(input);
+  }
+
+  override async respondToPermission(input: PermissionResponseInput): Promise<void> {
+    await super.respondToPermission(input);
+    this.resolvePermissionResponse?.();
+  }
+
+  private async waitForPermissionResponse(signal: AbortSignal | undefined): Promise<void> {
+    if (signal?.aborted) return;
+
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        signal?.removeEventListener("abort", done);
+        resolve();
+      };
+
+      signal?.addEventListener("abort", done, { once: true });
+      this.permissionResponseReceived.then(done);
+    });
   }
 
   override async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent> {

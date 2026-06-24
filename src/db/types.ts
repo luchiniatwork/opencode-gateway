@@ -62,6 +62,7 @@ export interface AccessRuleRecord {
 export interface RunRecord {
   id: string;
   bindingId: string;
+  targetId?: RuntimeTargetId;
   opencodeSessionId: RuntimeSessionId;
   opencodeMessageId?: string;
   status: string;

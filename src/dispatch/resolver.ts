@@ -118,6 +118,7 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
 
       const run = repositories.runs.create({
         bindingId: resolution.binding.id,
+        targetId: resolution.target.id,
         opencodeSessionId: resolution.binding.opencodeSessionId,
       });
 

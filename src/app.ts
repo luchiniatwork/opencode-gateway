@@ -151,11 +151,13 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
             status: "aborted",
             error: "Gateway restarted before observing a final response.",
           });
+          const expiredStalePermissions = staleRuns.flatMap((run) => repositories.pendingPermissions.expirePendingByRunId(run.id));
 
           if (staleRuns.length > 0) {
             log("warn", "stale active runs marked aborted", {
               count: staleRuns.length,
               runIds: staleRuns.map((run) => run.id),
+              expiredPermissionIds: expiredStalePermissions.map((permission) => permission.id),
             });
           }
 

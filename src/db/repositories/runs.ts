@@ -6,6 +6,7 @@ import type { RunRecord } from "../types.ts";
 interface RunRow {
   id: string;
   binding_id: string;
+  target_id: string | null;
   opencode_session_id: string;
   opencode_message_id: string | null;
   status: string;
@@ -16,6 +17,7 @@ interface RunRow {
 
 export interface CreateRunInput {
   bindingId: string;
+  targetId?: string;
   opencodeSessionId: string;
   opencodeMessageId?: string;
   status?: string;
@@ -52,13 +54,14 @@ export function createRunRepository(
       const row = db
         .query(
           `INSERT INTO runs (
-            id, binding_id, opencode_session_id, opencode_message_id, status, started_at, finished_at, error
-          ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+            id, binding_id, target_id, opencode_session_id, opencode_message_id, status, started_at, finished_at, error
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)
           RETURNING *`,
         )
         .get(
           createId(),
           input.bindingId,
+          input.targetId ?? null,
           input.opencodeSessionId,
           input.opencodeMessageId ?? null,
           input.status ?? "active",
@@ -172,6 +175,7 @@ function mapRunRow(row: RunRow): RunRecord {
   return {
     id: row.id,
     bindingId: row.binding_id,
+    targetId: nullableToUndefined(row.target_id),
     opencodeSessionId: row.opencode_session_id,
     opencodeMessageId: nullableToUndefined(row.opencode_message_id),
     status: row.status,

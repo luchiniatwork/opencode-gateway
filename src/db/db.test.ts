@@ -51,7 +51,7 @@ test("migrations are idempotent", async () => {
       count: number;
     };
 
-    expect(row.count).toBe(2);
+    expect(row.count).toBe(3);
   } finally {
     database.close();
   }

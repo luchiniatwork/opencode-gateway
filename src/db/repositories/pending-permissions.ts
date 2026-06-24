@@ -46,6 +46,7 @@ export interface PendingPermissionRepository {
   listPendingByRunId(runId: string): PendingPermissionRecord[];
   setActionMessageReceiptId(input: UpdatePendingPermissionActionReceiptInput): PendingPermissionRecord | undefined;
   resolve(input: ResolvePendingPermissionInput): PendingPermissionRecord | undefined;
+  expirePendingByRunId(runId: string): PendingPermissionRecord[];
 }
 
 export function createPendingPermissionRepository(
@@ -168,6 +169,20 @@ export function createPendingPermissionRepository(
         .get(input.status, input.actionMessageReceiptId ?? null, now().toISOString(), input.id) as PendingPermissionRow | null;
 
       return row ? mapPendingPermissionRow(row) : undefined;
+    },
+
+    expirePendingByRunId(runId): PendingPermissionRecord[] {
+      const rows = db
+        .query(
+          `UPDATE pending_permissions SET
+            status = 'expired',
+            resolved_at = ?
+          WHERE run_id = ? AND status = 'pending'
+          RETURNING *`,
+        )
+        .all(now().toISOString(), runId) as PendingPermissionRow[];
+
+      return rows.map(mapPendingPermissionRow);
     },
   };
 }

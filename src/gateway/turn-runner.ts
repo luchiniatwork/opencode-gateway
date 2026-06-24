@@ -190,6 +190,13 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
 
       abortObserver(run.id);
       const aborted = runs.finishIfActive({ id: run.id, status: "aborted", error: remoteAbortError }) ?? runs.getById(run.id) ?? run;
+      expirePendingPermissionsForRun(run.id, {
+        source: "channel",
+        targetId: input.target.id,
+        sessionId: run.opencodeSessionId,
+        runId: run.id,
+        opencodeMessageId: run.opencodeMessageId,
+      });
 
       log(remoteAbortError ? "warn" : "info", "turn run aborted", {
         source: "channel",
@@ -252,6 +259,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
 
     const run = runs.create({
       bindingId: resolution.binding.id,
+      targetId: resolution.target.id,
       opencodeSessionId: resolution.binding.opencodeSessionId,
     });
     const baseContext = runLogContext(message, resolution, run);
@@ -483,6 +491,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         await progress.finalize();
         const messageText = "OpenCode event stream ended before a final response.";
         runs.finishIfActive({ id: input.run.id, status: "error", error: messageText, opencodeMessageId: input.handle.id });
+        expirePendingPermissionsForRun(input.run.id, context);
         await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${messageText}` }, context);
         log("error", "turn run observer ended without final", { ...context, error: messageText });
       }
@@ -497,6 +506,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       const messageText = formatError(error);
       await progress.finalize();
       runs.finishIfActive({ id: input.run.id, status: "error", error: messageText, opencodeMessageId: input.handle.id });
+      expirePendingPermissionsForRun(input.run.id, context);
       await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${messageText}` }, context);
       log("error", "turn run observer failed", { ...context, error: messageText });
     } finally {
@@ -518,6 +528,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     const finished = runs.finishIfActive({ id: input.run.id, status: "error", error: messageText, opencodeMessageId: input.handle.id });
     if (!finished) return;
 
+    expirePendingPermissionsForRun(input.run.id, context);
     await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${messageText}` }, context);
     log("error", "turn run timed out", { ...context, error: messageText });
   }
@@ -541,12 +552,14 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
           context,
         );
         runs.finishIfActive({ id: input.run.id, status: "completed", opencodeMessageId: input.handle.id });
+        expirePendingPermissionsForRun(input.run.id, context);
         log("info", "turn run final sent", context);
         return true;
       }
       case "error": {
         await progress.finalize();
         runs.finishIfActive({ id: input.run.id, status: "error", error: event.message, opencodeMessageId: input.handle.id });
+        expirePendingPermissionsForRun(input.run.id, context);
         await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${event.message}` }, context);
         log("error", "turn run failed", { ...context, error: event.message, retryable: event.retryable });
         return true;
@@ -572,6 +585,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         if (event.status === "aborted") {
           progress.cancel();
           runs.finishIfActive({ id: input.run.id, status: "aborted", opencodeMessageId: input.handle.id });
+          expirePendingPermissionsForRun(input.run.id, context);
           log("info", "turn run observed abort", context);
           return true;
         }
@@ -580,6 +594,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
           await progress.finalize();
           const message = "OpenCode session reported an error.";
           runs.finishIfActive({ id: input.run.id, status: "error", error: message, opencodeMessageId: input.handle.id });
+          expirePendingPermissionsForRun(input.run.id, context);
           await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${message}` }, context);
           log("error", "turn run observed error status", context);
           return true;
@@ -620,6 +635,18 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         ...context,
         permissionId: existing.id,
         opencodePermissionId: event.id,
+      });
+
+      return { permission: existing, notify: false };
+    }
+
+    if (existing && existing.status !== "pending") {
+      log("info", "turn run permission request already resolved", {
+        ...context,
+        permissionId: existing.id,
+        opencodePermissionId: event.id,
+        previousRunId: existing.runId,
+        previousStatus: existing.status,
       });
 
       return { permission: existing, notify: false };
@@ -695,6 +722,25 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         ...context,
         messageKind: message.kind,
         platformMessageId: receipt.platformMessageId,
+        error: formatError(error),
+      });
+    }
+  }
+
+  function expirePendingPermissionsForRun(runId: string, context: GatewayLogContext): void {
+    if (!pendingPermissions) return;
+
+    try {
+      const expired = pendingPermissions.expirePendingByRunId(runId);
+      if (expired.length === 0) return;
+
+      log("info", "turn run pending permissions expired", {
+        ...context,
+        pendingPermissionIds: expired.map((permission) => permission.id),
+      });
+    } catch (error) {
+      log("error", "turn run pending permission expiration failed", {
+        ...context,
         error: formatError(error),
       });
     }

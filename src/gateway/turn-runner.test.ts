@@ -367,7 +367,7 @@ test("turn runner queues permission-producing follow-ups", async () => {
       { kind: "final", format: "markdown", text: "permission done" },
     ]);
     expect(pendingPermissionRows(harness.database)).toEqual([
-      expect.objectContaining({ id: "permission-1", opencode_permission_id: "opencode-permission-1", status: "pending" }),
+      expect.objectContaining({ id: "permission-1", opencode_permission_id: "opencode-permission-1", status: "expired" }),
     ]);
   } finally {
     await harness.runner.stop();
@@ -485,7 +485,7 @@ test("turn runner persists delivery receipts for progress and final messages", a
   }
 });
 
-test("turn runner persists pending permission requests", async () => {
+test("turn runner expires unresolved permission requests when the run finishes", async () => {
   const harness = await createHarness({
     events: [
       { type: "permission_request", id: "opencode-permission-1", summary: "Run bash", details: { tool: "bash" } },
@@ -509,7 +509,7 @@ test("turn runner persists pending permission requests", async () => {
         opencode_permission_id: "opencode-permission-1",
         summary: "Run bash",
         details_json: JSON.stringify({ tool: "bash" }),
-        status: "pending",
+        status: "expired",
         expires_at: "2026-01-01T00:01:00.000Z",
       },
     ]);
@@ -544,7 +544,7 @@ test("turn runner observes permissions for compact profiles without progress mes
       { kind: "final", format: "markdown", text: "done" },
     ]);
     expect(pendingPermissionRows(harness.database)).toEqual([
-      expect.objectContaining({ id: "permission-1", opencode_permission_id: "opencode-permission-1", status: "pending" }),
+      expect.objectContaining({ id: "permission-1", opencode_permission_id: "opencode-permission-1", status: "expired" }),
     ]);
   } finally {
     await harness.runner.stop();
@@ -577,7 +577,52 @@ test("turn runner resurfaces an already-pending OpenCode permission instead of d
       { kind: "final", format: "markdown", text: "done" },
     ]);
     expect(pendingPermissionRows(harness.database)).toEqual([
-      expect.objectContaining({ id: "permission-existing", opencode_permission_id: "opencode-permission-1", status: "pending" }),
+      expect.objectContaining({ id: "permission-existing", opencode_permission_id: "opencode-permission-1", status: "expired" }),
+    ]);
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
+test("turn runner does not resurrect expired OpenCode permissions when they are reported again", async () => {
+  const permissionEvent: RuntimeEvent = {
+    type: "permission_request",
+    id: "opencode-permission-1",
+    summary: "Run bash",
+    details: { action: "bash", resources: ["printf stale"] },
+  };
+  const harness = await createHarness({
+    eventBatches: [
+      [permissionEvent, { type: "final", text: "first done" }],
+      [permissionEvent, { type: "final", text: "second done" }],
+    ],
+    observePermissions: true,
+    sendPermissionRequests: true,
+  });
+
+  try {
+    await harness.runner.start({
+      message: inboundMessage({ id: "message-1", text: "first" }),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForDeliveries(harness.deliveries, 2);
+
+    await harness.runner.start({
+      message: inboundMessage({ id: "message-2", text: "second" }),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForDeliveries(harness.deliveries, 3);
+
+    expect(harness.deliveries).toEqual([
+      { kind: "status", format: "plain", text: "Permission card: permission-1" },
+      { kind: "final", format: "markdown", text: "first done" },
+      { kind: "final", format: "markdown", text: "second done" },
+    ]);
+    expect(pendingPermissionRows(harness.database)).toEqual([
+      expect.objectContaining({ id: "permission-1", opencode_permission_id: "opencode-permission-1", status: "expired" }),
     ]);
   } finally {
     await harness.runner.stop();

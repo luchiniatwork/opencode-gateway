@@ -114,6 +114,12 @@ export const migrations: Migration[] = [
         ON delivery_receipts(conversation_key)`,
     ],
   },
+  {
+    id: "003_run_target_snapshot",
+    statements: [
+      `ALTER TABLE runs ADD COLUMN target_id TEXT`,
+    ],
+  },
 ];
 
 export function runMigrations(db: Database, now: () => Date = () => new Date()): void {
