@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import type { InboundMessage, SendReceipt } from "../channels/types.ts";
+import type { InboundMessage, SendReceipt, TypingState } from "../channels/types.ts";
 import { openGatewayDatabase, type GatewayDatabase } from "../db/client.ts";
 import { runMigrations } from "../db/migrations.ts";
 import { createConversationBindingRepository } from "../db/repositories/conversation-bindings.ts";
@@ -52,7 +52,7 @@ test("turn runner starts turns, stores message IDs, and finishes final events", 
         text: "inspect",
         agent: "cto-agent",
         model: "provider/model",
-        mode: "sync",
+        mode: "async",
         observePermissions: false,
       }),
     ]);
@@ -200,7 +200,7 @@ test("turn runner exposes active turn plan diagnostics", async () => {
       startedAt: "2026-01-01T00:00:00.000Z",
       ageMs: 0,
       plan: {
-        finalSource: "prompt",
+        finalSource: "events",
         progressSource: "none",
         permissionSource: "events",
       },
@@ -463,6 +463,27 @@ test("turn runner sends no progress for compact final-answer-only turns", async 
   }
 });
 
+test("turn runner keeps channel typing active during compact turns", async () => {
+  const harness = await createHarness({ events: [{ type: "final", text: "done" }], eventDelayMs: 5 });
+
+  try {
+    await harness.runner.start({
+      message: inboundMessage(),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForTyping(harness.typing, 1);
+    await waitForDeliveries(harness.deliveries, 1);
+    await waitForTyping(harness.typing, 2);
+
+    expect(harness.typing).toEqual(["typing", "idle"]);
+    expect(harness.deliveries).toEqual([{ kind: "final", format: "markdown", text: "done" }]);
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
 test("turn runner persists delivery receipts for progress and final messages", async () => {
   const harness = await createHarness({
     events: [{ type: "status", status: "running" }, { type: "final", text: "done" }],
@@ -542,7 +563,7 @@ test("turn runner observes permissions for compact profiles without progress mes
     });
     await waitForDeliveries(harness.deliveries, 2);
 
-    expect(harness.runtime.calls.startTurn[0]).toEqual(expect.objectContaining({ mode: "sync", observePermissions: true }));
+    expect(harness.runtime.calls.startTurn[0]).toEqual(expect.objectContaining({ mode: "async", observePermissions: true }));
     expect(harness.deliveries).toEqual([
       { kind: "status", format: "plain", text: "Permission card: permission-1" },
       { kind: "final", format: "markdown", text: "done" },
@@ -655,7 +676,7 @@ test("turn runner renders tool progress for tools verbosity", async () => {
     await waitForDeliveries(harness.deliveries, 3);
 
     expect(harness.runtime.calls.startTurn[0]).toEqual(expect.objectContaining({
-      mode: "sync",
+      mode: "async",
       observeProgress: true,
     }));
     expect(harness.deliveries).toEqual([
@@ -696,8 +717,10 @@ interface Harness {
   runtime: FakeRuntime;
   resolution: ResolvedDispatch;
   deliveries: OutboundMessage[];
+  typing: TypingState[];
   delivery: {
     send(message: OutboundMessage): Promise<SendReceipt>;
+    setTyping(state: TypingState): Promise<void>;
   };
   runner: ReturnType<typeof createTurnRunner>;
 }
@@ -753,6 +776,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
   const target = requireRecord(targets.getById("default"), "target");
   const runtime = new FakeRuntime(options);
   const deliveries: OutboundMessage[] = [];
+  const typing: TypingState[] = [];
   const runner = createTurnRunner({
     runtime,
     runs,
@@ -776,10 +800,14 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     runtime,
     resolution: resolved(binding, profile, target),
     deliveries,
+    typing,
     delivery: {
       async send(message) {
         deliveries.push(message);
         return receiptFor(`sent-${deliveries.length}`);
+      },
+      async setTyping(state) {
+        typing.push(state);
       },
     },
     runner,
@@ -862,6 +890,16 @@ async function waitForObserve(runtime: FakeRuntime): Promise<void> {
   }
 
   expect(runtime.calls.observe).toHaveLength(1);
+}
+
+async function waitForTyping(typing: TypingState[], count: number): Promise<void> {
+  const deadline = Date.now() + 1_000;
+
+  while (typing.length < count && Date.now() < deadline) {
+    await Bun.sleep(5);
+  }
+
+  expect(typing.length).toBeGreaterThanOrEqual(count);
 }
 
 function runRows(database: GatewayDatabase): Array<{

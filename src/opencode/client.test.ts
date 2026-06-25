@@ -1115,6 +1115,54 @@ test("observe filters events from other sessions and user prompt parts", async (
   expect(events).toEqual([{ type: "status", status: "idle" }]);
 });
 
+test("observe filters same-session events from unrelated assistant messages after the observed turn is identified", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "message.updated",
+        properties: {
+          info: { id: "assistant-observed", sessionID: "session-1", role: "assistant", parentID: "message-user" },
+        },
+      },
+      {
+        type: "message.part.updated",
+        properties: {
+          part: { id: "part-observed", sessionID: "session-1", messageID: "assistant-observed", type: "text", text: "Observed" },
+        },
+      },
+      {
+        type: "message.part.updated",
+        properties: {
+          part: { id: "part-other", sessionID: "session-1", messageID: "assistant-other", type: "text", text: "Other" },
+        },
+      },
+      {
+        type: "message.updated",
+        properties: {
+          info: { id: "assistant-other", sessionID: "session-1", role: "assistant", parentID: "other-user", finish: "stop", time: { completed: 1 } },
+        },
+      },
+      {
+        type: "message.updated",
+        properties: {
+          info: { id: "assistant-observed", sessionID: "session-1", role: "assistant", parentID: "message-user", finish: "stop", time: { completed: 2 } },
+        },
+      },
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const events = await collectRuntimeEvents(
+    runtime.observe({ target: attachTarget, sessionId: "session-1", turnId: "message-user" }),
+  );
+
+  expect(events).toEqual([
+    { type: "text_delta", text: "Observed" },
+    { type: "final", text: "Observed", costUsd: undefined, tokens: undefined },
+  ]);
+});
+
 test("observe does not finalize intermediate tool-call assistant messages", async () => {
   const sdk = createFakeSdkClient({
     events: [

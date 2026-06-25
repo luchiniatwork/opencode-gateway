@@ -193,7 +193,7 @@ test("gateway app dispatches non-command messages to OpenCode and sends final re
     expect(runtime.calls.startTurn[0]).toEqual(expect.objectContaining({
       text: "Inspect this repo",
       sessionId: "session-1",
-      mode: "sync",
+      mode: "async",
       observePermissions: true,
     }));
     expect(channel.sent).toEqual([
@@ -443,6 +443,44 @@ test("gateway app accepts permission fallback approve commands", async () => {
   }
 });
 
+test("gateway app handles permission fallback commands immediately when debounce is enabled", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new PermissionRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db"), { inboundDebounceMs: 20 }),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ text: "Need a permission" }));
+    await waitForSent(channel, 1);
+
+    const permissionId = channel.sent[0]?.message.actions?.[0]?.value;
+    await channel.emit(
+      inboundMessage({
+        id: "message-2",
+        text: `/permission approve ${permissionId}`,
+        commandText: `/permission approve ${permissionId}`,
+      }),
+    );
+    await waitForSent(channel, 3);
+
+    expect(runtime.calls.respondToPermission).toEqual([
+      expect.objectContaining({ permissionId: "opencode-permission-1", decision: "approve" }),
+    ]);
+    expect(channel.sent[1]?.message.text).toContain("approved once by Tiago");
+    expect(channel.sent[2]?.message).toEqual({ kind: "final", format: "markdown", text: "answer-1" });
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("gateway app requires owner or admin for permission callback actions", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
@@ -567,11 +605,43 @@ test("gateway app rejects permission actions after the run is no longer active",
     await waitForSent(channel, 2);
 
     const permissionId = channel.sent[0]?.message.actions?.[0]?.value;
+    const editCountBeforeAction = channel.edited.length;
     await channel.emitAction(permissionAction({ actionId: "permission.approve", value: permissionId, messageId: "sent-1" }));
-    await waitForEdited(channel, 1);
+    await waitForEdited(channel, editCountBeforeAction + 1);
 
     expect(runtime.calls.respondToPermission).toEqual([]);
-    expect(channel.edited[0]?.message.text).toContain(`Permission request ${permissionId} is already expired.`);
+    expect(channel.edited.at(-1)?.message.text).toContain(`Permission request ${permissionId} is already expired.`);
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app visibly expires unresolved permission cards when a run finishes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new PermissionRuntime({ completeWithoutResponse: true });
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ text: "Need a permission" }));
+    await waitForSent(channel, 2);
+    await waitForEdited(channel, 1);
+
+    expect(channel.sent[0]?.message.actions?.map((action) => action.id)).toEqual(["permission.approve", "permission.deny"]);
+    expect(channel.sent[1]?.message).toEqual({ kind: "final", format: "markdown", text: "answer-1" });
+    expect(channel.edited[0]?.message).toEqual({
+      kind: "status",
+      format: "markdown",
+      text: expect.stringContaining("expired because the run completed"),
+    });
   } finally {
     await app.stop();
     await rm(dir, { recursive: true, force: true });
@@ -638,6 +708,78 @@ test("gateway app queues a second message while the first turn is active", async
       "answer-2",
     ]);
   } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app drains multiple queued messages in arrival order", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new QueueRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await runtime.firstSendStarted;
+
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await channel.emit(inboundMessage({ id: "message-3", text: "third" }));
+    await waitForSent(channel, 2);
+
+    runtime.finishFirstSend();
+    await waitForSent(channel, 5);
+
+    expect(runtime.calls.startTurn.map((call) => call.text)).toEqual(["first", "second", "third"]);
+    expect(channel.sent.map((entry) => entry.message.text)).toEqual([
+      expect.stringContaining("Queue size: 1."),
+      expect.stringContaining("Queue size: 2."),
+      "answer-1",
+      "answer-2",
+      "answer-3",
+    ]);
+  } finally {
+    runtime.finishFirstSend();
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app /status reports queue diagnostics while a turn is active", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new QueueRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await runtime.firstSendStarted;
+
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await waitForSent(channel, 1);
+
+    await channel.emit(inboundMessage({ id: "message-3", text: "/status", commandText: "/status" }));
+    await waitForSent(channel, 2);
+
+    expect(channel.sent[1]?.message.text).toContain("Active run:");
+    expect(channel.sent[1]?.message.text).toContain("plan=final:events");
+    expect(channel.sent[1]?.message.text).toContain("Queue: 1 pending, oldest age=0ms");
+  } finally {
+    runtime.finishFirstSend();
     await app.stop();
     await rm(dir, { recursive: true, force: true });
   }
@@ -831,6 +973,62 @@ test("gateway app uses agent and model command overrides for future turns", asyn
     ]);
   } finally {
     await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app preserves agent and model overrides across restart", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const databasePath = join(dir, "state.db");
+  const firstChannel = new FakeChannel();
+  const firstApp = createApp({
+    config: testConfig(databasePath),
+    runtime: new FakeRuntime(),
+    channels: [fakeRegistration(firstChannel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await firstApp.start();
+    await firstChannel.emit(inboundMessage({ id: "message-1", text: "/agent mobile-agent", commandText: "/agent mobile-agent" }));
+    await waitForSent(firstChannel, 1);
+    await firstChannel.emit(
+      inboundMessage({ id: "message-2", text: "/model provider/custom-model", commandText: "/model provider/custom-model" }),
+    );
+    await waitForSent(firstChannel, 2);
+    await firstApp.stop();
+
+    const secondChannel = new FakeChannel();
+    const secondRuntime = new FakeRuntime();
+    const secondApp = createApp({
+      config: testConfig(databasePath),
+      runtime: secondRuntime,
+      channels: [fakeRegistration(secondChannel)],
+      logger: () => undefined,
+      now: fixedNow,
+    });
+
+    try {
+      await secondApp.start();
+      await secondChannel.emit(inboundMessage({ id: "message-3", text: "inspect" }));
+      await waitForSent(secondChannel, 1);
+
+      expect(secondRuntime.calls.ensureSession).toEqual([]);
+      expect(secondRuntime.calls.startTurn).toEqual([
+        expect.objectContaining({
+          text: "inspect",
+          sessionId: "session-1",
+          agent: "mobile-agent",
+          model: "provider/custom-model",
+        }),
+      ]);
+      expect(secondChannel.sent[0]?.message.text).toBe("answer-1");
+    } finally {
+      await secondApp.stop();
+    }
+  } finally {
+    await firstApp.stop();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -1856,6 +2054,7 @@ class StuckThenFinalRuntime extends FakeRuntime {
 class QueueRuntime extends FakeRuntime {
   private resolveFirstSendStarted: (() => void) | undefined;
   private resolveFirstSend: (() => void) | undefined;
+  private turnCount = 0;
 
   readonly firstSendStarted = new Promise<void>((resolve) => {
     this.resolveFirstSendStarted = resolve;
@@ -1864,21 +2063,31 @@ class QueueRuntime extends FakeRuntime {
     this.resolveFirstSend = resolve;
   });
 
-  override async send(input: SendRuntimeMessageInput): Promise<RuntimeTurn> {
-    this.calls.send.push(input);
-    const messageNumber = this.calls.send.length;
+  override async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    this.calls.startTurn.push(input);
+    this.turnCount += 1;
+    const messageNumber = this.turnCount;
 
+    return {
+      handle: {
+        id: `message-${messageNumber}`,
+        sessionId: input.sessionId,
+        targetId: input.target.id,
+        status: "running",
+      },
+      events: this.turnEvents(input.signal, messageNumber),
+    };
+  }
+
+  private async *turnEvents(signal: AbortSignal | undefined, messageNumber: number): AsyncIterable<RuntimeEvent> {
     if (messageNumber === 1) {
       this.resolveFirstSendStarted?.();
       await this.firstSendFinished;
     }
 
-    return {
-      id: `message-${messageNumber}`,
-      sessionId: input.sessionId,
-      status: "completed",
-      text: `answer-${messageNumber}`,
-    };
+    if (signal?.aborted) return;
+
+    yield { type: "final", text: `answer-${messageNumber}` };
   }
 
   finishFirstSend(): void {
@@ -1898,11 +2107,37 @@ class SlowRuntime extends FakeRuntime {
     this.resolveSend = resolve;
   });
 
-  override async send(input: SendRuntimeMessageInput): Promise<RuntimeTurn> {
-    this.calls.send.push(input);
-    this.resolveSendStarted?.();
+  override async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    this.calls.startTurn.push(input);
 
-    return this.sendFinished;
+    return {
+      handle: {
+        id: "message-slow",
+        sessionId: input.sessionId,
+        targetId: input.target.id,
+        status: "running",
+      },
+      events: this.turnEvents(input.signal),
+    };
+  }
+
+  private async *turnEvents(signal: AbortSignal | undefined): AsyncIterable<RuntimeEvent> {
+    this.resolveSendStarted?.();
+    const turn = await this.sendFinished;
+
+    if (signal?.aborted) return;
+
+    if (turn.status === "error") {
+      yield { type: "error", message: turn.text ?? "OpenCode returned an error response" };
+      return;
+    }
+
+    yield {
+      type: "final",
+      text: turn.text ?? "",
+      costUsd: turn.costUsd,
+      tokens: turn.tokens,
+    };
   }
 
   finishSend(turn: RuntimeTurn): void {

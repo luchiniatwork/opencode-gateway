@@ -123,6 +123,12 @@ interface QueuedTurn {
   input: StartTurnInput;
 }
 
+interface PendingPermissionExpiryNotification {
+  delivery: ProgressDelivery;
+  message: InboundMessage;
+  reason: string;
+}
+
 export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
   const { runtime, runs, pendingPermissions, deliveryReceipts } = options;
   const runTimeoutMs = options.runTimeoutMs ?? 5 * 60_000;
@@ -201,7 +207,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
 
       abortObserver(run.id);
       const aborted = runs.finishIfActive({ id: run.id, status: "aborted", error: remoteAbortError }) ?? runs.getById(run.id) ?? run;
-      expirePendingPermissionsForRun(run.id, {
+      await expirePendingPermissionsForRun(run.id, {
         source: "channel",
         targetId: input.target.id,
         sessionId: run.opencodeSessionId,
@@ -291,12 +297,12 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         attachments: mapAttachments(message.attachments),
         agent: resolution.agent,
         model: resolution.model,
-          metadata: messageMetadata(message),
-          mode: runtimeTurnMode(plan),
-          observePermissions: plan.permissionSource === "events",
-          observeProgress: plan.progressSource === "events",
-          signal: controller.signal,
-        });
+        metadata: messageMetadata(message),
+        mode: runtimeTurnMode(plan),
+        observePermissions: plan.permissionSource === "events",
+        observeProgress: plan.progressSource === "events",
+        signal: controller.signal,
+      });
       const started = await withStartTimeout(startTask, startTimeoutMs, () => {
         controller.abort();
       });
@@ -551,6 +557,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       delayMs: options.progressDelayMs,
       send: input.delivery.send,
       edit: input.delivery.edit,
+      setTyping: input.delivery.setTyping,
       onProgress: (message) => {
         log("info", "turn run progress sent", { ...context, messageKind: message.kind });
       },
@@ -586,7 +593,11 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         await progress.finalize();
         const messageText = "OpenCode event stream ended before a final response.";
         runs.finishIfActive({ id: input.run.id, status: "error", error: messageText, opencodeMessageId: input.handle.id });
-        expirePendingPermissionsForRun(input.run.id, context);
+        await expirePendingPermissionsForRun(input.run.id, context, {
+          delivery: input.delivery,
+          message: input.message,
+          reason: "the event stream ended before a final response",
+        });
         await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${messageText}` }, context);
         log("error", "turn run observer ended without final", { ...context, error: messageText });
       }
@@ -601,7 +612,11 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
       const messageText = formatError(error);
       await progress.finalize();
       runs.finishIfActive({ id: input.run.id, status: "error", error: messageText, opencodeMessageId: input.handle.id });
-      expirePendingPermissionsForRun(input.run.id, context);
+      await expirePendingPermissionsForRun(input.run.id, context, {
+        delivery: input.delivery,
+        message: input.message,
+        reason: "the observer failed",
+      });
       await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${messageText}` }, context);
       log("error", "turn run observer failed", { ...context, error: messageText });
     } finally {
@@ -623,7 +638,11 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     const finished = runs.finishIfActive({ id: input.run.id, status: "error", error: messageText, opencodeMessageId: input.handle.id });
     if (!finished) return;
 
-    expirePendingPermissionsForRun(input.run.id, context);
+    await expirePendingPermissionsForRun(input.run.id, context, {
+      delivery: input.delivery,
+      message: input.message,
+      reason: "the run timed out",
+    });
     await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${messageText}` }, context);
     log("error", "turn run timed out", { ...context, error: messageText });
   }
@@ -647,14 +666,22 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
           context,
         );
         runs.finishIfActive({ id: input.run.id, status: "completed", opencodeMessageId: input.handle.id });
-        expirePendingPermissionsForRun(input.run.id, context);
+        await expirePendingPermissionsForRun(input.run.id, context, {
+          delivery: input.delivery,
+          message: input.message,
+          reason: "the run completed",
+        });
         log("info", "turn run final sent", context);
         return true;
       }
       case "error": {
         await progress.finalize();
         runs.finishIfActive({ id: input.run.id, status: "error", error: event.message, opencodeMessageId: input.handle.id });
-        expirePendingPermissionsForRun(input.run.id, context);
+        await expirePendingPermissionsForRun(input.run.id, context, {
+          delivery: input.delivery,
+          message: input.message,
+          reason: "the run failed",
+        });
         await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${event.message}` }, context);
         log("error", "turn run failed", { ...context, error: event.message, retryable: event.retryable });
         return true;
@@ -680,7 +707,11 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         if (event.status === "aborted") {
           progress.cancel();
           runs.finishIfActive({ id: input.run.id, status: "aborted", opencodeMessageId: input.handle.id });
-          expirePendingPermissionsForRun(input.run.id, context);
+          await expirePendingPermissionsForRun(input.run.id, context, {
+            delivery: input.delivery,
+            message: input.message,
+            reason: "the run was aborted",
+          });
           log("info", "turn run observed abort", context);
           return true;
         }
@@ -689,7 +720,11 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
           await progress.finalize();
           const message = "OpenCode session reported an error.";
           runs.finishIfActive({ id: input.run.id, status: "error", error: message, opencodeMessageId: input.handle.id });
-          expirePendingPermissionsForRun(input.run.id, context);
+          await expirePendingPermissionsForRun(input.run.id, context, {
+            delivery: input.delivery,
+            message: input.message,
+            reason: "the session reported an error",
+          });
           await deliverSafely(input, { kind: "error", format: "plain", text: `OpenCode error: ${message}` }, context);
           log("error", "turn run observed error status", context);
           return true;
@@ -822,7 +857,11 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     }
   }
 
-  function expirePendingPermissionsForRun(runId: string, context: GatewayLogContext): void {
+  async function expirePendingPermissionsForRun(
+    runId: string,
+    context: GatewayLogContext,
+    notification?: PendingPermissionExpiryNotification,
+  ): Promise<void> {
     if (!pendingPermissions) return;
 
     try {
@@ -833,9 +872,50 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         ...context,
         pendingPermissionIds: expired.map((permission) => permission.id),
       });
+
+      if (notification) {
+        for (const permission of expired) {
+          await notifyExpiredPermission(permission, notification, context);
+        }
+      }
     } catch (error) {
       log("error", "turn run pending permission expiration failed", {
         ...context,
+        error: formatError(error),
+      });
+    }
+  }
+
+  async function notifyExpiredPermission(
+    permission: PendingPermissionRecord,
+    notification: PendingPermissionExpiryNotification,
+    context: GatewayLogContext,
+  ): Promise<void> {
+    if (!permission.actionMessageReceiptId) return;
+
+    const message = expiredPermissionMessage(permission, notification.reason);
+
+    if (notification.delivery.edit) {
+      try {
+        await notification.delivery.edit(expiredPermissionReceipt(permission, notification.message), message);
+        log("info", "permission request card expired", { ...context, permissionId: permission.id });
+        return;
+      } catch (error) {
+        log("warn", "permission request expiry edit failed", {
+          ...context,
+          permissionId: permission.id,
+          error: formatError(error),
+        });
+      }
+    }
+
+    try {
+      const receipt = await notification.delivery.send(message);
+      if (receipt) recordDeliveryReceipt(permission.runId, message, receipt, context);
+    } catch (error) {
+      log("error", "permission request expiry delivery failed", {
+        ...context,
+        permissionId: permission.id,
         error: formatError(error),
       });
     }
@@ -896,11 +976,30 @@ function messageMetadata(message: InboundMessage): Record<string, unknown> {
   };
 }
 
+function expiredPermissionMessage(permission: PendingPermissionRecord, reason: string): OutboundMessage {
+  return {
+    kind: "status",
+    format: "markdown",
+    text: `Permission request ${permission.id} expired because ${reason}.`,
+  };
+}
+
+function expiredPermissionReceipt(permission: PendingPermissionRecord, message: InboundMessage): SendReceipt {
+  return {
+    channel: message.channel,
+    accountId: message.accountId,
+    conversationKey: message.conversation.key,
+    platformMessageId: permission.actionMessageReceiptId ?? "",
+    timestamp: message.timestamp,
+    raw: { chatId: message.conversation.id },
+  };
+}
+
 function createRuntimeTurnPlan(resolution: ResolvedDispatch, observePermissions: boolean): RuntimeTurnPlan {
   const observesProgress = resolution.binding.verbosity === "tools" || resolution.binding.verbosity === "verbose";
 
   return {
-    finalSource: "prompt",
+    finalSource: "events",
     progressSource: observesProgress ? "events" : "none",
     permissionSource: observePermissions ? "events" : "none",
   };
