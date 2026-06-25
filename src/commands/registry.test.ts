@@ -17,9 +17,13 @@ import type {
   AbortRuntimeTurnInput,
   AgentRuntime,
   EnsureSessionInput,
+  ListRuntimeAgentsInput,
+  ListRuntimeModelsInput,
   ListRuntimeSessionsInput,
   ObserveRuntimeTurnInput,
   PermissionResponseInput,
+  RuntimeAgent,
+  RuntimeModel,
   RuntimeSession,
   RuntimeStartedTurn,
   RuntimeTurn,
@@ -50,6 +54,22 @@ test("unknown command returns help guidance", async () => {
 
     expect(responseText(result)).toContain("Unknown command: /nope");
     expect(responseText(result)).toContain("/help");
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("help lists agent and model commands", async () => {
+  const harness = await createHarness();
+
+  try {
+    const result = await harness.router.handle(inboundMessage({ text: "/help" }));
+    const text = responseText(result);
+
+    expect(text).toContain("`/agent [name|default|clear]`");
+    expect(text).toContain("`/agents`");
+    expect(text).toContain("`/model [id|default|clear]`");
+    expect(text).toContain("`/models`");
   } finally {
     harness.database.close();
   }
@@ -113,6 +133,8 @@ test("status reports context without creating a binding", async () => {
     expect(text).toContain("Profile: CTO (cto)");
     expect(text).toContain("Target: Default workspace (default) (healthy)");
     expect(text).toContain("Session: none");
+    expect(text).toContain("Agent: cto-agent (profile default)");
+    expect(text).toContain("Model: provider/cto-model (profile default)");
     expect(harness.runtime.calls.ensureSession).toEqual([]);
     expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
   } finally {
@@ -144,6 +166,143 @@ test("status reports active run and pending permission diagnostics", async () =>
 
     expect(text).toContain(`Active run: ${run.id} (active) session=session-1 message=message-active`);
     expect(text).toContain("Pending permissions: 1 pending, 1 without action card");
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("agent and model view commands report effective defaults without creating a binding", async () => {
+  const harness = await createHarness();
+
+  try {
+    const agent = await harness.router.handle(inboundMessage({ text: "/agent" }));
+    const model = await harness.router.handle(inboundMessage({ text: "/model" }));
+
+    expect(responseText(agent)).toContain("Effective agent: cto-agent (profile default)");
+    expect(responseText(agent)).toContain("Agent override: none");
+    expect(responseText(agent)).toContain("Target default: target-agent");
+    expect(responseText(model)).toContain("Effective model: provider/cto-model (profile default)");
+    expect(responseText(model)).toContain("Model override: none");
+    expect(responseText(model)).toContain("Target default: provider/target-model");
+    expect(harness.runtime.calls.ensureSession).toEqual([]);
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("agents and models commands list available runtime selections and mark current values", async () => {
+  const harness = await createHarness();
+
+  try {
+    const agents = await harness.router.handle(inboundMessage({ text: "/agents" }));
+    const models = await harness.router.handle(inboundMessage({ text: "/models" }));
+
+    expect(responseText(agents)).toBe([
+      "OpenCode agents for Default workspace (default):",
+      "* cto-agent - CTO default",
+      "- mobile-agent - Mobile specialist",
+    ].join("\n"));
+    expect(responseText(models)).toBe([
+      "OpenCode models for Default workspace (default):",
+      "* provider/cto-model (CTO model)",
+      "- provider/custom-model (Custom model)",
+    ].join("\n"));
+    expect(harness.runtime.calls.listAgents).toEqual([expect.objectContaining({ target: expect.objectContaining({ id: "default" }) })]);
+    expect(harness.runtime.calls.listModels).toEqual([expect.objectContaining({ target: expect.objectContaining({ id: "default" }) })]);
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("agent command creates a binding, sets override, and clears it", async () => {
+  const harness = await createHarness();
+
+  try {
+    const set = await harness.router.handle(inboundMessage({ text: "/agent mobile-agent" }));
+    const bindingWithOverride = harness.repositories.bindings.getByConversationKey(conversationKey);
+
+    expect(responseText(set)).toContain("Agent override set to mobile-agent.");
+    expect(responseText(set)).toContain("Effective agent: mobile-agent (binding override)");
+    expect(bindingWithOverride?.agent).toBe("mobile-agent");
+    expect(bindingWithOverride?.opencodeSessionId).toBe("session-1");
+    expect(harness.runtime.calls.ensureSession).toHaveLength(1);
+
+    const status = await harness.router.handle(inboundMessage({ text: "/status" }));
+    expect(responseText(status)).toContain("Agent: mobile-agent (binding override)");
+
+    const clear = await harness.router.handle(inboundMessage({ text: "/agent clear" }));
+
+    expect(responseText(clear)).toContain("Agent override cleared.");
+    expect(responseText(clear)).toContain("Effective agent: cto-agent (profile default)");
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)?.agent).toBeUndefined();
+    expect(harness.runtime.calls.ensureSession).toHaveLength(1);
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("model command creates a binding, sets override, and clears it", async () => {
+  const harness = await createHarness();
+
+  try {
+    const set = await harness.router.handle(inboundMessage({ text: "/model provider/custom-model" }));
+    const bindingWithOverride = harness.repositories.bindings.getByConversationKey(conversationKey);
+
+    expect(responseText(set)).toContain("Model override set to provider/custom-model.");
+    expect(responseText(set)).toContain("Effective model: provider/custom-model (binding override)");
+    expect(bindingWithOverride?.model).toBe("provider/custom-model");
+    expect(bindingWithOverride?.opencodeSessionId).toBe("session-1");
+    expect(harness.runtime.calls.ensureSession).toHaveLength(1);
+
+    const status = await harness.router.handle(inboundMessage({ text: "/status" }));
+    expect(responseText(status)).toContain("Model: provider/custom-model (binding override)");
+
+    const clear = await harness.router.handle(inboundMessage({ text: "/model default" }));
+
+    expect(responseText(clear)).toContain("Model override cleared.");
+    expect(responseText(clear)).toContain("Effective model: provider/cto-model (profile default)");
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)?.model).toBeUndefined();
+    expect(harness.runtime.calls.ensureSession).toHaveLength(1);
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("agent and model set commands reject unavailable selections without creating a binding", async () => {
+  const harness = await createHarness();
+
+  try {
+    const missingAgent = await harness.router.handle(inboundMessage({ text: "/agent missing-agent" }));
+    const wrongCaseAgent = await harness.router.handle(inboundMessage({ text: "/agent Mobile-Agent" }));
+    const missingModel = await harness.router.handle(inboundMessage({ text: "/model provider/missing-model" }));
+
+    expect(responseText(missingAgent)).toBe("Agent not found: missing-agent. Run /agents to see available agents.");
+    expect(responseText(wrongCaseAgent)).toBe("Agent not found: Mobile-Agent. Run /agents to see available agents.");
+    expect(responseText(missingModel)).toBe("Model not found: provider/missing-model. Run /models to see available models.");
+    expect(harness.runtime.calls.ensureSession).toEqual([]);
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("normal users can view but not mutate agent and model overrides", async () => {
+  const harness = await createHarness({
+    accessRules: [{ channel: "telegram", accountId: "default", senderId: "123", role: "user" }],
+  });
+
+  try {
+    const view = await harness.router.handle(inboundMessage({ text: "/agent" }));
+    const setAgent = await harness.router.handle(inboundMessage({ text: "/agent mobile-agent" }));
+    const setModel = await harness.router.handle(inboundMessage({ text: "/model provider/custom-model" }));
+
+    expect(responseText(view)).toContain("Effective agent: cto-agent (profile default)");
+    expect(responseText(setAgent)).toBe("Agent changes require owner/admin access.");
+    expect(responseText(setModel)).toBe("Model changes require owner/admin access.");
+    expect(harness.runtime.calls.ensureSession).toEqual([]);
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
   } finally {
     harness.database.close();
   }
@@ -537,14 +696,26 @@ class FakeRuntime implements AgentRuntime {
     send: SendRuntimeMessageInput[];
     abort: AbortRuntimeTurnInput[];
     listSessions: ListRuntimeSessionsInput[];
+    listAgents: ListRuntimeAgentsInput[];
+    listModels: ListRuntimeModelsInput[];
   } = {
     ensureSession: [],
     send: [],
     abort: [],
     listSessions: [],
+    listAgents: [],
+    listModels: [],
   };
 
   sessions: RuntimeSession[] = [];
+  agents: RuntimeAgent[] = [
+    { id: "cto-agent", description: "CTO default" },
+    { id: "mobile-agent", description: "Mobile specialist" },
+  ];
+  models: RuntimeModel[] = [
+    { id: "provider/cto-model", providerId: "provider", modelId: "cto-model", name: "CTO model" },
+    { id: "provider/custom-model", providerId: "provider", modelId: "custom-model", name: "Custom model" },
+  ];
   abortError: Error | undefined;
   private nextSessionNumber = 1;
   private nextMessageNumber = 1;
@@ -604,5 +775,15 @@ class FakeRuntime implements AgentRuntime {
   async listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]> {
     this.calls.listSessions.push(input);
     return this.sessions;
+  }
+
+  async listAgents(input: ListRuntimeAgentsInput): Promise<RuntimeAgent[]> {
+    this.calls.listAgents.push(input);
+    return this.agents;
+  }
+
+  async listModels(input: ListRuntimeModelsInput): Promise<RuntimeModel[]> {
+    this.calls.listModels.push(input);
+    return this.models;
   }
 }

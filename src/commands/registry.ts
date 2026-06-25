@@ -1,12 +1,12 @@
 import type { InboundMessage } from "../channels/types.ts";
-import type { GatewayConfig } from "../config/schema.ts";
+import type { AccessRole, GatewayConfig } from "../config/schema.ts";
 import type { DispatchResolver, DispatchResolverRepositories } from "../dispatch/resolver.ts";
 import type { PendingPermissionRepository } from "../db/repositories/pending-permissions.ts";
 import type { ConversationBindingRecord, ProfileRecord, RunRecord, TargetRecord } from "../db/types.ts";
 import type { ActiveTurnDiagnostics, TurnRunner } from "../gateway/turn-runner.ts";
 import type { PermissionDecision, PermissionInteractionService } from "../interactive/permissions.ts";
 import type { OutboundMessage } from "../messages/types.ts";
-import type { AgentRuntime, RuntimeSession } from "../opencode/types.ts";
+import type { AgentRuntime, RuntimeAgent, RuntimeModel, RuntimeSession } from "../opencode/types.ts";
 
 export type GatewayHealthStatus = "healthy" | "unhealthy" | "unknown" | "configured" | (string & {});
 
@@ -37,6 +37,15 @@ export interface CommandRouter {
 interface ParsedCommand {
   name: string;
   args: string[];
+}
+
+type BindingOverrideKind = "agent" | "model";
+
+type EffectiveValueSource = "binding override" | "profile default" | "target default" | "none";
+
+interface EffectiveRuntimeValue {
+  value?: string;
+  source: EffectiveValueSource;
 }
 
 export function createCommandRouter(options: CommandRouterOptions): CommandRouter {
@@ -74,6 +83,14 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
         return profilesText(message);
       case "profile":
         return command.args.length === 0 ? currentProfileText(message) : switchProfileText(message, command.args[0]);
+      case "agents":
+        return agentsText(message);
+      case "agent":
+        return bindingOverrideText("agent", message, command.args);
+      case "models":
+        return modelsText(message);
+      case "model":
+        return bindingOverrideText("model", message, command.args);
       case "permission":
         return permissionText(message, command.args);
       default:
@@ -101,6 +118,10 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       "`/use-session <id>` - Rebind this conversation to an existing session.",
       "`/profiles` - List available gateway profiles.",
       "`/profile [id]` - Show or switch the active profile.",
+      "`/agents` - List available OpenCode agents for the active target.",
+      "`/agent [name|default|clear]` - Show, set, or clear the per-binding agent override.",
+      "`/models` - List available OpenCode models for the active target.",
+      "`/model [id|default|clear]` - Show, set, or clear the per-binding model override.",
       "`/permission approve|deny|always <id>` - Respond to an OpenCode permission request.",
     ].join("\n");
   }
@@ -127,6 +148,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       `Profile: ${formatProfile(profile)}`,
       `Target: ${formatTarget(target)} (${targetHealth})`,
       `Session: ${binding?.opencodeSessionId ?? "none"}${binding?.sessionName ? ` (${binding.sessionName})` : ""}`,
+      `Agent: ${formatEffectiveValue(resolveEffectiveAgentValue(binding, profile, target))}`,
+      `Model: ${formatEffectiveValue(resolveEffectiveModelValue(binding, profile, target))}`,
       `Active run: ${formatRun(activeRun, activeDiagnostics)}`,
       `Queue: ${formatQueue(queueDiagnostics)}`,
       `Pending permissions: ${formatPendingPermissions(pendingPermissions)}`,
@@ -320,6 +343,141 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
     return options.permissionService.handleFallbackCommand(message, decision, args[1]);
   }
 
+  async function agentsText(message: InboundMessage): Promise<string> {
+    const context = getConversationRuntimeContext(message);
+    if (!context.profile) return `Profile not found: ${config.defaults.profile}`;
+    if (!context.target) return `OpenCode target not found: ${context.profile.defaultTargetId}`;
+
+    try {
+      const agents = await runtime.listAgents({ target: context.target });
+      if (agents.length === 0) return `No OpenCode agents found for target ${context.target.id}.`;
+
+      const current = resolveEffectiveAgentValue(context.binding, context.profile, context.target).value;
+
+      return [
+        `OpenCode agents for ${formatTarget(context.target)}:`,
+        ...agents.map((agent) => formatAgentLine(agent, current)),
+      ].join("\n");
+    } catch (error) {
+      return `Unable to list agents: ${formatError(error)}`;
+    }
+  }
+
+  async function modelsText(message: InboundMessage): Promise<string> {
+    const context = getConversationRuntimeContext(message);
+    if (!context.profile) return `Profile not found: ${config.defaults.profile}`;
+    if (!context.target) return `OpenCode target not found: ${context.profile.defaultTargetId}`;
+
+    try {
+      const models = await runtime.listModels({ target: context.target });
+      if (models.length === 0) return `No OpenCode models found for target ${context.target.id}.`;
+
+      const current = resolveEffectiveModelValue(context.binding, context.profile, context.target).value;
+
+      return [
+        `OpenCode models for ${formatTarget(context.target)}:`,
+        ...models.map((model) => formatModelLine(model, current)),
+      ].join("\n");
+    } catch (error) {
+      return `Unable to list models: ${formatError(error)}`;
+    }
+  }
+
+  async function bindingOverrideText(kind: BindingOverrideKind, message: InboundMessage, args: string[]): Promise<string> {
+    if (args.length === 0) return currentBindingOverrideText(kind, message);
+    if (args.length > 1) return overrideUsage(kind);
+
+    const decision = resolver.authorizeSender(message);
+    if (!decision.allowed) return deniedDecisionText(decision.reason);
+    if (!isAdminRole(decision.role)) return `${overrideLabel(kind)} changes require owner/admin access.`;
+
+    const value = args[0];
+    if (!value) return overrideUsage(kind);
+
+    if (isClearOverrideValue(value)) return clearBindingOverrideText(kind, message);
+
+    const validation = await validateBindingOverride(kind, message, value);
+    if (!validation.valid) return validation.message;
+
+    const bindingResult = await resolver.ensureBindingForMessage(message);
+    if (bindingResult.status === "denied") return deniedDecisionText(bindingResult.decision.reason);
+
+    const updated = updateBindingOverride(kind, message.conversation.key, value);
+    if (!updated) return `Unable to set ${kind} override: conversation binding not found.`;
+
+    const context = getConversationRuntimeContext(message);
+
+    return [
+      `${overrideLabel(kind)} override set to ${value}.`,
+      `Effective ${kind}: ${formatEffectiveValue(resolveEffectiveValue(kind, context.binding, context.profile, context.target))}`,
+    ].join("\n");
+  }
+
+  function currentBindingOverrideText(kind: BindingOverrideKind, message: InboundMessage): string {
+    const context = getConversationRuntimeContext(message);
+
+    return [
+      `Effective ${kind}: ${formatEffectiveValue(resolveEffectiveValue(kind, context.binding, context.profile, context.target))}`,
+      `${overrideLabel(kind)} override: ${overrideValue(kind, context.binding) ?? "none"}`,
+      `Profile default: ${profileDefaultValue(kind, context.profile) ?? "none"}`,
+      `Target default: ${targetDefaultValue(kind, context.target) ?? "none"}`,
+    ].join("\n");
+  }
+
+  function clearBindingOverrideText(kind: BindingOverrideKind, message: InboundMessage): string {
+    const existing = repositories.bindings.getByConversationKey(message.conversation.key);
+
+    if (!existing) {
+      const context = getConversationRuntimeContext(message);
+
+      return [
+        `No ${kind} override is set.`,
+        `Effective ${kind}: ${formatEffectiveValue(resolveEffectiveValue(kind, context.binding, context.profile, context.target))}`,
+      ].join("\n");
+    }
+
+    const updated = updateBindingOverride(kind, message.conversation.key, null);
+    if (!updated) return `Unable to clear ${kind} override: conversation binding not found.`;
+
+    const context = getConversationRuntimeContext(message);
+
+    return [
+      `${overrideLabel(kind)} override cleared.`,
+      `Effective ${kind}: ${formatEffectiveValue(resolveEffectiveValue(kind, context.binding, context.profile, context.target))}`,
+    ].join("\n");
+  }
+
+  function updateBindingOverride(kind: BindingOverrideKind, conversationKey: string, value: string | null): ConversationBindingRecord | undefined {
+    if (kind === "agent") return repositories.bindings.updateAgent({ conversationKey, agent: value });
+    return repositories.bindings.updateModel({ conversationKey, model: value });
+  }
+
+  async function validateBindingOverride(
+    kind: BindingOverrideKind,
+    message: InboundMessage,
+    value: string,
+  ): Promise<{ valid: true } | { valid: false; message: string }> {
+    const context = getConversationRuntimeContext(message);
+    if (!context.profile) return { valid: false, message: `Profile not found: ${config.defaults.profile}` };
+    if (!context.target) return { valid: false, message: `OpenCode target not found: ${context.profile.defaultTargetId}` };
+
+    try {
+      if (kind === "agent") {
+        const agents = await runtime.listAgents({ target: context.target });
+        if (agents.some((agent) => agent.id === value)) return { valid: true };
+
+        return { valid: false, message: `Agent not found: ${value}. Run /agents to see available agents.` };
+      }
+
+      const models = await runtime.listModels({ target: context.target });
+      if (models.some((model) => model.id === value)) return { valid: true };
+
+      return { valid: false, message: `Model not found: ${value}. Run /models to see available models.` };
+    } catch (error) {
+      return { valid: false, message: `Unable to validate ${kind}: ${formatError(error)}` };
+    }
+  }
+
   function getConversationRuntimeContext(message: InboundMessage): {
     binding?: ConversationBindingRecord;
     profile?: ProfileRecord;
@@ -449,6 +607,93 @@ function formatProfileLine(profile: ProfileRecord, currentProfileId: string): st
   const description = profile.description ? ` - ${profile.description}` : "";
 
   return `${marker} ${profile.id}: ${profile.displayName}${description}`;
+}
+
+function formatAgentLine(agent: RuntimeAgent, currentAgent: string | undefined): string {
+  const marker = agent.id === currentAgent ? "*" : "-";
+  const name = agent.name ? ` (${agent.name})` : "";
+  const description = agent.description ? ` - ${agent.description}` : "";
+
+  return `${marker} ${agent.id}${name}${description}`;
+}
+
+function formatModelLine(model: RuntimeModel, currentModel: string | undefined): string {
+  const marker = model.id === currentModel ? "*" : "-";
+  const name = model.name ? ` (${model.name})` : "";
+
+  return `${marker} ${model.id}${name}`;
+}
+
+function resolveEffectiveValue(
+  kind: BindingOverrideKind,
+  binding: ConversationBindingRecord | undefined,
+  profile: ProfileRecord | undefined,
+  target: TargetRecord | undefined,
+): EffectiveRuntimeValue {
+  if (kind === "agent") return resolveEffectiveAgentValue(binding, profile, target);
+  return resolveEffectiveModelValue(binding, profile, target);
+}
+
+function resolveEffectiveAgentValue(
+  binding: ConversationBindingRecord | undefined,
+  profile: ProfileRecord | undefined,
+  target: TargetRecord | undefined,
+): EffectiveRuntimeValue {
+  return resolveEffectiveRuntimeValue(binding?.agent, profile?.defaultAgent, target?.defaultAgent);
+}
+
+function resolveEffectiveModelValue(
+  binding: ConversationBindingRecord | undefined,
+  profile: ProfileRecord | undefined,
+  target: TargetRecord | undefined,
+): EffectiveRuntimeValue {
+  return resolveEffectiveRuntimeValue(binding?.model, profile?.defaultModel, target?.defaultModel);
+}
+
+function resolveEffectiveRuntimeValue(
+  bindingValue: string | undefined,
+  profileValue: string | undefined,
+  targetValue: string | undefined,
+): EffectiveRuntimeValue {
+  if (bindingValue) return { value: bindingValue, source: "binding override" };
+  if (profileValue) return { value: profileValue, source: "profile default" };
+  if (targetValue) return { value: targetValue, source: "target default" };
+  return { source: "none" };
+}
+
+function formatEffectiveValue(value: EffectiveRuntimeValue): string {
+  return value.value ? `${value.value} (${value.source})` : "none";
+}
+
+function overrideValue(kind: BindingOverrideKind, binding: ConversationBindingRecord | undefined): string | undefined {
+  return kind === "agent" ? binding?.agent : binding?.model;
+}
+
+function profileDefaultValue(kind: BindingOverrideKind, profile: ProfileRecord | undefined): string | undefined {
+  return kind === "agent" ? profile?.defaultAgent : profile?.defaultModel;
+}
+
+function targetDefaultValue(kind: BindingOverrideKind, target: TargetRecord | undefined): string | undefined {
+  return kind === "agent" ? target?.defaultAgent : target?.defaultModel;
+}
+
+function overrideLabel(kind: BindingOverrideKind): string {
+  return kind === "agent" ? "Agent" : "Model";
+}
+
+function overrideUsage(kind: BindingOverrideKind): string {
+  if (kind === "agent") return "Usage: `/agent [name|default|clear]`";
+  return "Usage: `/model [id|default|clear]`";
+}
+
+function isClearOverrideValue(value: string): boolean {
+  const normalized = value.toLowerCase();
+
+  return normalized === "default" || normalized === "clear";
+}
+
+function isAdminRole(role: AccessRole | undefined): boolean {
+  return role === "owner" || role === "admin";
 }
 
 function titleCase(value: string): string {

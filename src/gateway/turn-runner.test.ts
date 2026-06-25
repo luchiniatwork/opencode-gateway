@@ -17,10 +17,14 @@ import type {
   AbortRuntimeTurnInput,
   AgentRuntime,
   EnsureSessionInput,
+  ListRuntimeAgentsInput,
+  ListRuntimeModelsInput,
   ListRuntimeSessionsInput,
   ObserveRuntimeTurnInput,
   PermissionResponseInput,
+  RuntimeAgent,
   RuntimeEvent,
+  RuntimeModel,
   RuntimeSession,
   RuntimeStartedTurn,
   RuntimeTurn,
@@ -1058,5 +1062,13 @@ class FakeRuntime implements AgentRuntime {
 
   async listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]> {
     return [{ id: input.target.id, targetId: input.target.id }];
+  }
+
+  async listAgents(_input: ListRuntimeAgentsInput): Promise<RuntimeAgent[]> {
+    return [];
+  }
+
+  async listModels(_input: ListRuntimeModelsInput): Promise<RuntimeModel[]> {
+    return [];
   }
 }

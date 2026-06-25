@@ -26,10 +26,14 @@ import type {
   AbortRuntimeTurnInput,
   AgentRuntime,
   EnsureSessionInput,
+  ListRuntimeAgentsInput,
+  ListRuntimeModelsInput,
   ListRuntimeSessionsInput,
   ObserveRuntimeTurnInput,
   PermissionResponseInput,
+  RuntimeAgent,
   RuntimeEvent,
+  RuntimeModel,
   RuntimeSession,
   RuntimeStartedTurn,
   RuntimeTurn,
@@ -133,6 +137,38 @@ test("gateway app fails fast when profile routing points at a managed target", a
   expect(error instanceof Error ? error.message : "").toContain(
     "Phase 1 only supports attach-mode OpenCode targets for profile routing: default (managed)",
   );
+});
+
+test("gateway app fails fast when OpenCode target is unavailable", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new FakeRuntime();
+  runtime.listAgentsError = new Error("Unable to connect");
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  let error: unknown;
+
+  try {
+    await app.start();
+  } catch (caught) {
+    error = caught;
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+
+  expect(error).toBeInstanceOf(Error);
+  expect(error instanceof Error ? error.message : "").toContain(
+    "OpenCode target default is unavailable at http://127.0.0.1:4096. Start OpenCode with `opencode serve` before starting the gateway. Unable to connect",
+  );
+  expect(channel.started).toBe(false);
+  expect(app.status.databaseConnected).toBe(false);
 });
 
 test("gateway app dispatches non-command messages to OpenCode and sends final response", async () => {
@@ -568,6 +604,86 @@ test("gateway app starts queued messages with the current binding state", async 
     }));
   } finally {
     runtime.finishFirstSend();
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app uses agent and model command overrides for future turns", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new FakeRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "/agent mobile-agent", commandText: "/agent mobile-agent" }));
+    await waitForSent(channel, 1);
+
+    await channel.emit(
+      inboundMessage({ id: "message-2", text: "/model provider/custom-model", commandText: "/model provider/custom-model" }),
+    );
+    await waitForSent(channel, 2);
+
+    await channel.emit(inboundMessage({ id: "message-3", text: "inspect" }));
+    await waitForSent(channel, 3);
+
+    expect(channel.sent.map((entry) => entry.message.text)).toEqual([
+      expect.stringContaining("Agent override set to mobile-agent."),
+      expect.stringContaining("Model override set to provider/custom-model."),
+      "answer-1",
+    ]);
+    expect(runtime.calls.startTurn).toEqual([
+      expect.objectContaining({
+        text: "inspect",
+        sessionId: "session-1",
+        agent: "mobile-agent",
+        model: "provider/custom-model",
+      }),
+    ]);
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app rejects unavailable agent and model selections", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new FakeRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "/agent missing-agent", commandText: "/agent missing-agent" }));
+    await waitForSent(channel, 1);
+
+    await channel.emit(inboundMessage({ id: "message-2", text: "/model provider/missing", commandText: "/model provider/missing" }));
+    await waitForSent(channel, 2);
+
+    await channel.emit(inboundMessage({ id: "message-3", text: "/status", commandText: "/status" }));
+    await waitForSent(channel, 3);
+
+    expect(channel.sent.map((entry) => entry.message.text)).toEqual([
+      "Agent not found: missing-agent. Run /agents to see available agents.",
+      "Model not found: provider/missing. Run /models to see available models.",
+      expect.stringContaining("Session: none"),
+    ]);
+    expect(runtime.calls.ensureSession).toEqual([]);
+    expect(runtime.calls.startTurn).toEqual([]);
+  } finally {
     await app.stop();
     await rm(dir, { recursive: true, force: true });
   }
@@ -1203,6 +1319,8 @@ class FakeRuntime implements AgentRuntime {
     observe: ObserveRuntimeTurnInput[];
     abort: AbortRuntimeTurnInput[];
     listSessions: ListRuntimeSessionsInput[];
+    listAgents: ListRuntimeAgentsInput[];
+    listModels: ListRuntimeModelsInput[];
     respondToPermission: PermissionResponseInput[];
   } = {
     ensureSession: [],
@@ -1212,12 +1330,23 @@ class FakeRuntime implements AgentRuntime {
     observe: [],
     abort: [],
     listSessions: [],
+    listAgents: [],
+    listModels: [],
     respondToPermission: [],
   };
 
   private nextSessionNumber = 1;
   private nextMessageNumber = 1;
   private sessions: RuntimeSession[] = [];
+  agents: RuntimeAgent[] = [
+    { id: "mobile-agent", description: "Mobile specialist" },
+    { id: "review-agent", description: "Review specialist" },
+  ];
+  models: RuntimeModel[] = [
+    { id: "provider/custom-model", providerId: "provider", modelId: "custom-model", name: "Custom model" },
+    { id: "provider/review-model", providerId: "provider", modelId: "review-model", name: "Review model" },
+  ];
+  listAgentsError: Error | undefined;
   protected readonly asyncAnswers = new Map<string, string>();
 
   async ensureSession(input: EnsureSessionInput): Promise<RuntimeSession> {
@@ -1349,6 +1478,17 @@ class FakeRuntime implements AgentRuntime {
   async listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]> {
     this.calls.listSessions.push(input);
     return this.sessions;
+  }
+
+  async listAgents(input: ListRuntimeAgentsInput): Promise<RuntimeAgent[]> {
+    this.calls.listAgents.push(input);
+    if (this.listAgentsError) throw this.listAgentsError;
+    return this.agents;
+  }
+
+  async listModels(input: ListRuntimeModelsInput): Promise<RuntimeModel[]> {
+    this.calls.listModels.push(input);
+    return this.models;
   }
 }
 

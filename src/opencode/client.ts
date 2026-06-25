@@ -4,10 +4,14 @@ import type {
   AbortRuntimeTurnInput,
   AgentRuntime,
   EnsureSessionInput,
+  ListRuntimeAgentsInput,
+  ListRuntimeModelsInput,
   ListRuntimeSessionsInput,
   ObserveRuntimeTurnInput,
   PermissionResponseInput,
+  RuntimeAgent,
   RuntimeEvent,
+  RuntimeModel,
   RuntimeSession,
   RuntimeStartedTurn,
   RuntimeTarget,
@@ -31,6 +35,21 @@ interface SdkSession {
     created?: number;
     updated?: number;
   };
+}
+
+interface SdkAgent {
+  id?: string;
+  name?: string;
+  description?: string;
+  mode?: string;
+  hidden?: boolean;
+  disabled?: boolean;
+  disable?: boolean;
+}
+
+interface SdkConfigProvidersResponse {
+  providers?: unknown;
+  default?: Record<string, string>;
 }
 
 interface SdkAssistantMessage {
@@ -83,6 +102,14 @@ interface SdkSessionOptions {
   body?: unknown;
 }
 
+interface SdkAppOptions {
+  query?: { directory?: string };
+}
+
+interface SdkConfigOptions {
+  query?: { directory?: string };
+}
+
 interface SdkEventSubscribeOptions {
   query?: { directory?: string };
   signal?: AbortSignal;
@@ -93,6 +120,12 @@ interface SdkEventSubscription {
 }
 
 interface OpenCodeSdkClient {
+  app: {
+    agents(options?: SdkAppOptions): Promise<SdkResult<SdkAgent[]>>;
+  };
+  config: {
+    providers(options?: SdkConfigOptions): Promise<SdkResult<SdkConfigProvidersResponse>>;
+  };
   postSessionIdPermissionsPermissionId?(options: SdkSessionOptions): Promise<SdkResult<boolean>>;
   session: {
     create(options?: SdkSessionOptions): Promise<SdkResult<SdkSession>>;
@@ -1302,6 +1335,30 @@ export class OpenCodeRuntime implements AgentRuntime {
     return input.limit === undefined ? mapped : mapped.slice(0, input.limit);
   }
 
+  async listAgents(input: ListRuntimeAgentsInput): Promise<RuntimeAgent[]> {
+    const client = this.getClient(input.target);
+    const agents = await unwrapSdkResult(
+      client.app.agents({ query: directoryQuery(input.target) }),
+      "Unable to list OpenCode agents",
+    );
+
+    return agents
+      .filter(isPrimarySelectableAgent)
+      .map(mapAgent)
+      .filter((agent): agent is RuntimeAgent => agent !== undefined)
+      .sort((left, right) => left.id.localeCompare(right.id));
+  }
+
+  async listModels(input: ListRuntimeModelsInput): Promise<RuntimeModel[]> {
+    const client = this.getClient(input.target);
+    const response = await unwrapSdkResult(
+      client.config.providers({ query: directoryQuery(input.target) }),
+      "Unable to list OpenCode models",
+    );
+
+    return mapModels(response).sort((left, right) => left.id.localeCompare(right.id));
+  }
+
   private getClient(target: RuntimeTarget): OpenCodeSdkClient {
     validateAttachTarget(target);
 
@@ -1670,6 +1727,108 @@ function mapSession(target: RuntimeTarget, session: SdkSession): RuntimeSession 
     createdAt: timestampToIso(session.time?.created),
     updatedAt: timestampToIso(session.time?.updated),
     raw: session,
+  };
+}
+
+function mapAgent(agent: SdkAgent): RuntimeAgent | undefined {
+  const id = agent.id ?? agent.name;
+  if (!id) return undefined;
+
+  return {
+    id,
+    name: agent.name && agent.name !== id ? agent.name : undefined,
+    description: agent.description,
+    mode: agent.mode,
+    raw: agent,
+  };
+}
+
+function isPrimarySelectableAgent(agent: SdkAgent): boolean {
+  if (agent.hidden || agent.disabled || agent.disable) return false;
+  if (!agent.mode) return true;
+
+  return agent.mode === "primary" || agent.mode === "all";
+}
+
+function mapModels(response: SdkConfigProvidersResponse): RuntimeModel[] {
+  const modelsById = new Map<string, RuntimeModel>();
+
+  for (const provider of providerEntries(response.providers)) {
+    if (provider.raw.enabled === false) continue;
+
+    for (const model of modelEntries(provider.id, provider.raw.models)) {
+      modelsById.set(model.id, model);
+    }
+  }
+
+  return [...modelsById.values()];
+}
+
+function providerEntries(providers: unknown): Array<{ id: string; raw: Record<string, unknown> }> {
+  if (Array.isArray(providers)) {
+    return providers.flatMap((provider) => {
+      const raw = asObject(provider);
+      const id = getObjectString(raw, "id") ?? getObjectString(raw, "providerID") ?? getObjectString(raw, "providerId");
+
+      return raw && id ? [{ id, raw }] : [];
+    });
+  }
+
+  const providerRecord = asObject(providers);
+  if (!providerRecord) return [];
+
+  return Object.entries(providerRecord).flatMap(([key, value]) => {
+    const raw = asObject(value);
+    if (!raw) return [];
+
+    const id = getObjectString(raw, "id") ?? getObjectString(raw, "providerID") ?? getObjectString(raw, "providerId") ?? key;
+
+    return id ? [{ id, raw }] : [];
+  });
+}
+
+function modelEntries(providerId: string, models: unknown): RuntimeModel[] {
+  if (Array.isArray(models)) {
+    return models.flatMap((model) => {
+      const raw = asObject(model);
+      const rawModelId = getObjectString(raw, "id") ?? getObjectString(raw, "modelID") ?? getObjectString(raw, "modelId");
+      if (!raw || !rawModelId) return [];
+
+      return [runtimeModel(providerId, rawModelId, raw)];
+    });
+  }
+
+  const modelRecord = asObject(models);
+  if (!modelRecord) return [];
+
+  return Object.entries(modelRecord).flatMap(([key, value]) => {
+    const raw = asObject(value) ?? {};
+
+    return [runtimeModel(providerId, key, raw)];
+  });
+}
+
+function runtimeModel(providerId: string, rawModelId: string, raw: Record<string, unknown>): RuntimeModel {
+  const providerOverride = getObjectString(raw, "providerID") ?? getObjectString(raw, "providerId");
+  const modelOverride = getObjectString(raw, "modelID") ?? getObjectString(raw, "modelId");
+  const ref = splitModelRef(providerOverride ?? providerId, modelOverride ?? rawModelId);
+
+  return {
+    id: `${ref.providerId}/${ref.modelId}`,
+    providerId: ref.providerId,
+    modelId: ref.modelId,
+    name: getObjectString(raw, "name"),
+    raw,
+  };
+}
+
+function splitModelRef(providerId: string, modelId: string): { providerId: string; modelId: string } {
+  const separatorIndex = modelId.indexOf("/");
+  if (separatorIndex <= 0 || separatorIndex === modelId.length - 1) return { providerId, modelId };
+
+  return {
+    providerId: modelId.slice(0, separatorIndex),
+    modelId: modelId.slice(separatorIndex + 1),
   };
 }
 

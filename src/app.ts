@@ -129,6 +129,9 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
 
       if (options.config) {
         validatePhase1RuntimeTargets(options.config);
+        const runtime = options.runtime ?? new OpenCodeRuntime();
+
+        await validateOpenCodeTargetsReachable(options.config, runtime);
 
         openedDatabase = await openGatewayDatabase(options.config.gateway.databasePath);
 
@@ -161,7 +164,6 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
             });
           }
 
-          const runtime = options.runtime ?? new OpenCodeRuntime();
           const resolver = createDispatchResolver({ config: options.config, repositories, runtime });
           diagnosticRepositories = {
             runs: repositories.runs,
@@ -600,6 +602,22 @@ function validatePhase1RuntimeTargets(config: GatewayConfig): void {
   const labels = unsupportedTargets.map((target) => `${target.id} (${target.mode})`).join(", ");
 
   throw new Error(`Phase 1 only supports attach-mode OpenCode targets for profile routing: ${labels}`);
+}
+
+async function validateOpenCodeTargetsReachable(config: GatewayConfig, runtime: AgentRuntime): Promise<void> {
+  for (const target of config.opencode.targets) {
+    if (target.mode !== "attach") continue;
+
+    try {
+      await runtime.listAgents({ target });
+    } catch (error) {
+      const server = target.serverUrl ?? "unknown server URL";
+
+      throw new Error(
+        `OpenCode target ${target.id} is unavailable at ${server}. Start OpenCode with \`opencode serve\` before starting the gateway. ${formatError(error)}`,
+      );
+    }
+  }
 }
 
 function turnStartMessages(result: StartTurnResult): OutboundMessage[] {

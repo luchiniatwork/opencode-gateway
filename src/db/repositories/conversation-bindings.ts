@@ -52,12 +52,24 @@ export interface UpdateBindingProfileInput {
   verbosity: Verbosity;
 }
 
+export interface UpdateBindingAgentInput {
+  conversationKey: string;
+  agent: string | null;
+}
+
+export interface UpdateBindingModelInput {
+  conversationKey: string;
+  model: string | null;
+}
+
 export interface ConversationBindingRepository {
   getById(id: string): ConversationBindingRecord | undefined;
   getByConversationKey(conversationKey: string): ConversationBindingRecord | undefined;
   upsert(input: UpsertConversationBindingInput): ConversationBindingRecord;
   updateSession(input: UpdateBindingSessionInput): ConversationBindingRecord | undefined;
   updateProfile(input: UpdateBindingProfileInput): ConversationBindingRecord | undefined;
+  updateAgent(input: UpdateBindingAgentInput): ConversationBindingRecord | undefined;
+  updateModel(input: UpdateBindingModelInput): ConversationBindingRecord | undefined;
 }
 
 export function createConversationBindingRepository(
@@ -170,6 +182,34 @@ export function createConversationBindingRepository(
           now().toISOString(),
           input.conversationKey,
         ) as ConversationBindingRow | null;
+
+      return row ? mapConversationBindingRow(row) : undefined;
+    },
+
+    updateAgent(input): ConversationBindingRecord | undefined {
+      const row = db
+        .query(
+          `UPDATE conversation_bindings SET
+            agent = ?,
+            updated_at = ?
+          WHERE conversation_key = ?
+          RETURNING *`,
+        )
+        .get(input.agent, now().toISOString(), input.conversationKey) as ConversationBindingRow | null;
+
+      return row ? mapConversationBindingRow(row) : undefined;
+    },
+
+    updateModel(input): ConversationBindingRecord | undefined {
+      const row = db
+        .query(
+          `UPDATE conversation_bindings SET
+            model = ?,
+            updated_at = ?
+          WHERE conversation_key = ?
+          RETURNING *`,
+        )
+        .get(input.model, now().toISOString(), input.conversationKey) as ConversationBindingRow | null;
 
       return row ? mapConversationBindingRow(row) : undefined;
     },

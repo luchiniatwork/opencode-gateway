@@ -28,6 +28,22 @@ export interface RuntimeSession {
   raw?: unknown;
 }
 
+export interface RuntimeAgent {
+  id: string;
+  name?: string;
+  description?: string;
+  mode?: string;
+  raw?: unknown;
+}
+
+export interface RuntimeModel {
+  id: string;
+  providerId: string;
+  modelId: string;
+  name?: string;
+  raw?: unknown;
+}
+
 export type RuntimeTurnStatus = "queued" | "running" | "completed" | "aborted" | "error";
 
 export interface RuntimeAttachment {
@@ -113,6 +129,14 @@ export interface ListRuntimeSessionsInput {
   cursor?: string;
 }
 
+export interface ListRuntimeAgentsInput {
+  target: RuntimeTarget;
+}
+
+export interface ListRuntimeModelsInput {
+  target: RuntimeTarget;
+}
+
 export interface PermissionResponseInput {
   target: RuntimeTarget;
   sessionId: RuntimeSessionId;
@@ -141,4 +165,6 @@ export interface AgentRuntime {
   abort(input: AbortRuntimeTurnInput): Promise<void>;
   respondToPermission(input: PermissionResponseInput): Promise<void>;
   listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]>;
+  listAgents(input: ListRuntimeAgentsInput): Promise<RuntimeAgent[]>;
+  listModels(input: ListRuntimeModelsInput): Promise<RuntimeModel[]>;
 }

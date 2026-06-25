@@ -1573,6 +1573,64 @@ test("wraps SDK error responses with an actionable message", async () => {
   );
 });
 
+test("lists OpenCode agents through the app API", async () => {
+  const sdk = createFakeSdkClient({
+    agents: [
+      { id: "build", description: "Build implementation", mode: "primary" },
+      { name: "review", description: "Review changes", mode: "all" },
+      { id: "explore", description: "Explore code", mode: "subagent" },
+      { id: "title", description: "Internal title", mode: "primary", hidden: true },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const agents = await runtime.listAgents({ target: attachTarget });
+
+  expect(agents).toEqual([
+    { id: "build", name: undefined, description: "Build implementation", mode: "primary", raw: { id: "build", description: "Build implementation", mode: "primary" } },
+    { id: "review", name: undefined, description: "Review changes", mode: "all", raw: { name: "review", description: "Review changes", mode: "all" } },
+  ]);
+  expect(sdk.calls.agents).toEqual([{ query: { directory: "/work/repo" } }]);
+});
+
+test("lists enabled OpenCode provider models through the config API", async () => {
+  const sdk = createFakeSdkClient({
+    providers: {
+      providers: {
+        openai: {
+          id: "openai",
+          enabled: { via: "env", name: "OPENAI_API_KEY" },
+          models: {
+            "gpt-5.5": { name: "GPT 5.5" },
+            "gpt-5.5-mini": {},
+          },
+        },
+        disabled: {
+          id: "disabled",
+          enabled: false,
+          models: {
+            nope: { name: "Unavailable" },
+          },
+        },
+        anthropic: {
+          id: "anthropic",
+          models: [{ id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" }],
+        },
+      },
+    },
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const models = await runtime.listModels({ target: attachTarget });
+
+  expect(models.map((model) => ({ id: model.id, providerId: model.providerId, modelId: model.modelId, name: model.name }))).toEqual([
+    { id: "anthropic/claude-sonnet-4-5", providerId: "anthropic", modelId: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
+    { id: "openai/gpt-5.5", providerId: "openai", modelId: "gpt-5.5", name: "GPT 5.5" },
+    { id: "openai/gpt-5.5-mini", providerId: "openai", modelId: "gpt-5.5-mini", name: undefined },
+  ]);
+  expect(sdk.calls.providers).toEqual([{ query: { directory: "/work/repo" } }]);
+});
+
 const attachTarget: RuntimeTarget = {
   id: "default",
   name: "Default",
@@ -1582,6 +1640,16 @@ const attachTarget: RuntimeTarget = {
 };
 
 interface FakeSdkOptions {
+  agents?: Array<{
+    id?: string;
+    name?: string;
+    description?: string;
+    mode?: string;
+    hidden?: boolean;
+    disabled?: boolean;
+    disable?: boolean;
+  }>;
+  providers?: unknown;
   createSession?: FakeSession;
   createSessionError?: unknown;
   getSession?: FakeSession;
@@ -1627,9 +1695,21 @@ interface FakePromptResponse {
 
 function createFakeSdkClient(options: FakeSdkOptions = {}) {
   const calls: Record<
-    "create" | "get" | "list" | "messages" | "prompt" | "promptAsync" | "abort" | "subscribe" | "respondToPermission",
+    | "agents"
+    | "providers"
+    | "create"
+    | "get"
+    | "list"
+    | "messages"
+    | "prompt"
+    | "promptAsync"
+    | "abort"
+    | "subscribe"
+    | "respondToPermission",
     unknown[]
   > = {
+    agents: [],
+    providers: [],
     create: [],
     get: [],
     list: [],
@@ -1641,6 +1721,8 @@ function createFakeSdkClient(options: FakeSdkOptions = {}) {
     respondToPermission: [],
   };
   const responses = {
+    agents: options.agents ?? [],
+    providers: options.providers ?? { providers: [] },
     createSession: options.createSession ?? { id: "session-created" },
     getSession: options.getSession ?? { id: "session-existing" },
     sessions: options.sessions ?? [],
@@ -1654,6 +1736,18 @@ function createFakeSdkClient(options: FakeSdkOptions = {}) {
     calls,
     responses,
     client: {
+      app: {
+        async agents(input: unknown) {
+          calls.agents.push(input);
+          return { data: responses.agents };
+        },
+      },
+      config: {
+        async providers(input: unknown) {
+          calls.providers.push(input);
+          return { data: responses.providers };
+        },
+      },
       async postSessionIdPermissionsPermissionId(input: unknown) {
         calls.respondToPermission.push(input);
         return { data: true };

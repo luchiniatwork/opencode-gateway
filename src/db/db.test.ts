@@ -211,6 +211,49 @@ test("conversation bindings keep one row per conversation key", async () => {
   }
 });
 
+test("conversation binding agent and model overrides can be set and cleared", async () => {
+  const database = await openSeededDatabase();
+
+  try {
+    const bindings = createConversationBindingRepository(database.db, {
+      now: fixedNow,
+      createId: () => "binding-1",
+    });
+    const binding = bindings.upsert({
+      conversationKey: "telegram:default:dm:123",
+      channel: "telegram",
+      accountId: "default",
+      profileId: "cto",
+      targetId: "default",
+      opencodeSessionId: "session-1",
+      busyMode: "queue",
+      verbosity: "compact",
+    });
+
+    const withAgent = bindings.updateAgent({ conversationKey: binding.conversationKey, agent: "reviewer" });
+    const withModel = bindings.updateModel({ conversationKey: binding.conversationKey, model: "provider/model" });
+
+    expect(withAgent?.agent).toBe("reviewer");
+    expect(withModel?.model).toBe("provider/model");
+    expect(bindings.getByConversationKey(binding.conversationKey)).toMatchObject({
+      agent: "reviewer",
+      model: "provider/model",
+    });
+
+    const withoutAgent = bindings.updateAgent({ conversationKey: binding.conversationKey, agent: null });
+    const withoutModel = bindings.updateModel({ conversationKey: binding.conversationKey, model: null });
+
+    expect(withoutAgent?.agent).toBeUndefined();
+    expect(withoutModel?.model).toBeUndefined();
+    expect(bindings.getByConversationKey(binding.conversationKey)).toMatchObject({
+      agent: undefined,
+      model: undefined,
+    });
+  } finally {
+    database.close();
+  }
+});
+
 test("runs can be created, queried as active, and finished", async () => {
   const database = await openSeededDatabase();
 

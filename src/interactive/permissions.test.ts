@@ -13,10 +13,14 @@ import type {
   AbortRuntimeTurnInput,
   AgentRuntime,
   EnsureSessionInput,
+  ListRuntimeAgentsInput,
+  ListRuntimeModelsInput,
   ListRuntimeSessionsInput,
   ObserveRuntimeTurnInput,
   PermissionResponseInput,
+  RuntimeAgent,
   RuntimeEvent,
+  RuntimeModel,
   RuntimeSession,
   RuntimeStartedTurn,
   RuntimeTurn,
@@ -170,6 +174,14 @@ class RecordingRuntime implements AgentRuntime {
 
   async listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]> {
     return [{ id: "session-1", targetId: input.target.id }];
+  }
+
+  async listAgents(_input: ListRuntimeAgentsInput): Promise<RuntimeAgent[]> {
+    return [];
+  }
+
+  async listModels(_input: ListRuntimeModelsInput): Promise<RuntimeModel[]> {
+    return [];
   }
 }
 

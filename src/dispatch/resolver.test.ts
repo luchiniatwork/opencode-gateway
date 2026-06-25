@@ -14,9 +14,13 @@ import type {
   AbortRuntimeTurnInput,
   AgentRuntime,
   EnsureSessionInput,
+  ListRuntimeAgentsInput,
+  ListRuntimeModelsInput,
   ListRuntimeSessionsInput,
   ObserveRuntimeTurnInput,
   PermissionResponseInput,
+  RuntimeAgent,
+  RuntimeModel,
   RuntimeSession,
   RuntimeStartedTurn,
   RuntimeTurn,
@@ -98,6 +102,49 @@ test("dispatch sends through the runtime and marks the run completed", async () 
     expect(runRows(harness.database)).toEqual([
       { id: "run-1", status: "completed", opencode_message_id: "message-1", error: null },
     ]);
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("dispatch uses binding agent and model overrides before profile defaults", async () => {
+  const harness = await createHarness();
+
+  try {
+    const bindingResult = await harness.resolver.ensureBindingForMessage(inboundMessage());
+    if (bindingResult.status !== "resolved") throw new Error("expected resolved");
+
+    harness.repositories.bindings.updateAgent({
+      conversationKey,
+      agent: "binding-agent",
+    });
+    harness.repositories.bindings.updateModel({
+      conversationKey,
+      model: "provider/binding-model",
+    });
+
+    await harness.resolver.dispatchMessage(inboundMessage({ text: "with overrides" }));
+
+    expect(harness.runtime.calls.send.at(-1)).toEqual(
+      expect.objectContaining({
+        text: "with overrides",
+        agent: "binding-agent",
+        model: "provider/binding-model",
+      }),
+    );
+
+    harness.repositories.bindings.updateAgent({ conversationKey, agent: null });
+    harness.repositories.bindings.updateModel({ conversationKey, model: null });
+
+    await harness.resolver.dispatchMessage(inboundMessage({ text: "after clear" }));
+
+    expect(harness.runtime.calls.send.at(-1)).toEqual(
+      expect.objectContaining({
+        text: "after clear",
+        agent: "cto-agent",
+        model: "provider/cto-model",
+      }),
+    );
   } finally {
     harness.database.close();
   }
@@ -419,11 +466,15 @@ class FakeRuntime implements AgentRuntime {
     send: SendRuntimeMessageInput[];
     abort: AbortRuntimeTurnInput[];
     listSessions: ListRuntimeSessionsInput[];
+    listAgents: ListRuntimeAgentsInput[];
+    listModels: ListRuntimeModelsInput[];
   } = {
     ensureSession: [],
     send: [],
     abort: [],
     listSessions: [],
+    listAgents: [],
+    listModels: [],
   };
 
   readonly missingSessionIds = new Set<string>();
@@ -490,6 +541,16 @@ class FakeRuntime implements AgentRuntime {
 
   async listSessions(input: ListRuntimeSessionsInput): Promise<RuntimeSession[]> {
     this.calls.listSessions.push(input);
+    return [];
+  }
+
+  async listAgents(input: ListRuntimeAgentsInput): Promise<RuntimeAgent[]> {
+    this.calls.listAgents.push(input);
+    return [];
+  }
+
+  async listModels(input: ListRuntimeModelsInput): Promise<RuntimeModel[]> {
+    this.calls.listModels.push(input);
     return [];
   }
 }
