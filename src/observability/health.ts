@@ -18,6 +18,10 @@ export interface GatewayHealthSnapshot {
 }
 
 export interface GatewayRuntimeHealthSnapshot {
+  activeRunCount: number;
+  queuedTurnCount: number;
+  queuedBindingCount: number;
+  pendingPermissionCount: number;
   activeRuns: Array<{
     id: string;
     bindingId: string;

@@ -25,6 +25,11 @@ import type { ProgressDelivery } from "./delivery/renderer.ts";
 import { createDispatchResolver } from "./dispatch/resolver.ts";
 import { createTurnRunner, type StartTurnResult, type TurnRunner } from "./gateway/turn-runner.ts";
 import { createPermissionInteractionService, type PermissionInteractionService } from "./interactive/permissions.ts";
+import {
+  createInboundMessageDebouncer,
+  type DebouncedMessage,
+  type InboundMessageDebouncer,
+} from "./messages/debounce.ts";
 import type { OutboundMessage } from "./messages/types.ts";
 import {
   createHealthSnapshot,
@@ -75,6 +80,10 @@ export interface GatewayAppOptions {
   turnRunTimeoutMs?: number;
 }
 
+interface DebounceContext {
+  delivery: ProgressDelivery;
+}
+
 export function createApp(options: GatewayAppOptions = {}): GatewayApp {
   const logger = options.logger ?? createJsonLogSink({ level: options.config?.gateway.logLevel });
   const now = options.now ?? (() => new Date());
@@ -84,6 +93,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
   let healthServer: ReturnType<typeof Bun.serve> | undefined;
   let turnRunner: TurnRunner | undefined;
   let permissionService: PermissionInteractionService | undefined;
+  let inboundDebouncer: InboundMessageDebouncer<DebounceContext> | undefined;
   let diagnosticRepositories: {
     runs: ReturnType<typeof createRunRepository>;
     pendingPermissions: ReturnType<typeof createPendingPermissionRepository>;
@@ -220,6 +230,101 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
               };
             },
           });
+          const dispatchMessage = async (message: InboundMessage, delivery: ProgressDelivery): Promise<OutboundMessage[]> => {
+            const bindingResult = await resolver.ensureBindingForMessage(message);
+
+            if (bindingResult.status === "denied") {
+              log("warn", "dispatch denied", {
+                ...messageLogContext(message),
+                reason: bindingResult.decision.reason,
+              });
+
+              return deniedMessages(bindingResult.decision.reason);
+            }
+
+            if (!turnRunner) throw new Error("Turn runner is not initialized");
+
+            const startResult = await turnRunner.start({
+              message,
+              resolution: bindingResult.resolution,
+              delivery,
+              signal: abortController?.signal,
+            });
+            logTurnStartResult(startResult, message);
+
+            return turnStartMessages(startResult);
+          };
+          const flushDebouncedMessage = async (batch: DebouncedMessage<DebounceContext>): Promise<void> => {
+            log("info", "debounce flushed", debounceLogContext(batch));
+
+            const responses = await dispatchMessage(batch.message, batch.context.delivery);
+
+            for (const response of responses) {
+              await batch.context.delivery.send(response);
+            }
+          };
+          const handleDebounceError = async (error: unknown, batch: DebouncedMessage<DebounceContext>): Promise<void> => {
+            log("error", "debounce flush failed", {
+              ...debounceLogContext(batch),
+              error: formatError(error),
+            });
+
+            await batch.context.delivery.send({
+              kind: "error",
+              format: "plain",
+              text: `Gateway error: ${formatError(error)}`,
+            });
+          };
+          inboundDebouncer = options.config.defaults.inboundDebounceMs > 0
+            ? createInboundMessageDebouncer<DebounceContext>({
+              delayMs: options.config.defaults.inboundDebounceMs,
+              now,
+              onFlush: flushDebouncedMessage,
+              onError: handleDebounceError,
+            })
+            : undefined;
+          const routeInboundMessage = async (message: InboundMessage, delivery: ProgressDelivery): Promise<OutboundMessage[]> => {
+            log("info", "inbound message received", messageLogContext(message));
+
+            const commandResult = await commandRouter.handle(message);
+
+            if (commandResult.handled) {
+              log("info", "gateway command handled", {
+                ...messageLogContext(message),
+                command: commandResult.command,
+              });
+
+              return commandResult.messages;
+            }
+
+            const decision = resolver.authorizeSender(message);
+
+            if (!decision.allowed) {
+              log("warn", "dispatch denied", {
+                ...messageLogContext(message),
+                reason: decision.reason,
+              });
+
+              return deniedMessages(decision.reason);
+            }
+
+            if (inboundDebouncer) {
+              const scheduled = inboundDebouncer.enqueue({ message, context: { delivery } });
+
+              log("info", "debounce queued", {
+                ...messageLogContext(message),
+                firstMessageId: scheduled.firstMessageId,
+                lastMessageId: scheduled.lastMessageId,
+                messageCount: scheduled.messageCount,
+                queuedAt: scheduled.queuedAt,
+                flushAfterMs: scheduled.flushAfterMs,
+              });
+
+              return [];
+            }
+
+            return dispatchMessage(message, delivery);
+          };
           const channels = options.channels ?? configuredChannels(options.config, options.createTelegramAdapter);
 
           for (const channel of channels) {
@@ -233,43 +338,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
                 signal: abortController.signal,
                 logger: channelLogger(channel.adapter.id, channel.accountId),
                 emit: async (event) => {
-                  await handleChannelEvent(channel, event, async (message, delivery) => {
-                    log("info", "inbound message received", messageLogContext(message));
-
-                    const commandResult = await commandRouter.handle(message);
-
-                    if (commandResult.handled) {
-                      log("info", "gateway command handled", {
-                        ...messageLogContext(message),
-                        command: commandResult.command,
-                      });
-
-                      return commandResult.messages;
-                    }
-
-                    const bindingResult = await resolver.ensureBindingForMessage(message);
-
-                    if (bindingResult.status === "denied") {
-                      log("warn", "dispatch denied", {
-                        ...messageLogContext(message),
-                        reason: bindingResult.decision.reason,
-                      });
-
-                      return deniedMessages(bindingResult.decision.reason);
-                    }
-
-                    if (!turnRunner) throw new Error("Turn runner is not initialized");
-
-                    const startResult = await turnRunner.start({
-                      message,
-                      resolution: bindingResult.resolution,
-                      delivery,
-                      signal: abortController?.signal,
-                    });
-                    logTurnStartResult(startResult, message);
-
-                    return turnStartMessages(startResult);
-                  });
+                  await handleChannelEvent(channel, event, routeInboundMessage);
                 },
               });
               channelStatuses.set(channelStatusKey(channel), "running");
@@ -292,6 +361,8 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
 
           startHealthServer(options.config);
         } catch (error) {
+          await inboundDebouncer?.stop();
+          inboundDebouncer = undefined;
           await turnRunner?.stop();
           turnRunner = undefined;
           permissionService = undefined;
@@ -313,6 +384,8 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       if (!started) return;
 
       started = false;
+      await inboundDebouncer?.stop();
+      inboundDebouncer = undefined;
       abortController?.abort();
       await turnRunner?.stop();
       turnRunner = undefined;
@@ -518,22 +591,30 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
   function runtimeHealthSnapshot(): GatewayRuntimeHealthSnapshot | undefined {
     if (!diagnosticRepositories) return undefined;
 
+    const activeRuns = diagnosticRepositories.runs.listActive().map((run) => ({
+      id: run.id,
+      bindingId: run.bindingId,
+      sessionId: run.opencodeSessionId,
+      opencodeMessageId: run.opencodeMessageId,
+      startedAt: run.startedAt,
+    }));
+    const queuedTurns = turnRunner?.listQueueDiagnostics() ?? [];
+    const pendingPermissions = diagnosticRepositories.pendingPermissions.listPending().map((permission) => ({
+      id: permission.id,
+      runId: permission.runId,
+      opencodePermissionId: permission.opencodePermissionId,
+      hasActionMessageReceipt: Boolean(permission.actionMessageReceiptId),
+      expiresAt: permission.expiresAt,
+    }));
+
     return {
-      activeRuns: diagnosticRepositories.runs.listActive().map((run) => ({
-        id: run.id,
-        bindingId: run.bindingId,
-        sessionId: run.opencodeSessionId,
-        opencodeMessageId: run.opencodeMessageId,
-        startedAt: run.startedAt,
-      })),
-      queuedTurns: turnRunner?.listQueueDiagnostics() ?? [],
-      pendingPermissions: diagnosticRepositories.pendingPermissions.listPending().map((permission) => ({
-        id: permission.id,
-        runId: permission.runId,
-        opencodePermissionId: permission.opencodePermissionId,
-        hasActionMessageReceipt: Boolean(permission.actionMessageReceiptId),
-        expiresAt: permission.expiresAt,
-      })),
+      activeRunCount: activeRuns.length,
+      queuedTurnCount: queuedTurns.reduce((count, queue) => count + queue.size, 0),
+      queuedBindingCount: queuedTurns.length,
+      pendingPermissionCount: pendingPermissions.length,
+      activeRuns,
+      queuedTurns,
+      pendingPermissions,
     };
   }
 
@@ -568,6 +649,18 @@ function messageLogContext(message: InboundMessage): GatewayLogContext {
     channel: message.channel,
     accountId: message.accountId,
     conversationKey: message.conversation.key,
+  };
+}
+
+function debounceLogContext(batch: DebouncedMessage<DebounceContext>): GatewayLogContext {
+  return {
+    ...messageLogContext(batch.message),
+    firstMessageId: batch.firstMessageId,
+    lastMessageId: batch.lastMessageId,
+    messageCount: batch.messageCount,
+    queuedAt: batch.queuedAt,
+    flushedAt: batch.flushedAt,
+    debounceReason: batch.reason,
   };
 }
 

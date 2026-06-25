@@ -30,6 +30,78 @@ test("health snapshot is not ok when a channel is in error", () => {
   expect(snapshot.ok).toBe(false);
 });
 
+test("health snapshot includes runtime diagnostics when provided", () => {
+  const snapshot = createHealthSnapshot({
+    config: testConfig(),
+    started: true,
+    runtime: {
+      activeRunCount: 1,
+      queuedTurnCount: 2,
+      queuedBindingCount: 1,
+      pendingPermissionCount: 1,
+      activeRuns: [
+        {
+          id: "run-1",
+          bindingId: "binding-1",
+          sessionId: "session-1",
+          opencodeMessageId: "message-1",
+          startedAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      queuedTurns: [
+        {
+          bindingId: "binding-1",
+          size: 2,
+          oldestEnqueuedAt: "2026-01-01T00:00:01.000Z",
+          oldestAgeMs: 1000,
+        },
+      ],
+      pendingPermissions: [
+        {
+          id: "permission-1",
+          runId: "run-1",
+          opencodePermissionId: "opencode-permission-1",
+          hasActionMessageReceipt: true,
+          expiresAt: "2026-01-01T00:15:00.000Z",
+        },
+      ],
+    },
+  });
+
+  expect(snapshot.runtime).toEqual({
+    activeRunCount: 1,
+    queuedTurnCount: 2,
+    queuedBindingCount: 1,
+    pendingPermissionCount: 1,
+    activeRuns: [
+      {
+        id: "run-1",
+        bindingId: "binding-1",
+        sessionId: "session-1",
+        opencodeMessageId: "message-1",
+        startedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ],
+    queuedTurns: [
+      {
+        bindingId: "binding-1",
+        size: 2,
+        oldestEnqueuedAt: "2026-01-01T00:00:01.000Z",
+        oldestAgeMs: 1000,
+      },
+    ],
+    pendingPermissions: [
+      {
+        id: "permission-1",
+        runId: "run-1",
+        opencodePermissionId: "opencode-permission-1",
+        hasActionMessageReceipt: true,
+        expiresAt: "2026-01-01T00:15:00.000Z",
+      },
+    ],
+  });
+});
+
 function testConfig(): GatewayConfig {
   return {
     gateway: {

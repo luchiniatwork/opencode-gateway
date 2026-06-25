@@ -217,6 +217,101 @@ test("gateway app dispatches non-command messages to OpenCode and sends final re
   }
 });
 
+test("gateway app debounces rapid non-command messages", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new FakeRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db"), { inboundDebounceMs: 20 }),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await waitForSent(channel, 1);
+
+    expect(runtime.calls.startTurn).toEqual([
+      expect.objectContaining({
+        text: "first\n\nsecond",
+        sessionId: "session-1",
+      }),
+    ]);
+    expect(channel.sent.map((entry) => entry.message.text)).toEqual(["answer-1"]);
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app handles commands immediately while a message is debounced", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new FakeRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db"), { inboundDebounceMs: 20 }),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await channel.emit(inboundMessage({ id: "message-2", text: "/status", commandText: "/status" }));
+    await waitForSent(channel, 1);
+
+    expect(channel.sent[0]?.message.text).toContain("Gateway status:");
+    expect(runtime.calls.startTurn).toEqual([]);
+
+    await waitForSent(channel, 2);
+
+    expect(runtime.calls.startTurn).toEqual([expect.objectContaining({ text: "first" })]);
+    expect(channel.sent[1]?.message.text).toBe("answer-1");
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app denies unknown senders before debounce", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new FakeRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db"), { inboundDebounceMs: 20 }),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ senderId: "999", text: "hello" }));
+
+    expect(runtime.calls.ensureSession).toHaveLength(0);
+    expect(runtime.calls.startTurn).toHaveLength(0);
+    expect(channel.sent).toEqual([
+      expect.objectContaining({
+        message: {
+          kind: "error",
+          format: "plain",
+          text: "Access denied: this sender is not allowlisted.",
+        },
+      }),
+    ]);
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("gateway app sends permission buttons and approves callback actions", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
@@ -543,6 +638,93 @@ test("gateway app queues a second message while the first turn is active", async
       "answer-2",
     ]);
   } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app logs debounce lifecycle with routing context", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new FakeRuntime();
+  const entries: GatewayLogEntry[] = [];
+  const app = createApp({
+    config: testConfig(join(dir, "state.db"), { inboundDebounceMs: 20 }),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: (entry) => entries.push(entry),
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await waitForSent(channel, 1);
+
+    expect(entries).toContainEqual(expect.objectContaining({
+      message: "debounce queued",
+      channel: "telegram",
+      accountId: "default",
+      conversationKey,
+      firstMessageId: "message-1",
+      lastMessageId: "message-2",
+      messageCount: 2,
+      flushAfterMs: 20,
+    }));
+    expect(entries).toContainEqual(expect.objectContaining({
+      message: "debounce flushed",
+      channel: "telegram",
+      accountId: "default",
+      conversationKey,
+      firstMessageId: "message-1",
+      lastMessageId: "message-2",
+      messageCount: 2,
+      debounceReason: "timer",
+    }));
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app logs when a queued turn is drained", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new QueueRuntime();
+  const entries: GatewayLogEntry[] = [];
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: (entry) => entries.push(entry),
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    const firstEmit = channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await runtime.firstSendStarted;
+
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await waitForSent(channel, 1);
+
+    runtime.finishFirstSend();
+    await firstEmit;
+    await waitForSent(channel, 3);
+
+    expect(entries).toContainEqual(expect.objectContaining({
+      message: "queue drained",
+      channel: "telegram",
+      accountId: "default",
+      conversationKey,
+      profileId: "cto",
+      targetId: "default",
+      sessionId: "session-1",
+      initialQueueSize: 1,
+    }));
+  } finally {
+    runtime.finishFirstSend();
     await app.stop();
     await rm(dir, { recursive: true, force: true });
   }
@@ -920,7 +1102,14 @@ test("gateway app serves health JSON", async () => {
       channels: { "telegram:default": "running" },
       opencodeTargets: { default: "configured" },
       profiles: { default: "cto", active: ["cto"] },
-      runtime: { activeRuns: [], pendingPermissions: [] },
+      runtime: {
+        activeRunCount: 0,
+        queuedTurnCount: 0,
+        queuedBindingCount: 0,
+        pendingPermissionCount: 0,
+        activeRuns: [],
+        pendingPermissions: [],
+      },
     });
 
     const missing = await fetch(new URL("/missing", healthUrl).toString());
@@ -1192,7 +1381,7 @@ function fakeRegistration(channel: FakeChannel): GatewayChannelRegistration<unkn
 
 function testConfig(
   databasePath: string,
-  options: { allowAlways?: boolean; busyMode?: GatewayConfig["defaults"]["busyMode"] } = {},
+  options: { allowAlways?: boolean; busyMode?: GatewayConfig["defaults"]["busyMode"]; inboundDebounceMs?: number } = {},
 ): GatewayConfig {
   const busyMode = options.busyMode ?? "queue";
 
@@ -1243,7 +1432,7 @@ function testConfig(
       target: "default",
       busyMode,
       verbosity: "compact",
-      inboundDebounceMs: 1500,
+      inboundDebounceMs: options.inboundDebounceMs ?? 0,
     },
   };
 }

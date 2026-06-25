@@ -348,6 +348,10 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     if (stopped) return;
     if (drainingBindingIds.has(bindingId)) return;
 
+    const initialQueue = queuedByBindingId.get(bindingId);
+    const initialQueueSize = initialQueue?.length ?? 0;
+    const firstQueuedTurn = initialQueue?.[0];
+
     drainingBindingIds.add(bindingId);
 
     try {
@@ -383,6 +387,14 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         await deliverQueuedStartError(queued, prepared.input, result.error);
       }
     } finally {
+      if (initialQueueSize > 0 && queueSize(bindingId) === 0) {
+        log("info", "queue drained", {
+          ...(firstQueuedTurn ? messageLogContext(firstQueuedTurn.input.message, firstQueuedTurn.input.resolution) : { bindingId }),
+          bindingId,
+          initialQueueSize,
+        });
+      }
+
       drainingBindingIds.delete(bindingId);
     }
   }

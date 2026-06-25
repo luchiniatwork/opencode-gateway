@@ -5,7 +5,7 @@ import type { ConversationBindingRepository } from "../db/repositories/conversat
 import type { PendingPermissionRepository } from "../db/repositories/pending-permissions.ts";
 import type { RunRepository } from "../db/repositories/runs.ts";
 import type { TargetRepository } from "../db/repositories/targets.ts";
-import type { PendingPermissionRecord, RunRecord } from "../db/types.ts";
+import type { ConversationBindingRecord, PendingPermissionRecord, RunRecord } from "../db/types.ts";
 import type { ProgressDelivery } from "../delivery/renderer.ts";
 import type { ResolvedDispatch } from "../dispatch/resolver.ts";
 import type { OutboundAction, OutboundMessage } from "../messages/types.ts";
@@ -38,6 +38,7 @@ export interface SendPermissionRequestInput {
   permission: PendingPermissionRecord;
   event: Extract<RuntimeEvent, { type: "permission_request" }>;
   run: RunRecord;
+  message: InboundMessage;
   resolution: ResolvedDispatch;
   delivery: ProgressDelivery;
 }
@@ -86,7 +87,7 @@ export function createPermissionInteractionService(options: PermissionInteractio
         }
 
         log("info", "permission request card sent", {
-          source: "channel",
+          ...permissionRequestLogContext(input),
           profileId: input.resolution.profile.id,
           targetId: input.resolution.target.id,
           sessionId: input.run.opencodeSessionId,
@@ -96,7 +97,7 @@ export function createPermissionInteractionService(options: PermissionInteractio
         });
       } catch (error) {
         log("error", "permission request card failed", {
-          source: "channel",
+          ...permissionRequestLogContext(input),
           profileId: input.resolution.profile.id,
           targetId: input.resolution.target.id,
           sessionId: input.run.opencodeSessionId,
@@ -202,7 +203,7 @@ export function createPermissionInteractionService(options: PermissionInteractio
       });
 
       log("info", "permission resolved", {
-        source: "channel",
+        ...permissionResponseLogContext(context.binding),
         targetId: context.target.id,
         sessionId: context.run.opencodeSessionId,
         runId: context.run.id,
@@ -219,7 +220,7 @@ export function createPermissionInteractionService(options: PermissionInteractio
       const message = `Unable to respond to permission ${permission.id}: ${formatError(error)}`;
 
       log("error", "permission response failed", {
-        source: "channel",
+        ...permissionResponseLogContext(context.binding),
         targetId: context.target.id,
         sessionId: context.run.opencodeSessionId,
         runId: context.run.id,
@@ -236,12 +237,12 @@ export function createPermissionInteractionService(options: PermissionInteractio
   function permissionRuntimeContext(
     permission: PendingPermissionRecord,
   ):
-    | { ok: true; run: RunRecord; target: NonNullable<ReturnType<TargetRepository["getById"]>> }
+    | { ok: true; run: RunRecord; target: NonNullable<ReturnType<TargetRepository["getById"]>>; binding?: ConversationBindingRecord }
     | { ok: false; error: string } {
     const run = repositories.runs.getById(permission.runId);
     if (!run) return { ok: false, error: `Run not found for permission ${permission.id}: ${permission.runId}` };
 
-    const binding = run.targetId ? undefined : repositories.bindings.getById(run.bindingId);
+    const binding = repositories.bindings.getById(run.bindingId);
     if (!run.targetId && !binding) return { ok: false, error: `Binding not found for permission ${permission.id}: ${run.bindingId}` };
 
     const targetId = run.targetId ?? binding?.targetId;
@@ -250,8 +251,26 @@ export function createPermissionInteractionService(options: PermissionInteractio
     const target = repositories.targets.getById(targetId);
     if (!target) return { ok: false, error: `OpenCode target not found for permission ${permission.id}: ${targetId}` };
 
-    return { ok: true, run, target };
+    return { ok: true, run, target, binding };
   }
+}
+
+function permissionRequestLogContext(input: SendPermissionRequestInput): GatewayLogContext {
+  return {
+    source: "channel",
+    channel: input.message.channel,
+    accountId: input.message.accountId,
+    conversationKey: input.message.conversation.key,
+  };
+}
+
+function permissionResponseLogContext(binding: ConversationBindingRecord | undefined): GatewayLogContext {
+  return {
+    source: "channel",
+    channel: binding?.channel,
+    accountId: binding?.accountId,
+    conversationKey: binding?.conversationKey,
+  };
 }
 
 function permissionRequestMessage(input: SendPermissionRequestInput, config: InteractivePermissionsConfig): OutboundMessage {
