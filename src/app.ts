@@ -180,6 +180,22 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
             pendingPermissions: repositories.pendingPermissions,
             deliveryReceipts: repositories.deliveryReceipts,
             observePermissions: options.config.interactive.permissions.mode !== "off",
+            prepareQueuedTurn: async ({ input }) => {
+              const bindingResult = await resolver.ensureBindingForMessage(input.message);
+
+              if (bindingResult.status === "denied") {
+                return {
+                  status: "skip",
+                  reason: bindingResult.decision.reason,
+                  messages: deniedMessages(bindingResult.decision.reason),
+                };
+              }
+
+              return {
+                status: "ready",
+                input: { ...input, resolution: bindingResult.resolution },
+              };
+            },
             onPermissionRequest: (input) => permissionService?.sendPermissionRequest(input),
             runTimeoutMs: options.turnRunTimeoutMs,
             now,
@@ -587,7 +603,7 @@ function validatePhase1RuntimeTargets(config: GatewayConfig): void {
 }
 
 function turnStartMessages(result: StartTurnResult): OutboundMessage[] {
-    switch (result.status) {
+  switch (result.status) {
     case "started":
       return [];
     case "queued":
@@ -605,12 +621,21 @@ function turnStartMessages(result: StartTurnResult): OutboundMessage[] {
         activeSessionId === currentSessionId
           ? `Session ${currentSessionId} is busy.`
           : `Session ${currentSessionId} is blocked by active run ${result.run.id} from previous session ${activeSessionId}.`;
+      const busyMode = result.resolution.binding.busyMode;
+      const modeText =
+        busyMode === "steer"
+          ? "Busy mode steer is not implemented yet, so this message was not sent."
+          : busyMode === "interrupt"
+            ? "Busy mode interrupt is not implemented yet, so this message was not sent."
+            : busyMode === "reject"
+              ? "Busy mode reject is active, so this message was not queued."
+              : "This message was not queued.";
 
       return [
         {
           kind: "status",
           format: "plain",
-          text: `${sessionText} Use /stop to abort the active run.`,
+          text: `${sessionText} ${modeText} Use /stop to abort the active run.`,
         },
       ];
     }

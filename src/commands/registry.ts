@@ -167,8 +167,9 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
     const run = repositories.runs.getActiveByBindingId(binding.id);
     if (!run) return "No active run for this conversation.";
 
-    const target = repositories.targets.getById(binding.targetId);
-    if (!target) return `OpenCode target not found: ${binding.targetId}`;
+    const targetId = run.targetId ?? binding.targetId;
+    const target = repositories.targets.getById(targetId);
+    if (!target) return `OpenCode target not found: ${targetId}`;
 
     try {
       const result = await turnRunner.abortActive({
@@ -195,8 +196,9 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
     const run = repositories.runs.getActiveByBindingId(binding.id);
     if (!run) return undefined;
 
-    const target = repositories.targets.getById(binding.targetId);
-    if (!target) return { status: "error", message: `OpenCode target not found: ${binding.targetId}` };
+    const targetId = run.targetId ?? binding.targetId;
+    const target = repositories.targets.getById(targetId);
+    if (!target) return { status: "error", message: `OpenCode target not found: ${targetId}` };
 
     try {
       const result = await turnRunner.abortActive({

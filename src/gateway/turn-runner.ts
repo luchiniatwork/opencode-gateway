@@ -19,6 +19,7 @@ export interface TurnRunnerOptions {
   startTimeoutMs?: number;
   permissionTtlMs?: number;
   observePermissions?: boolean;
+  prepareQueuedTurn?(input: PrepareQueuedTurnInput): Promise<PrepareQueuedTurnResult> | PrepareQueuedTurnResult;
   onPermissionRequest?(input: TurnRunnerPermissionRequestInput): Promise<void> | void;
   now?: () => Date;
   log?: (level: GatewayLogLevel, message: string, context?: GatewayLogContext) => void;
@@ -55,6 +56,16 @@ export interface QueueDiagnostics {
   oldestEnqueuedAt?: string;
   oldestAgeMs?: number;
 }
+
+export interface PrepareQueuedTurnInput {
+  queuedId: string;
+  enqueuedAt: string;
+  input: StartTurnInput;
+}
+
+export type PrepareQueuedTurnResult =
+  | { status: "ready"; input: StartTurnInput }
+  | { status: "skip"; reason?: string; messages?: OutboundMessage[] };
 
 export interface StartTurnInput {
   message: InboundMessage;
@@ -207,7 +218,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         remoteAbortError,
       });
 
-      await drainQueue(input.binding.id);
+      scheduleDrainQueue(input.binding.id);
 
       return { status: "aborted", run: aborted, remoteAbortError };
     },
@@ -345,20 +356,69 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         if (!queued) return;
         if (queued.input.signal?.aborted) continue;
 
+        const prepared = await prepareQueuedTurnForStart(queued);
+        if (prepared.status === "skip") {
+          log("info", "queued turn skipped", {
+            ...messageLogContext(queued.input.message, queued.input.resolution),
+            queuedId: queued.id,
+            reason: prepared.reason,
+            queueSize: queueSize(bindingId),
+          });
+          await deliverQueuedSkipMessages(queued, prepared.messages);
+          continue;
+        }
+
+        if (prepared.input.signal?.aborted) continue;
+
         log("info", "queued turn starting", {
-          ...messageLogContext(queued.input.message, queued.input.resolution),
+          ...messageLogContext(prepared.input.message, prepared.input.resolution),
           queuedId: queued.id,
           queueSize: queueSize(bindingId),
         });
 
-        const result = await startNow(queued.input);
+        const result = await startNow(prepared.input);
 
         if (result.status === "started") return;
 
-        await deliverQueuedStartError(queued, result.error);
+        await deliverQueuedStartError(queued, prepared.input, result.error);
       }
     } finally {
       drainingBindingIds.delete(bindingId);
+    }
+  }
+
+  async function prepareQueuedTurnForStart(queued: QueuedTurn): Promise<PrepareQueuedTurnResult> {
+    if (!options.prepareQueuedTurn) return { status: "ready", input: queued.input };
+
+    try {
+      const prepared = await options.prepareQueuedTurn({
+        queuedId: queued.id,
+        enqueuedAt: queued.enqueuedAt,
+        input: queued.input,
+      });
+
+      if (prepared.status === "ready") {
+        log("info", "queued turn prepared", {
+          ...messageLogContext(prepared.input.message, prepared.input.resolution),
+          queuedId: queued.id,
+        });
+      }
+
+      return prepared;
+    } catch (error) {
+      const message = formatError(error);
+
+      log("error", "queued turn preparation failed", {
+        ...messageLogContext(queued.input.message, queued.input.resolution),
+        queuedId: queued.id,
+        error: message,
+      });
+
+      return {
+        status: "skip",
+        reason: "prepare_failed",
+        messages: [{ kind: "error", format: "plain", text: `OpenCode error: ${message}` }],
+      };
     }
   }
 
@@ -372,16 +432,39 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     return queued;
   }
 
-  async function deliverQueuedStartError(queued: QueuedTurn, error: string): Promise<void> {
+  async function deliverQueuedStartError(queued: QueuedTurn, input: StartTurnInput, error: string): Promise<void> {
     try {
-      await queued.input.delivery.send({ kind: "error", format: "plain", text: `OpenCode error: ${error}` });
+      await input.delivery.send({ kind: "error", format: "plain", text: `OpenCode error: ${error}` });
     } catch (deliveryError) {
       log("error", "queued turn start error delivery failed", {
-        ...messageLogContext(queued.input.message, queued.input.resolution),
+        ...messageLogContext(input.message, input.resolution),
         queuedId: queued.id,
         error: formatError(deliveryError),
       });
     }
+  }
+
+  async function deliverQueuedSkipMessages(queued: QueuedTurn, messages: OutboundMessage[] | undefined): Promise<void> {
+    if (!messages || messages.length === 0) return;
+
+    for (const message of messages) {
+      try {
+        await queued.input.delivery.send(message);
+      } catch (deliveryError) {
+        log("error", "queued turn skip delivery failed", {
+          ...messageLogContext(queued.input.message, queued.input.resolution),
+          queuedId: queued.id,
+          messageKind: message.kind,
+          error: formatError(deliveryError),
+        });
+      }
+    }
+  }
+
+  function scheduleDrainQueue(bindingId: string): void {
+    void drainQueue(bindingId).catch((error) => {
+      log("error", "queue drain failed", { bindingId, error: formatError(error) });
+    });
   }
 
   function queueSize(bindingId: string): number {

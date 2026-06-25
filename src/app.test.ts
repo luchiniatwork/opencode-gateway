@@ -512,6 +512,138 @@ test("gateway app queues a second message while the first turn is active", async
   }
 });
 
+test("gateway app starts queued messages with the current binding state", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new QueueRuntime();
+  const config = testConfig(join(dir, "state.db"));
+  config.opencode.targets.push({
+    id: "review",
+    name: "Review workspace",
+    mode: "attach",
+    serverUrl: "http://127.0.0.1:4097",
+  });
+  config.profiles.entries.push({
+    id: "review",
+    displayName: "Review",
+    defaultTargetId: "review",
+    defaultAgent: "review-agent",
+    defaultModel: "provider/review-model",
+    defaults: { busyMode: "queue", verbosity: "compact" },
+  });
+  const app = createApp({
+    config,
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await runtime.firstSendStarted;
+
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await waitForSent(channel, 1);
+
+    await channel.emit(inboundMessage({ id: "message-3", text: "/profile review", commandText: "/profile review" }));
+    await waitForSent(channel, 2);
+
+    runtime.finishFirstSend();
+    await waitForSent(channel, 4);
+
+    expect(channel.sent.map((entry) => entry.message.text)).toEqual([
+      expect.stringContaining("Queued behind active run"),
+      expect.stringContaining("Switched profile to Review (review)."),
+      "answer-1",
+      "answer-2",
+    ]);
+    expect(runtime.calls.startTurn.map((call) => call.text)).toEqual(["first", "second"]);
+    expect(runtime.calls.startTurn[1]).toEqual(expect.objectContaining({
+      sessionId: "session-2",
+      target: expect.objectContaining({ id: "review" }),
+      agent: "review-agent",
+      model: "provider/review-model",
+    }));
+  } finally {
+    runtime.finishFirstSend();
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app /stop aborts the active run and leaves queued messages", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new QueueRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await runtime.firstSendStarted;
+
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await waitForSent(channel, 1);
+
+    await channel.emit(inboundMessage({ id: "message-3", text: "/stop", commandText: "/stop" }));
+    await waitForSent(channel, 3);
+
+    expect(runtime.calls.startTurn.map((call) => call.text)).toEqual(["first", "second"]);
+    expect(channel.sent.map((entry) => entry.message.text)).toEqual([
+      expect.stringContaining("Queued behind active run"),
+      expect.stringContaining("Stopped active run"),
+      "answer-2",
+    ]);
+  } finally {
+    runtime.finishFirstSend();
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+for (const [busyMode, expectedText] of [
+  ["reject", "Busy mode reject is active"],
+  ["steer", "Busy mode steer is not implemented yet"],
+  ["interrupt", "Busy mode interrupt is not implemented yet"],
+] as const) {
+  test(`gateway app reports ${busyMode} busy mode without queueing`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+    const channel = new FakeChannel();
+    const runtime = new QueueRuntime();
+    const app = createApp({
+      config: testConfig(join(dir, "state.db"), { busyMode }),
+      runtime,
+      channels: [fakeRegistration(channel)],
+      logger: () => undefined,
+      now: fixedNow,
+    });
+
+    try {
+      await app.start();
+      await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+      await runtime.firstSendStarted;
+
+      await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+      await waitForSent(channel, 1);
+
+      expect(runtime.calls.startTurn.map((call) => call.text)).toEqual(["first"]);
+      expect(channel.sent[0]?.message.text).toContain(expectedText);
+    } finally {
+      runtime.finishFirstSend();
+      await app.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test("gateway app accepts a second message after a timed-out turn", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
@@ -795,6 +927,53 @@ test("gateway app /new rebinds while old sessions remain listable", async () => 
   }
 });
 
+test("gateway app /stop aborts the active run target after a profile switch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new QueueRuntime();
+  const config = testConfig(join(dir, "state.db"));
+  config.opencode.targets.push({
+    id: "review",
+    name: "Review workspace",
+    mode: "attach",
+    serverUrl: "http://127.0.0.1:4097",
+  });
+  config.profiles.entries.push({
+    id: "review",
+    displayName: "Review",
+    defaultTargetId: "review",
+    defaults: { busyMode: "queue", verbosity: "compact" },
+  });
+  const app = createApp({
+    config,
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await runtime.firstSendStarted;
+
+    await channel.emit(inboundMessage({ id: "message-2", text: "/profile review", commandText: "/profile review" }));
+    await waitForSent(channel, 1);
+
+    await channel.emit(inboundMessage({ id: "message-3", text: "/stop", commandText: "/stop" }));
+    await waitForSent(channel, 2);
+
+    expect(runtime.calls.abort[0]).toEqual(expect.objectContaining({
+      target: expect.objectContaining({ id: "default" }),
+      sessionId: "session-1",
+    }));
+  } finally {
+    runtime.finishFirstSend();
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("gateway app stops started channels and closes the database", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
@@ -832,7 +1011,12 @@ function fakeRegistration(channel: FakeChannel): GatewayChannelRegistration<unkn
   };
 }
 
-function testConfig(databasePath: string, options: { allowAlways?: boolean } = {}): GatewayConfig {
+function testConfig(
+  databasePath: string,
+  options: { allowAlways?: boolean; busyMode?: GatewayConfig["defaults"]["busyMode"] } = {},
+): GatewayConfig {
+  const busyMode = options.busyMode ?? "queue";
+
   return {
     gateway: {
       host: "127.0.0.1",
@@ -857,7 +1041,7 @@ function testConfig(databasePath: string, options: { allowAlways?: boolean } = {
           id: "cto",
           displayName: "CTO",
           defaultTargetId: "default",
-          defaults: { busyMode: "queue", verbosity: "compact" },
+          defaults: { busyMode, verbosity: "compact" },
         },
       ],
     },
@@ -878,7 +1062,7 @@ function testConfig(databasePath: string, options: { allowAlways?: boolean } = {
     defaults: {
       profile: "cto",
       target: "default",
-      busyMode: "queue",
+      busyMode,
       verbosity: "compact",
       inboundDebounceMs: 1500,
     },
