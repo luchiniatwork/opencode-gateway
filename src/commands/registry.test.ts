@@ -519,6 +519,32 @@ test("profile switch preserves session on same target and creates one on new tar
   }
 });
 
+test("profile switch reports binding overrides cleared for the new target", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.router.handle(inboundMessage({ text: "/agent mobile-agent" }));
+    await harness.router.handle(inboundMessage({ text: "/model provider/custom-model" }));
+
+    const result = await harness.router.handle(inboundMessage({ text: "/profile ops" }));
+    const text = responseText(result);
+
+    expect(text).toContain("Switched profile to Ops (ops).");
+    expect(text).toContain("Target: Ops workspace (ops-target)");
+    expect(text).toContain("Cleared agent override: mobile-agent is not available on target ops-target.");
+    expect(text).toContain("Cleared model override: provider/custom-model is not available on target ops-target.");
+    expect(text).toContain("Effective agent: ops-target-agent (target default)");
+    expect(text).toContain("Effective model: none");
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toMatchObject({
+      targetId: "ops-target",
+      agent: undefined,
+      model: undefined,
+    });
+  } finally {
+    harness.database.close();
+  }
+});
+
 const conversationKey = "telegram:default:dm:123";
 
 interface Harness {
@@ -716,6 +742,12 @@ class FakeRuntime implements AgentRuntime {
     { id: "provider/cto-model", providerId: "provider", modelId: "cto-model", name: "CTO model" },
     { id: "provider/custom-model", providerId: "provider", modelId: "custom-model", name: "Custom model" },
   ];
+  readonly agentsByTarget = new Map<string, RuntimeAgent[]>([
+    ["ops-target", [{ id: "ops-target-agent", description: "Ops target default" }]],
+  ]);
+  readonly modelsByTarget = new Map<string, RuntimeModel[]>([
+    ["ops-target", []],
+  ]);
   abortError: Error | undefined;
   private nextSessionNumber = 1;
   private nextMessageNumber = 1;
@@ -779,11 +811,11 @@ class FakeRuntime implements AgentRuntime {
 
   async listAgents(input: ListRuntimeAgentsInput): Promise<RuntimeAgent[]> {
     this.calls.listAgents.push(input);
-    return this.agents;
+    return this.agentsByTarget.get(input.target.id) ?? this.agents;
   }
 
   async listModels(input: ListRuntimeModelsInput): Promise<RuntimeModel[]> {
     this.calls.listModels.push(input);
-    return this.models;
+    return this.modelsByTarget.get(input.target.id) ?? this.models;
   }
 }

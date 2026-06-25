@@ -689,6 +689,69 @@ test("gateway app rejects unavailable agent and model selections", async () => {
   }
 });
 
+test("gateway app clears invalid overrides on profile target switch before future turns", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new FakeRuntime();
+  runtime.agentsByTarget.set("review", [{ id: "review-agent", description: "Review specialist" }]);
+  runtime.modelsByTarget.set("review", [
+    { id: "provider/review-model", providerId: "provider", modelId: "review-model", name: "Review model" },
+  ]);
+  const config = testConfig(join(dir, "state.db"));
+  config.opencode.targets.push({
+    id: "review",
+    name: "Review workspace",
+    mode: "attach",
+    serverUrl: "http://127.0.0.1:4097",
+  });
+  config.profiles.entries.push({
+    id: "review",
+    displayName: "Review",
+    defaultTargetId: "review",
+    defaultAgent: "review-agent",
+    defaultModel: "provider/review-model",
+    defaults: { busyMode: "queue", verbosity: "compact" },
+  });
+  const app = createApp({
+    config,
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "/agent mobile-agent", commandText: "/agent mobile-agent" }));
+    await waitForSent(channel, 1);
+
+    await channel.emit(
+      inboundMessage({ id: "message-2", text: "/model provider/custom-model", commandText: "/model provider/custom-model" }),
+    );
+    await waitForSent(channel, 2);
+
+    await channel.emit(inboundMessage({ id: "message-3", text: "/profile review", commandText: "/profile review" }));
+    await waitForSent(channel, 3);
+
+    await channel.emit(inboundMessage({ id: "message-4", text: "inspect" }));
+    await waitForSent(channel, 4);
+
+    expect(channel.sent[2]?.message.text).toContain("Cleared agent override: mobile-agent is not available on target review.");
+    expect(channel.sent[2]?.message.text).toContain("Cleared model override: provider/custom-model is not available on target review.");
+    expect(runtime.calls.startTurn).toEqual([
+      expect.objectContaining({
+        text: "inspect",
+        target: expect.objectContaining({ id: "review" }),
+        agent: "review-agent",
+        model: "provider/review-model",
+      }),
+    ]);
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("gateway app /stop aborts the active run and leaves queued messages", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
@@ -1346,6 +1409,8 @@ class FakeRuntime implements AgentRuntime {
     { id: "provider/custom-model", providerId: "provider", modelId: "custom-model", name: "Custom model" },
     { id: "provider/review-model", providerId: "provider", modelId: "review-model", name: "Review model" },
   ];
+  readonly agentsByTarget = new Map<string, RuntimeAgent[]>();
+  readonly modelsByTarget = new Map<string, RuntimeModel[]>();
   listAgentsError: Error | undefined;
   protected readonly asyncAnswers = new Map<string, string>();
 
@@ -1483,12 +1548,12 @@ class FakeRuntime implements AgentRuntime {
   async listAgents(input: ListRuntimeAgentsInput): Promise<RuntimeAgent[]> {
     this.calls.listAgents.push(input);
     if (this.listAgentsError) throw this.listAgentsError;
-    return this.agents;
+    return this.agentsByTarget.get(input.target.id) ?? this.agents;
   }
 
   async listModels(input: ListRuntimeModelsInput): Promise<RuntimeModel[]> {
     this.calls.listModels.push(input);
-    return this.models;
+    return this.modelsByTarget.get(input.target.id) ?? this.models;
   }
 }
 

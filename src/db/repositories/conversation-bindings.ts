@@ -48,6 +48,8 @@ export interface UpdateBindingProfileInput {
   targetId: string;
   opencodeSessionId: string;
   sessionName?: string;
+  agent?: string | null;
+  model?: string | null;
   busyMode: BusyMode;
   verbosity: Verbosity;
 }
@@ -166,6 +168,8 @@ export function createConversationBindingRepository(
             target_id = ?,
             opencode_session_id = ?,
             session_name = ?,
+            agent = CASE WHEN ? THEN ? ELSE agent END,
+            model = CASE WHEN ? THEN ? ELSE model END,
             busy_mode = ?,
             verbosity = ?,
             updated_at = ?
@@ -177,6 +181,10 @@ export function createConversationBindingRepository(
           input.targetId,
           input.opencodeSessionId,
           input.sessionName ?? null,
+          input.agent === undefined ? 0 : 1,
+          input.agent ?? null,
+          input.model === undefined ? 0 : 1,
+          input.model ?? null,
           input.busyMode,
           input.verbosity,
           now().toISOString(),

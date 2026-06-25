@@ -327,6 +327,12 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
         : undefined,
       `Current session: ${result.session.id}`,
       `Target: ${result.resolution.target.name} (${result.resolution.target.id})`,
+      ...formatClearedOverrideLines(
+        result.clearedOverrides,
+        result.resolution.binding,
+        result.resolution.profile,
+        result.resolution.target,
+      ),
     ]
       .filter(Boolean)
       .join("\n");
@@ -622,6 +628,29 @@ function formatModelLine(model: RuntimeModel, currentModel: string | undefined):
   const name = model.name ? ` (${model.name})` : "";
 
   return `${marker} ${model.id}${name}`;
+}
+
+function formatClearedOverrideLines(
+  clearedOverrides: Array<{ kind: BindingOverrideKind; value: string; targetId: string }> | undefined,
+  binding: ConversationBindingRecord,
+  profile: ProfileRecord,
+  target: TargetRecord,
+): string[] {
+  if (!clearedOverrides || clearedOverrides.length === 0) return [];
+
+  const lines = clearedOverrides.map((override) => (
+    `Cleared ${override.kind} override: ${override.value} is not available on target ${override.targetId}.`
+  ));
+
+  if (clearedOverrides.some((override) => override.kind === "agent")) {
+    lines.push(`Effective agent: ${formatEffectiveValue(resolveEffectiveAgentValue(binding, profile, target))}`);
+  }
+
+  if (clearedOverrides.some((override) => override.kind === "model")) {
+    lines.push(`Effective model: ${formatEffectiveValue(resolveEffectiveModelValue(binding, profile, target))}`);
+  }
+
+  return lines;
 }
 
 function resolveEffectiveValue(

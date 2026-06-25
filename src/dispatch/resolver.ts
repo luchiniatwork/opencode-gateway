@@ -11,6 +11,7 @@ import type {
   RuntimeAttachment,
   RuntimeSession,
   RuntimeSessionId,
+  RuntimeTarget,
   RuntimeTurn,
 } from "../opencode/types.ts";
 
@@ -43,10 +44,17 @@ export type BindingOperationResult =
       resolution: ResolvedDispatch;
       session: RuntimeSession;
       previousSessionId?: RuntimeSessionId;
+      clearedOverrides?: ClearedBindingOverride[];
     }
   | { status: "denied"; decision: Extract<AccessDecision, { allowed: false }> }
   | { status: "not_found"; resource: "profile" | "target"; id: string }
   | { status: "error"; error: string };
+
+export interface ClearedBindingOverride {
+  kind: "agent" | "model";
+  value: string;
+  targetId: string;
+}
 
 export interface DispatchResolverRepositories {
   accessRules: AccessRuleRepository;
@@ -251,10 +259,23 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
 
       const existing = repositories.bindings.getByConversationKey(message.conversation.key);
       const shouldCreateSession = !existing || existing.targetId !== target.id;
+
+      let clearedOverrides: ClearedBindingOverride[] = [];
+
+      if (existing && shouldCreateSession) {
+        try {
+          clearedOverrides = await invalidOverridesForTarget(existing, target);
+        } catch (error) {
+          return { status: "error", error: `Unable to validate overrides for target ${target.id}: ${formatError(error)}` };
+        }
+      }
+
       const session = shouldCreateSession
         ? await createRuntimeSession(message, profile, target)
         : { id: existing.opencodeSessionId, targetId: target.id, title: existing.sessionName };
       const previousSessionId = existing?.opencodeSessionId;
+      const shouldClearAgent = clearedOverrides.some((override) => override.kind === "agent");
+      const shouldClearModel = clearedOverrides.some((override) => override.kind === "model");
       const binding = existing
         ? requireUpdatedBinding(
             repositories.bindings.updateProfile({
@@ -263,6 +284,8 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
               targetId: target.id,
               opencodeSessionId: session.id,
               sessionName: session.title,
+              agent: shouldClearAgent ? null : undefined,
+              model: shouldClearModel ? null : undefined,
               busyMode: effectiveBusyMode(profile),
               verbosity: effectiveVerbosity(profile),
             }),
@@ -285,6 +308,7 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
         resolution: resolveBinding(binding, access.role),
         session,
         previousSessionId,
+        clearedOverrides: clearedOverrides.length > 0 ? clearedOverrides : undefined,
       };
     },
   };
@@ -360,6 +384,31 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
 
   function effectiveVerbosity(profile: ProfileRecord): Verbosity {
     return profile.defaultVerbosity ?? config.defaults.verbosity;
+  }
+
+  async function invalidOverridesForTarget(
+    binding: ConversationBindingRecord,
+    target: RuntimeTarget,
+  ): Promise<ClearedBindingOverride[]> {
+    const cleared: ClearedBindingOverride[] = [];
+
+    if (binding.agent) {
+      const agents = await runtime.listAgents({ target });
+
+      if (!agents.some((agent) => agent.id === binding.agent)) {
+        cleared.push({ kind: "agent", value: binding.agent, targetId: target.id });
+      }
+    }
+
+    if (binding.model) {
+      const models = await runtime.listModels({ target });
+
+      if (!models.some((model) => model.id === binding.model)) {
+        cleared.push({ kind: "model", value: binding.model, targetId: target.id });
+      }
+    }
+
+    return cleared;
   }
 }
 

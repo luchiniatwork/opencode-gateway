@@ -254,6 +254,67 @@ test("conversation binding agent and model overrides can be set and cleared", as
   }
 });
 
+test("conversation binding profile updates can preserve or clear overrides", async () => {
+  const database = await openSeededDatabase();
+
+  try {
+    const bindings = createConversationBindingRepository(database.db, {
+      now: fixedNow,
+      createId: () => "binding-1",
+    });
+    const binding = bindings.upsert({
+      conversationKey: "telegram:default:dm:123",
+      channel: "telegram",
+      accountId: "default",
+      profileId: "cto",
+      targetId: "default",
+      opencodeSessionId: "session-1",
+      agent: "agent-override",
+      model: "provider/model-override",
+      busyMode: "queue",
+      verbosity: "compact",
+    });
+
+    const preserved = bindings.updateProfile({
+      conversationKey: binding.conversationKey,
+      profileId: "cto",
+      targetId: "default",
+      opencodeSessionId: "session-2",
+      sessionName: "preserved",
+      busyMode: "queue",
+      verbosity: "tools",
+    });
+
+    expect(preserved).toMatchObject({
+      agent: "agent-override",
+      model: "provider/model-override",
+      opencodeSessionId: "session-2",
+      verbosity: "tools",
+    });
+
+    const cleared = bindings.updateProfile({
+      conversationKey: binding.conversationKey,
+      profileId: "cto",
+      targetId: "default",
+      opencodeSessionId: "session-3",
+      sessionName: "cleared",
+      agent: null,
+      model: null,
+      busyMode: "queue",
+      verbosity: "compact",
+    });
+
+    expect(cleared).toMatchObject({
+      agent: undefined,
+      model: undefined,
+      opencodeSessionId: "session-3",
+      verbosity: "compact",
+    });
+  } finally {
+    database.close();
+  }
+});
+
 test("runs can be created, queried as active, and finished", async () => {
   const database = await openSeededDatabase();
 

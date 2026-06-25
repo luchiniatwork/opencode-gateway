@@ -293,6 +293,60 @@ test("switchProfile creates a fresh session when the selected profile uses anoth
   }
 });
 
+test("switchProfile clears binding overrides unavailable on the new target", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.resolver.ensureBindingForMessage(inboundMessage());
+    harness.repositories.bindings.updateAgent({ conversationKey, agent: "default-only-agent" });
+    harness.repositories.bindings.updateModel({ conversationKey, model: "provider/default-only-model" });
+
+    const result = await harness.resolver.switchProfile(inboundMessage(), "ops");
+
+    expect(result.status).toBe("rebound");
+    if (result.status !== "rebound") throw new Error("expected rebound");
+
+    expect(result.clearedOverrides).toEqual([
+      { kind: "agent", value: "default-only-agent", targetId: "ops-target" },
+      { kind: "model", value: "provider/default-only-model", targetId: "ops-target" },
+    ]);
+    expect(result.resolution.binding.agent).toBeUndefined();
+    expect(result.resolution.binding.model).toBeUndefined();
+    expect(result.resolution.agent).toBe("ops-target-agent");
+    expect(result.resolution.model).toBeUndefined();
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toMatchObject({
+      agent: undefined,
+      model: undefined,
+      targetId: "ops-target",
+    });
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("switchProfile preserves binding overrides available on the new target", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.resolver.ensureBindingForMessage(inboundMessage());
+    harness.repositories.bindings.updateAgent({ conversationKey, agent: "shared-agent" });
+    harness.repositories.bindings.updateModel({ conversationKey, model: "provider/shared-model" });
+
+    const result = await harness.resolver.switchProfile(inboundMessage(), "ops");
+
+    expect(result.status).toBe("rebound");
+    if (result.status !== "rebound") throw new Error("expected rebound");
+
+    expect(result.clearedOverrides).toBeUndefined();
+    expect(result.resolution.binding.agent).toBe("shared-agent");
+    expect(result.resolution.binding.model).toBe("provider/shared-model");
+    expect(result.resolution.agent).toBe("shared-agent");
+    expect(result.resolution.model).toBe("provider/shared-model");
+  } finally {
+    harness.database.close();
+  }
+});
+
 const conversationKey = "telegram:default:dm:123";
 
 interface Harness {
@@ -478,6 +532,21 @@ class FakeRuntime implements AgentRuntime {
   };
 
   readonly missingSessionIds = new Set<string>();
+  readonly agentsByTarget = new Map<string, RuntimeAgent[]>([
+    ["default", [{ id: "cto-agent" }, { id: "default-only-agent" }, { id: "shared-agent" }]],
+    ["ops-target", [{ id: "ops-target-agent" }, { id: "shared-agent" }]],
+  ]);
+  readonly modelsByTarget = new Map<string, RuntimeModel[]>([
+    [
+      "default",
+      [
+        { id: "provider/cto-model", providerId: "provider", modelId: "cto-model" },
+        { id: "provider/default-only-model", providerId: "provider", modelId: "default-only-model" },
+        { id: "provider/shared-model", providerId: "provider", modelId: "shared-model" },
+      ],
+    ],
+    ["ops-target", [{ id: "provider/shared-model", providerId: "provider", modelId: "shared-model" }]],
+  ]);
   sendError: Error | undefined;
   private nextSessionNumber = 1;
   private nextMessageNumber = 1;
@@ -546,11 +615,11 @@ class FakeRuntime implements AgentRuntime {
 
   async listAgents(input: ListRuntimeAgentsInput): Promise<RuntimeAgent[]> {
     this.calls.listAgents.push(input);
-    return [];
+    return this.agentsByTarget.get(input.target.id) ?? [];
   }
 
   async listModels(input: ListRuntimeModelsInput): Promise<RuntimeModel[]> {
     this.calls.listModels.push(input);
-    return [];
+    return this.modelsByTarget.get(input.target.id) ?? [];
   }
 }
