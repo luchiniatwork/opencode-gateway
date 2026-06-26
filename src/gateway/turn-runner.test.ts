@@ -52,7 +52,7 @@ test("turn runner starts turns, stores message IDs, and finishes final events", 
         text: "inspect",
         agent: "cto-agent",
         model: "provider/model",
-        mode: "async",
+        mode: "sync",
         observePermissions: false,
       }),
     ]);
@@ -200,7 +200,7 @@ test("turn runner exposes active turn plan diagnostics", async () => {
       startedAt: "2026-01-01T00:00:00.000Z",
       ageMs: 0,
       plan: {
-        finalSource: "events",
+        finalSource: "prompt",
         progressSource: "none",
         permissionSource: "events",
       },
@@ -563,7 +563,7 @@ test("turn runner observes permissions for compact profiles without progress mes
     });
     await waitForDeliveries(harness.deliveries, 2);
 
-    expect(harness.runtime.calls.startTurn[0]).toEqual(expect.objectContaining({ mode: "async", observePermissions: true }));
+    expect(harness.runtime.calls.startTurn[0]).toEqual(expect.objectContaining({ mode: "sync", observePermissions: true }));
     expect(harness.deliveries).toEqual([
       { kind: "status", format: "plain", text: "Permission card: permission-1" },
       { kind: "final", format: "markdown", text: "done" },

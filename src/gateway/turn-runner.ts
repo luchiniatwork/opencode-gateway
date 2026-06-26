@@ -999,7 +999,8 @@ function createRuntimeTurnPlan(resolution: ResolvedDispatch, observePermissions:
   const observesProgress = resolution.binding.verbosity === "tools" || resolution.binding.verbosity === "verbose";
 
   return {
-    finalSource: "events",
+    // ADR 0001: final-answer-only modes must not depend on event-stream final correlation.
+    finalSource: observesProgress ? "events" : "prompt",
     progressSource: observesProgress ? "events" : "none",
     permissionSource: observePermissions ? "events" : "none",
   };

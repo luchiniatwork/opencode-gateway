@@ -193,7 +193,7 @@ test("gateway app dispatches non-command messages to OpenCode and sends final re
     expect(runtime.calls.startTurn[0]).toEqual(expect.objectContaining({
       text: "Inspect this repo",
       sessionId: "session-1",
-      mode: "async",
+      mode: "sync",
       observePermissions: true,
     }));
     expect(channel.sent).toEqual([
@@ -211,6 +211,38 @@ test("gateway app dispatches non-command messages to OpenCode and sends final re
         },
       },
     ]);
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app answers consecutive compact messages through the sync prompt path", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new SyncOnlyRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+    turnRunTimeoutMs: 20,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await waitForSent(channel, 1);
+
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await waitForSent(channel, 2);
+
+    expect(runtime.calls.startTurn.map((call) => call.mode)).toEqual(["sync", "sync"]);
+    expect(runtime.calls.send.map((call) => call.text)).toEqual(["first", "second"]);
+    expect(runtime.calls.sendAsync).toEqual([]);
+    expect(runtime.calls.observe).toEqual([]);
+    expect(channel.sent.map((entry) => entry.message.text)).toEqual(["answer-1", "answer-2"]);
   } finally {
     await app.stop();
     await rm(dir, { recursive: true, force: true });
@@ -776,7 +808,7 @@ test("gateway app /status reports queue diagnostics while a turn is active", asy
     await waitForSent(channel, 2);
 
     expect(channel.sent[1]?.message.text).toContain("Active run:");
-    expect(channel.sent[1]?.message.text).toContain("plan=final:events");
+    expect(channel.sent[1]?.message.text).toContain("plan=final:prompt");
     expect(channel.sent[1]?.message.text).toContain("Queue: 1 pending, oldest age=0ms");
   } finally {
     runtime.finishFirstSend();
@@ -2041,6 +2073,30 @@ class StuckThenFinalRuntime extends FakeRuntime {
         status: "running",
       },
       events: this.turnCount === 1 ? this.neverFinal(input.signal) : this.syncEvents(input),
+    };
+  }
+
+  private async *neverFinal(signal: AbortSignal | undefined): AsyncIterable<RuntimeEvent> {
+    await new Promise<void>((resolve) => {
+      signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+}
+
+class SyncOnlyRuntime extends FakeRuntime {
+  override async startTurn(input: StartRuntimeTurnInput): Promise<RuntimeStartedTurn> {
+    if (input.mode === "sync") return super.startTurn(input);
+
+    this.calls.startTurn.push(input);
+
+    return {
+      handle: {
+        id: `message-async-${this.calls.startTurn.length}`,
+        sessionId: input.sessionId,
+        targetId: input.target.id,
+        status: "running",
+      },
+      events: this.neverFinal(input.signal),
     };
   }
 
