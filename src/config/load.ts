@@ -4,12 +4,14 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { ZodError } from "zod";
 
 import {
+  createDefaultManagedTargetConfig,
   rawGatewayConfigSchema,
   type AccessRuleSeed,
   type ConfigSeeds,
   type GatewayConfig,
   type GatewayProfileConfig,
   type GatewayTargetConfig,
+  type ManagedTargetConfig,
   type RawGatewayConfig,
   type TelegramChannelConfig,
 } from "./schema.ts";
@@ -118,8 +120,10 @@ function getAccessRuleSeeds(config: GatewayConfig): AccessRuleSeed[] {
 }
 
 function normalizeConfig(rawConfig: RawGatewayConfig, homeDir: string, baseDir: string | undefined): GatewayConfig {
-  const targets = rawConfig.opencode.targets.map(
-    (target): GatewayTargetConfig => ({
+  const targets = rawConfig.opencode.targets.map((target): GatewayTargetConfig => {
+    const managed = normalizeManagedTargetConfig(target.mode, target.managed);
+
+    return {
       id: target.id,
       name: target.name ?? target.id,
       mode: target.mode,
@@ -128,8 +132,9 @@ function normalizeConfig(rawConfig: RawGatewayConfig, homeDir: string, baseDir: 
       configDir: expandOptionalPath(target.configDir, homeDir, baseDir),
       defaultAgent: target.defaultAgent,
       defaultModel: target.defaultModel,
-    }),
-  );
+      ...(managed ? { managed } : {}),
+    };
+  });
 
   const explicitDefaultProfile = rawConfig.profiles.default ?? rawConfig.defaults.profile;
   const defaultProfile = explicitDefaultProfile ?? rawConfig.profiles.entries[0]?.id;
@@ -196,6 +201,14 @@ function normalizeConfig(rawConfig: RawGatewayConfig, homeDir: string, baseDir: 
   };
 }
 
+function normalizeManagedTargetConfig(
+  mode: RawGatewayConfig["opencode"]["targets"][number]["mode"],
+  managed: RawGatewayConfig["opencode"]["targets"][number]["managed"],
+): ManagedTargetConfig | undefined {
+  if (mode !== "managed") return undefined;
+  return managed ?? createDefaultManagedTargetConfig();
+}
+
 function normalizeTelegramConfig(
   telegram: RawGatewayConfig["channels"]["telegram"],
 ): TelegramChannelConfig | undefined {
@@ -232,6 +245,10 @@ function validateRawConfig(config: RawGatewayConfig): string[] {
 
     if (target.mode === "attach" && !target.serverUrl) {
       issues.push(`opencode.targets.${target.id}.serverUrl is required for attach mode`);
+    }
+
+    if (target.mode === "attach" && target.managed) {
+      issues.push(`opencode.targets.${target.id}.managed is only valid for managed mode`);
     }
 
     if (target.mode === "managed" && !target.workdir) {

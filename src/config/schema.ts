@@ -3,8 +3,33 @@ import { z } from "zod";
 export const accessRoleSchema = z.enum(["owner", "admin", "user", "blocked"]);
 export const busyModeSchema = z.enum(["queue", "interrupt", "reject", "steer"]);
 export const logLevelSchema = z.enum(["debug", "info", "warn", "error"]);
+export const managedRestartPolicySchema = z.enum(["on-failure", "never"]);
 export const targetModeSchema = z.enum(["attach", "managed"]);
 export const verbositySchema = z.enum(["off", "compact", "tools", "verbose"]);
+
+const managedTargetConfigDefaults = {
+  command: "opencode",
+  host: "127.0.0.1",
+  port: 0,
+  startupTimeoutMs: 15_000,
+  stopTimeoutMs: 5_000,
+  healthCheckIntervalMs: 10_000,
+  healthCheckTimeoutMs: 2_000,
+  restart: "on-failure",
+} as const;
+
+const managedTargetSchema = z
+  .object({
+    command: z.string().min(1).default(managedTargetConfigDefaults.command),
+    host: z.string().min(1).default(managedTargetConfigDefaults.host),
+    port: z.number().int().min(0).max(65_535).default(managedTargetConfigDefaults.port),
+    startupTimeoutMs: z.number().int().min(0).max(300_000).default(managedTargetConfigDefaults.startupTimeoutMs),
+    stopTimeoutMs: z.number().int().min(0).max(60_000).default(managedTargetConfigDefaults.stopTimeoutMs),
+    healthCheckIntervalMs: z.number().int().min(0).max(3_600_000).default(managedTargetConfigDefaults.healthCheckIntervalMs),
+    healthCheckTimeoutMs: z.number().int().min(0).max(60_000).default(managedTargetConfigDefaults.healthCheckTimeoutMs),
+    restart: managedRestartPolicySchema.default(managedTargetConfigDefaults.restart),
+  })
+  .strict();
 
 const targetSchema = z
   .object({
@@ -16,6 +41,7 @@ const targetSchema = z
     configDir: z.string().min(1).optional(),
     defaultAgent: z.string().min(1).optional(),
     defaultModel: z.string().min(1).optional(),
+    managed: managedTargetSchema.optional(),
   })
   .strict();
 
@@ -131,9 +157,15 @@ export const rawGatewayConfigSchema = z
 export type AccessRole = z.infer<typeof accessRoleSchema>;
 export type BusyMode = z.infer<typeof busyModeSchema>;
 export type LogLevel = z.infer<typeof logLevelSchema>;
+export type ManagedRestartPolicy = z.infer<typeof managedRestartPolicySchema>;
+export type ManagedTargetConfig = z.infer<typeof managedTargetSchema>;
 export type TargetMode = z.infer<typeof targetModeSchema>;
 export type Verbosity = z.infer<typeof verbositySchema>;
 export type RawGatewayConfig = z.infer<typeof rawGatewayConfigSchema>;
+
+export function createDefaultManagedTargetConfig(): ManagedTargetConfig {
+  return { ...managedTargetConfigDefaults };
+}
 
 export interface GatewayTargetConfig {
   id: string;
@@ -144,6 +176,7 @@ export interface GatewayTargetConfig {
   configDir?: string;
   defaultAgent?: string;
   defaultModel?: string;
+  managed?: ManagedTargetConfig;
 }
 
 export interface GatewayProfileConfig {

@@ -145,6 +145,119 @@ test("loads file-backed config paths relative to the config file", async () => {
   }
 });
 
+test("loads managed target defaults without serverUrl", () => {
+  const config = parseGatewayConfig(
+    `{
+      "opencode": {
+        "targets": [{
+          "id": "managed",
+          "name": "Managed workspace",
+          "mode": "managed",
+          "workdir": "/work/repo"
+        }]
+      },
+      "profiles": {
+        "entries": [{ "id": "cto", "displayName": "Tiago CTO", "defaultTarget": "managed" }]
+      }
+    }`,
+    { env, homeDir: "/home/alice" },
+  );
+
+  expect(config.opencode.targets[0]).toEqual({
+    id: "managed",
+    name: "Managed workspace",
+    mode: "managed",
+    serverUrl: undefined,
+    workdir: "/work/repo",
+    configDir: undefined,
+    defaultAgent: undefined,
+    defaultModel: undefined,
+    managed: {
+      command: "opencode",
+      host: "127.0.0.1",
+      port: 0,
+      startupTimeoutMs: 15000,
+      stopTimeoutMs: 5000,
+      healthCheckIntervalMs: 10000,
+      healthCheckTimeoutMs: 2000,
+      restart: "on-failure",
+    },
+  });
+});
+
+test("loads managed target lifecycle overrides", () => {
+  const config = parseGatewayConfig(
+    `{
+      "opencode": {
+        "targets": [{
+          "id": "managed",
+          "mode": "managed",
+          "workdir": "/work/repo",
+          "managed": {
+            "command": "/usr/local/bin/opencode",
+            "host": "0.0.0.0",
+            "port": 4097,
+            "startupTimeoutMs": 30000,
+            "stopTimeoutMs": 10000,
+            "healthCheckIntervalMs": 15000,
+            "healthCheckTimeoutMs": 3000,
+            "restart": "never"
+          }
+        }]
+      },
+      "profiles": {
+        "entries": [{ "id": "cto", "displayName": "Tiago CTO", "defaultTarget": "managed" }]
+      }
+    }`,
+    { env, homeDir: "/home/alice" },
+  );
+
+  expect(config.opencode.targets[0]?.managed).toEqual({
+    command: "/usr/local/bin/opencode",
+    host: "0.0.0.0",
+    port: 4097,
+    startupTimeoutMs: 30000,
+    stopTimeoutMs: 10000,
+    healthCheckIntervalMs: 15000,
+    healthCheckTimeoutMs: 3000,
+    restart: "never",
+  });
+});
+
+test("loads managed target paths relative to the config file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-managed-config-"));
+  const configPath = join(dir, "config.jsonc");
+
+  await writeFile(
+    configPath,
+    `{
+      "opencode": {
+        "targets": [{
+          "id": "managed",
+          "mode": "managed",
+          "workdir": "./workspace",
+          "configDir": "./opencode-config",
+          "managed": {}
+        }]
+      },
+      "profiles": {
+        "entries": [{ "id": "cto", "displayName": "Tiago CTO", "defaultTarget": "managed" }]
+      }
+    }`,
+    "utf8",
+  );
+
+  try {
+    const config = await loadConfig(configPath, { env, homeDir: "/home/alice" });
+
+    expect(config.opencode.targets[0]?.workdir).toBe(join(dir, "workspace"));
+    expect(config.opencode.targets[0]?.configDir).toBe(join(dir, "opencode-config"));
+    expect(config.opencode.targets[0]?.managed?.command).toBe("opencode");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("derives access rule seeds from Telegram allowlist", () => {
   const config = parseGatewayConfig(minimalConfig(), {
     env,
@@ -213,6 +326,138 @@ test("rejects unknown profile target references", () => {
       { env, homeDir: "/home/alice" },
     ),
   ).toThrow("profiles.entries.cto.defaultTarget references unknown target: missing");
+});
+
+test("requires managed targets to declare workdir", () => {
+  expect(() =>
+    parseGatewayConfig(
+      `{
+        "opencode": {
+          "targets": [{ "id": "managed", "mode": "managed" }]
+        },
+        "profiles": {
+          "entries": [{ "id": "cto", "displayName": "Tiago CTO", "defaultTarget": "managed" }]
+        }
+      }`,
+      { env, homeDir: "/home/alice" },
+    ),
+  ).toThrow("opencode.targets.managed.workdir is required for managed mode");
+});
+
+test("rejects managed lifecycle config on attach targets", () => {
+  expect(() =>
+    parseGatewayConfig(
+      `{
+        "opencode": {
+          "targets": [{
+            "id": "default",
+            "mode": "attach",
+            "serverUrl": "http://127.0.0.1:4096",
+            "managed": {}
+          }]
+        },
+        "profiles": {
+          "entries": [{ "id": "cto", "displayName": "Tiago CTO", "defaultTarget": "default" }]
+        }
+      }`,
+      { env, homeDir: "/home/alice" },
+    ),
+  ).toThrow("opencode.targets.default.managed is only valid for managed mode");
+});
+
+test("rejects invalid managed target port", () => {
+  expect(() =>
+    parseGatewayConfig(
+      `{
+        "opencode": {
+          "targets": [{
+            "id": "managed",
+            "mode": "managed",
+            "workdir": "/work/repo",
+            "managed": { "port": 70000 }
+          }]
+        },
+        "profiles": {
+          "entries": [{ "id": "cto", "displayName": "Tiago CTO", "defaultTarget": "managed" }]
+        }
+      }`,
+      { env, homeDir: "/home/alice" },
+    ),
+  ).toThrow("opencode.targets.0.managed.port");
+});
+
+test("rejects invalid managed target timeout", () => {
+  expect(() =>
+    parseGatewayConfig(
+      `{
+        "opencode": {
+          "targets": [{
+            "id": "managed",
+            "mode": "managed",
+            "workdir": "/work/repo",
+            "managed": { "startupTimeoutMs": -1 }
+          }]
+        },
+        "profiles": {
+          "entries": [{ "id": "cto", "displayName": "Tiago CTO", "defaultTarget": "managed" }]
+        }
+      }`,
+      { env, homeDir: "/home/alice" },
+    ),
+  ).toThrow("opencode.targets.0.managed.startupTimeoutMs");
+});
+
+test("rejects unknown managed lifecycle keys", () => {
+  expect(() =>
+    parseGatewayConfig(
+      `{
+        "opencode": {
+          "targets": [{
+            "id": "managed",
+            "mode": "managed",
+            "workdir": "/work/repo",
+            "managed": { "startupTimeout": 15000 }
+          }]
+        },
+        "profiles": {
+          "entries": [{ "id": "cto", "displayName": "Tiago CTO", "defaultTarget": "managed" }]
+        }
+      }`,
+      { env, homeDir: "/home/alice" },
+    ),
+  ).toThrow("startupTimeout");
+});
+
+test("does not leak managed command env values in validation errors", () => {
+  try {
+    parseGatewayConfig(
+      `{
+        "opencode": {
+          "targets": [{
+            "id": "managed",
+            "mode": "managed",
+            "workdir": "/work/repo",
+            "managed": {
+              "command": "{env:OPENCODE_BIN}",
+              "port": 70000
+            }
+          }]
+        },
+        "profiles": {
+          "entries": [{ "id": "cto", "displayName": "Tiago CTO", "defaultTarget": "managed" }]
+        }
+      }`,
+      {
+        env: { ...env, OPENCODE_BIN: "secret-opencode-bin" },
+        homeDir: "/home/alice",
+      },
+    );
+
+    throw new Error("expected config validation to fail");
+  } catch (error) {
+    expect(String(error)).toContain("opencode.targets.0.managed.port");
+    expect(String(error)).not.toContain("secret-opencode-bin");
+  }
 });
 
 test("requires default profile when multiple profiles are configured", () => {
