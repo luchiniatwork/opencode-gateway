@@ -67,8 +67,14 @@ export function createProgressRenderer(options: ProgressRendererOptions): Progre
     },
 
     async finalize(): Promise<void> {
-      finalized = true;
+      if (finalized) return;
       clearProgressTimer();
+
+      if (options.verbosity === "tools" || options.verbosity === "verbose") {
+        await enqueueFlush();
+      }
+
+      finalized = true;
       await Promise.all([
         task.catch((error) => options.onError?.(error)),
         stopTypingIndicator(),

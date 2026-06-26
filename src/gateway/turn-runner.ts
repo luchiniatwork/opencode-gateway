@@ -286,6 +286,9 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
 
     const controller = new AbortController();
     const abortFromParent = () => controller.abort();
+    const mode = runtimeTurnMode(plan);
+
+    assertChannelTurnPlan(plan, mode);
 
     input.signal?.addEventListener("abort", abortFromParent, { once: true });
 
@@ -298,7 +301,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
         agent: resolution.agent,
         model: resolution.model,
         metadata: messageMetadata(message),
-        mode: runtimeTurnMode(plan),
+        mode,
         observePermissions: plan.permissionSource === "events",
         observeProgress: plan.progressSource === "events",
         signal: controller.signal,
@@ -999,8 +1002,8 @@ function createRuntimeTurnPlan(resolution: ResolvedDispatch, observePermissions:
   const observesProgress = resolution.binding.verbosity === "tools" || resolution.binding.verbosity === "verbose";
 
   return {
-    // ADR 0001: final-answer-only modes must not depend on event-stream final correlation.
-    finalSource: observesProgress ? "events" : "prompt",
+    // ADR 0001: verbosity changes side-channel progress rendering, not final-answer delivery.
+    finalSource: "prompt",
     progressSource: observesProgress ? "events" : "none",
     permissionSource: observePermissions ? "events" : "none",
   };
@@ -1008,6 +1011,14 @@ function createRuntimeTurnPlan(resolution: ResolvedDispatch, observePermissions:
 
 function runtimeTurnMode(plan: RuntimeTurnPlan): "sync" | "async" {
   return plan.finalSource === "events" ? "async" : "sync";
+}
+
+function assertChannelTurnPlan(plan: RuntimeTurnPlan, mode: "sync" | "async"): void {
+  if (plan.finalSource === "prompt" && mode === "sync") return;
+
+  throw new Error(
+    "Invalid channel turn plan: final answers must use the prompt path; event streams are progress/permission side channels only.",
+  );
 }
 
 async function withStartTimeout<T>(task: Promise<T>, timeoutMs: number, onTimeout: () => void): Promise<T> {

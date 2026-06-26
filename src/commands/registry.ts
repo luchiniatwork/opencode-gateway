@@ -150,6 +150,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       `Session: ${binding?.opencodeSessionId ?? "none"}${binding?.sessionName ? ` (${binding.sessionName})` : ""}`,
       `Agent: ${formatEffectiveValue(resolveEffectiveAgentValue(binding, profile, target))}`,
       `Model: ${formatEffectiveValue(resolveEffectiveModelValue(binding, profile, target))}`,
+      `Verbosity: ${formatEffectiveVerbosity(binding, profile, config.defaults.verbosity)}`,
       `Active run: ${formatRun(activeRun, activeDiagnostics)}`,
       `Queue: ${formatQueue(queueDiagnostics)}`,
       `Pending permissions: ${formatPendingPermissions(pendingPermissions)}`,
@@ -306,6 +307,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       context.profile.description ? `Description: ${context.profile.description}` : undefined,
       `Target: ${formatTarget(context.target)}`,
       `Session: ${context.binding?.opencodeSessionId ?? "none"}`,
+      `Verbosity: ${formatEffectiveVerbosity(context.binding, context.profile, config.defaults.verbosity)}`,
     ]
       .filter(Boolean)
       .join("\n");
@@ -327,6 +329,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
         : undefined,
       `Current session: ${result.session.id}`,
       `Target: ${result.resolution.target.name} (${result.resolution.target.id})`,
+      `Verbosity: ${result.resolution.binding.verbosity}`,
       ...formatClearedOverrideLines(
         result.clearedOverrides,
         result.resolution.binding,
@@ -611,8 +614,23 @@ function formatSessionShortName(title: string | undefined): string {
 function formatProfileLine(profile: ProfileRecord, currentProfileId: string): string {
   const marker = profile.id === currentProfileId ? "*" : "-";
   const description = profile.description ? ` - ${profile.description}` : "";
+  const defaults = [
+    profile.defaultVerbosity ? `verbosity=${profile.defaultVerbosity}` : undefined,
+    profile.defaultBusyMode ? `busy=${profile.defaultBusyMode}` : undefined,
+  ].filter(isNonEmptyString).join(", ");
+  const suffix = defaults ? ` [${defaults}]` : "";
 
-  return `${marker} ${profile.id}: ${profile.displayName}${description}`;
+  return `${marker} ${profile.id}: ${profile.displayName}${suffix}${description}`;
+}
+
+function formatEffectiveVerbosity(
+  binding: ConversationBindingRecord | undefined,
+  profile: ProfileRecord | undefined,
+  gatewayDefault: string,
+): string {
+  if (binding) return `${binding.verbosity} (binding)`;
+  if (profile?.defaultVerbosity) return `${profile.defaultVerbosity} (profile default)`;
+  return `${gatewayDefault} (gateway default)`;
 }
 
 function formatAgentLine(agent: RuntimeAgent, currentAgent: string | undefined): string {

@@ -85,6 +85,19 @@ test("progress renderer falls back to sparse progress sends without editing", as
   ]);
 });
 
+test("progress renderer flushes delayed progress when finalized quickly", async () => {
+  const harness = createHarness();
+  const renderer = createProgressRenderer({ verbosity: "tools", delayMs: 10_000, ...harness.delivery });
+
+  await renderer.handle({ type: "tool_start", id: "tool-1", name: "bash", summary: "Run tests" });
+  await renderer.handle({ type: "tool_end", id: "tool-1", name: "bash", ok: true, summary: "Passed" });
+  await renderer.finalize();
+
+  expect(harness.sent.map((entry) => entry.message.text)).toEqual([
+    "Tool bash started: Run tests\nTool bash completed: Passed",
+  ]);
+});
+
 test("progress renderer only shows tool lifecycle events in tools verbosity", async () => {
   const harness = createHarness();
   const renderer = createProgressRenderer({ verbosity: "tools", delayMs: 1, ...harness.delivery });

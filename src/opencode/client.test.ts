@@ -254,6 +254,87 @@ test("startTurn sync path can observe tool progress while final comes from promp
   expect(sdk.calls.promptAsync).toEqual([]);
 });
 
+test("startTurn sync path still returns final when progress subscription fails", async () => {
+  const sdk = createFakeSdkClient({
+    eventSubscribeError: new Error("events unavailable"),
+    prompt: {
+      info: { id: "assistant-sync", sessionID: "session-1", role: "assistant", finish: "stop" },
+      parts: [{ type: "text", text: "Final despite observer failure" }],
+    },
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const turn = await runtime.startTurn({
+    target: attachTarget,
+    sessionId: "session-1",
+    text: "Use bash",
+    mode: "sync",
+    observeProgress: true,
+  });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([
+    { type: "diagnostic", label: "Observer", summary: "OpenCode progress observation unavailable: events unavailable" },
+    { type: "final", text: "Final despite observer failure", costUsd: undefined, tokens: undefined },
+  ]);
+  expect(sdk.calls.prompt).toHaveLength(1);
+  expect(sdk.calls.promptAsync).toEqual([]);
+});
+
+test("startTurn sync path still returns final when progress event stream fails", async () => {
+  const sdk = createFakeSdkClient({
+    eventStreamError: new Error("stream dropped"),
+    promptDelayMs: 10,
+    prompt: {
+      info: { id: "assistant-sync", sessionID: "session-1", role: "assistant", finish: "stop" },
+      parts: [{ type: "text", text: "Final after stream failure" }],
+    },
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const turn = await runtime.startTurn({
+    target: attachTarget,
+    sessionId: "session-1",
+    text: "Use bash",
+    mode: "sync",
+    observeProgress: true,
+  });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([
+    { type: "final", text: "Final after stream failure", costUsd: undefined, tokens: undefined },
+  ]);
+  expect(sdk.calls.prompt).toHaveLength(1);
+  expect(sdk.calls.promptAsync).toEqual([]);
+});
+
+test("startTurn sync path still returns final when progress stream emits no useful events", async () => {
+  const sdk = createFakeSdkClient({
+    events: [{ type: "session.next.unknown", properties: { sessionID: "session-1" } }],
+    promptDelayMs: 10,
+    prompt: {
+      info: { id: "assistant-sync", sessionID: "session-1", role: "assistant", finish: "stop" },
+      parts: [{ type: "text", text: "Final without progress" }],
+    },
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const turn = await runtime.startTurn({
+    target: attachTarget,
+    sessionId: "session-1",
+    text: "Use bash",
+    mode: "sync",
+    observeProgress: true,
+  });
+  const events = await collectRuntimeEvents(turn.events);
+
+  expect(events).toEqual([
+    { type: "final", text: "Final without progress", costUsd: undefined, tokens: undefined },
+  ]);
+  expect(sdk.calls.prompt).toHaveLength(1);
+  expect(sdk.calls.promptAsync).toEqual([]);
+});
+
 test("starts observing events before sending an async prompt", async () => {
   let eventStreamStarted = false;
   const sdk = createFakeSdkClient({

@@ -212,6 +212,39 @@ test("turn runner exposes active turn plan diagnostics", async () => {
   }
 });
 
+for (const verbosity of ["off", "compact", "tools", "verbose"] as const) {
+  for (const observePermissions of [false, true] as const) {
+    test(`turn runner keeps final delivery on prompt path for ${verbosity} verbosity with permissions ${observePermissions ? "on" : "off"}`, async () => {
+      const harness = await createHarness({ waitForAbort: true, observePermissions, verbosity });
+
+      try {
+        await harness.runner.start({
+          message: inboundMessage(),
+          resolution: harness.resolution,
+          delivery: harness.delivery,
+        });
+        await waitForObserve(harness.runtime);
+
+        const observesProgress = verbosity === "tools" || verbosity === "verbose";
+        expect(harness.runtime.calls.startTurn[0]).toEqual(expect.objectContaining({
+          mode: "sync",
+          observeProgress: observesProgress,
+          observePermissions,
+        }));
+        expect(harness.runner.getActiveDiagnostics(harness.resolution.binding.id)?.plan).toEqual({
+          finalSource: "prompt",
+          progressSource: observesProgress ? "events" : "none",
+          permissionSource: observePermissions ? "events" : "none",
+        });
+      } finally {
+        await harness.runner.abortActive({ binding: harness.resolution.binding, target: harness.resolution.target });
+        await harness.runner.stop();
+        harness.database.close();
+      }
+    });
+  }
+}
+
 test("turn runner times out turns without a final response", async () => {
   const harness = await createHarness({ waitForAbort: true, runTimeoutMs: 1 });
 
@@ -676,7 +709,7 @@ test("turn runner renders tool progress for tools verbosity", async () => {
     await waitForDeliveries(harness.deliveries, 3);
 
     expect(harness.runtime.calls.startTurn[0]).toEqual(expect.objectContaining({
-      mode: "async",
+      mode: "sync",
       observeProgress: true,
     }));
     expect(harness.deliveries).toEqual([
@@ -723,7 +756,7 @@ test("turn runner renders subagent updates and todos for tools verbosity", async
     await waitForDeliveries(harness.deliveries, 4);
 
     expect(harness.runtime.calls.startTurn[0]).toEqual(expect.objectContaining({
-      mode: "async",
+      mode: "sync",
       observeProgress: true,
     }));
     expect(harness.deliveries).toEqual([

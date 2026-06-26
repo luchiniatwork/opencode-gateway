@@ -135,6 +135,7 @@ test("status reports context without creating a binding", async () => {
     expect(text).toContain("Session: none");
     expect(text).toContain("Agent: cto-agent (profile default)");
     expect(text).toContain("Model: provider/cto-model (profile default)");
+    expect(text).toContain("Verbosity: compact (profile default)");
     expect(harness.runtime.calls.ensureSession).toEqual([]);
     expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
   } finally {
@@ -475,9 +476,9 @@ test("profiles command lists available profiles and marks current", async () => 
     const text = responseText(result);
 
     expect(text).toContain("Gateway profiles:");
-    expect(text).toContain("* cto: CTO");
-    expect(text).toContain("- ops: Ops");
-    expect(text).toContain("- review: Review");
+    expect(text).toContain("* cto: CTO [verbosity=compact, busy=queue]");
+    expect(text).toContain("- ops: Ops [verbosity=tools, busy=queue]");
+    expect(text).toContain("- review: Review [verbosity=tools, busy=queue]");
   } finally {
     harness.database.close();
   }
@@ -493,6 +494,7 @@ test("profile command shows current profile", async () => {
     expect(text).toContain("Current profile: CTO (cto)");
     expect(text).toContain("Target: Default workspace (default)");
     expect(text).toContain("Session: none");
+    expect(text).toContain("Verbosity: compact (profile default)");
   } finally {
     harness.database.close();
   }
@@ -507,6 +509,7 @@ test("profile switch preserves session on same target and creates one on new tar
     const sameTarget = await harness.router.handle(inboundMessage({ text: "/profile review" }));
     expect(responseText(sameTarget)).toContain("Switched profile to Review (review).");
     expect(responseText(sameTarget)).toContain("Current session: session-1");
+    expect(responseText(sameTarget)).toContain("Verbosity: tools");
     expect(harness.repositories.bindings.getByConversationKey(conversationKey)?.profileId).toBe("review");
 
     const newTarget = await harness.router.handle(inboundMessage({ text: "/profile ops" }));

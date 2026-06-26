@@ -1633,28 +1633,20 @@ export class OpenCodeRuntime implements AgentRuntime {
 
       try {
         if (input.observePermissions || input.observeProgress) {
-          const client = this.getClient(input.target);
-          const subscription = await this.subscribeToEvents(client, input.target, input.signal);
+          const sideChannel = await this.startSyncSideChannelObserver(input, queue).catch((error) => {
+            if (!input.signal?.aborted) {
+              queue.push({
+                type: "diagnostic",
+                label: "Observer",
+                summary: `OpenCode progress observation unavailable: ${formatRuntimeError(error)}`,
+              });
+            }
 
-          permissionObserver = startObservedEventPump({
-            subscription,
-            client,
-            target: input.target,
-            state: createObserveState(input.sessionId, undefined),
-            fetch: this.fetch,
-            signal: input.signal,
-            reconcileIntervalMs: this.observeReconcileIntervalMs,
-            reconcileTimeoutMs: this.observeReconcileTimeoutMs,
-            permissionPollIntervalMs: this.permissionPollIntervalMs,
-            idleNoAssistantGraceMs: this.idleNoAssistantGraceMs,
+            return undefined;
           });
-          permissionForwarder = forwardSideChannelEvents(
-            permissionObserver.events,
-            queue,
-            { progress: Boolean(input.observeProgress), permissions: Boolean(input.observePermissions) },
-            input.signal,
-          );
-          await permissionObserver.ready;
+
+          permissionObserver = sideChannel?.observer;
+          permissionForwarder = sideChannel?.forwarder;
         }
 
         const turn = await this.send(input);
@@ -1687,6 +1679,36 @@ export class OpenCodeRuntime implements AgentRuntime {
       handle: createRuntimeTurnHandle(input, messageId, { mode: "sync" }),
       events: queue,
     };
+  }
+
+  private async startSyncSideChannelObserver(
+    input: StartRuntimeTurnInput,
+    queue: RuntimeEventQueue,
+  ): Promise<{ observer: ObservedEventPump; forwarder: Promise<void> }> {
+    const client = this.getClient(input.target);
+    const subscription = await this.subscribeToEvents(client, input.target, input.signal);
+    const observer = startObservedEventPump({
+      subscription,
+      client,
+      target: input.target,
+      state: createObserveState(input.sessionId, undefined),
+      fetch: this.fetch,
+      signal: input.signal,
+      reconcileIntervalMs: this.observeReconcileIntervalMs,
+      reconcileTimeoutMs: this.observeReconcileTimeoutMs,
+      permissionPollIntervalMs: this.permissionPollIntervalMs,
+      idleNoAssistantGraceMs: this.idleNoAssistantGraceMs,
+    });
+    const forwarder = forwardSideChannelEvents(
+      observer.events,
+      queue,
+      { progress: Boolean(input.observeProgress), permissions: Boolean(input.observePermissions) },
+      input.signal,
+    );
+
+    await observer.ready;
+
+    return { observer, forwarder };
   }
 
   async *observe(input: ObserveRuntimeTurnInput): AsyncIterable<RuntimeEvent> {

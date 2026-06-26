@@ -12,15 +12,26 @@ We hit this class of regression when final-answer-only Telegram conversations de
 
 ## Decision
 
-Turn execution is planned by source, not by a vague async/sync label:
+Turn execution is planned by source, not by a vague async/sync label. The
+critical boundary is that final-answer delivery must remain independent from
+optional progress observation:
 
 - `finalSource`: `prompt` or `events`
 - `progressSource`: `none` or `events`
 - `permissionSource`: `none` or `events`
 
-Final-answer-only modes (`off`, `compact`) use `finalSource: prompt`. They must not depend on OpenCode SSE for final delivery. They may use event observation only as a permission side channel. `compact` may keep a channel-native activity indicator (for example Telegram `typing...`) alive while the turn runs, but it does not send durable progress messages to chat.
+Channel-originated chat turns use `finalSource: prompt` regardless of verbosity.
+They must not depend on OpenCode SSE for final delivery. Event observation is a
+side channel only: it may provide progress messages and permission cards while
+the prompt is running, but failure to correlate progress events must not make the
+final answer disappear.
 
-Progress modes (`tools`, `verbose`) use `finalSource: events` and `progressSource: events` so the gateway can render tool/status progress and final completion from the same observed turn.
+Progress modes (`tools`, `verbose`) use `progressSource: events` so the gateway
+can render tool/status/todo/sub-agent progress. Final completion still comes
+from the prompt response. Final-answer-only modes (`off`, `compact`) use
+`progressSource: none`; `compact` may keep a channel-native activity indicator
+(for example Telegram `typing...`) alive while the turn runs, but it does not
+send durable progress messages to chat.
 
 Permission observation is independent from progress. If interactive permissions are enabled, `permissionSource` is `events` even for compact/off turns.
 
@@ -28,12 +39,30 @@ The local gateway run lock is an operational safety boundary. Timeouts and `/sto
 
 ## Consequences
 
-- Compact/off turns use OpenCode's synchronous prompt path for final answers.
+- All channel-originated chat turns use OpenCode's synchronous prompt path for
+  final answers.
 - Compact turns use transient channel activity indicators when available; the gateway should not send generic “working...” heartbeat messages.
-- Tools/verbose turns continue to use async prompt and SSE event observation.
+- Tools/verbose turns use SSE event observation only as a progress side channel.
 - Permission cards can still appear for compact/off turns through a permission-only observer.
-- Regression tests should assert turn-plan behavior directly instead of treating `promptAsync` as synonymous with a gateway turn.
+- Regression tests should assert turn-plan behavior directly and verify that
+  verbosity changes rendering, not final-answer execution semantics.
 - `/status`, `/health`, and logs should expose enough active-run and permission state to diagnose where a blocking failure occurred.
+
+## Executable Checks
+
+This decision is only useful if tests enforce it. The following checks are part
+of the architecture, not incidental coverage:
+
+- `src/gateway/turn-runner.test.ts` has a verbosity/permission matrix asserting
+  every channel-originated turn starts the runtime with `mode: "sync"`, uses
+  `finalSource: "prompt"`, and only changes `progressSource` / `permissionSource`.
+- `src/opencode/client.test.ts` asserts sync turns can observe tool progress
+  while the final answer comes from `session.prompt`.
+- `src/opencode/client.test.ts` asserts progress observer subscription failure,
+  event-stream failure, and unknown/no-op progress events do not prevent prompt
+  final delivery.
+- `src/gateway/turn-runner.ts` has a runtime tripwire that rejects any normal
+  channel turn plan attempting to use event-stream final delivery.
 
 ## Non-Goals
 
