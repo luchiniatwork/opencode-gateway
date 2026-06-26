@@ -152,6 +152,62 @@ test("send preserves markdown code fences as Telegram code blocks", async () => 
   expect(fakeBot.sentMessages[0]?.options?.parse_mode).toBe("HTML");
 });
 
+test("send renders markdown paragraphs and unordered lists for Telegram", async () => {
+  const fakeBot = new FakeTelegramBot();
+
+  await sendTelegramMessage(fakeBot, outboundTarget(), {
+    kind: "final",
+    format: "markdown",
+    text: [
+      "This paragraph wraps",
+      "across source lines.",
+      "",
+      "- First item with **bold**",
+      "* Second item",
+      "  + Nested item",
+      "- [x] Finished task",
+      "- [ ] Pending task",
+      "",
+      "Final paragraph.",
+    ].join("\n"),
+  });
+
+  expect(fakeBot.sentMessages[0]?.text).toBe([
+    "This paragraph wraps across source lines.",
+    "",
+    "• First item with <b>bold</b>",
+    "• Second item",
+    "  • Nested item",
+    "✅ Finished task",
+    "⬜ Pending task",
+    "",
+    "Final paragraph.",
+  ].join("\n"));
+  expect(fakeBot.sentMessages[0]?.options?.parse_mode).toBe("HTML");
+});
+
+test("send renders markdown ordered lists for Telegram", async () => {
+  const fakeBot = new FakeTelegramBot();
+
+  await sendTelegramMessage(fakeBot, outboundTarget(), {
+    kind: "final",
+    format: "markdown",
+    text: [
+      "Steps:",
+      "1. Install dependencies",
+      "2) Run `bun test`",
+      "  1. Inspect failures",
+    ].join("\n"),
+  });
+
+  expect(fakeBot.sentMessages[0]?.text).toBe([
+    "Steps:",
+    "1. Install dependencies",
+    "2. Run <code>bun test</code>",
+    "  1. Inspect failures",
+  ].join("\n"));
+});
+
 test("send splits long Telegram messages", async () => {
   const fakeBot = new FakeTelegramBot();
   const text = "a".repeat(TELEGRAM_MAX_TEXT_LENGTH + 10);

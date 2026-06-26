@@ -170,6 +170,7 @@ function splitFencedCodeBlock(block: string, maxLength: number): string[] {
 function markdownToTelegramHtml(markdown: string): string {
   const lines = markdown.split("\n");
   const output: string[] = [];
+  let paragraphLines: string[] = [];
   let inFence = false;
   let fenceLanguage: string | undefined;
   let fenceLines: string[] = [];
@@ -179,11 +180,12 @@ function markdownToTelegramHtml(markdown: string): string {
 
     if (trimmed.startsWith("```")) {
       if (!inFence) {
+        flushParagraph();
         inFence = true;
         fenceLanguage = trimmed.slice(3).trim().split(/\s+/)[0];
         fenceLines = [];
       } else {
-        output.push(renderCodeBlock(fenceLines.join("\n"), fenceLanguage));
+        appendMarkdownBlock(output, renderCodeBlock(fenceLines.join("\n"), fenceLanguage));
         inFence = false;
         fenceLanguage = undefined;
         fenceLines = [];
@@ -196,14 +198,36 @@ function markdownToTelegramHtml(markdown: string): string {
       continue;
     }
 
-    output.push(renderMarkdownLine(line));
+    if (line.trim() === "") {
+      flushParagraph();
+      appendBlankLine(output);
+      continue;
+    }
+
+    const listLine = renderListLine(line);
+    if (listLine) {
+      flushParagraph();
+      appendMarkdownBlock(output, listLine);
+      continue;
+    }
+
+    paragraphLines.push(line);
   }
+
+  flushParagraph();
 
   if (inFence) {
-    output.push(renderCodeBlock(fenceLines.join("\n"), fenceLanguage));
+    appendMarkdownBlock(output, renderCodeBlock(fenceLines.join("\n"), fenceLanguage));
   }
 
-  return output.join("\n");
+  return output.join("\n").trim();
+
+  function flushParagraph(): void {
+    if (paragraphLines.length === 0) return;
+
+    appendMarkdownBlock(output, renderMarkdownParagraph(paragraphLines));
+    paragraphLines = [];
+  }
 }
 
 function renderCodeBlock(code: string, language: string | undefined): string {
@@ -219,6 +243,89 @@ function renderMarkdownLine(line: string): string {
   }
 
   return renderInlineMarkdown(line);
+}
+
+function renderMarkdownParagraph(lines: string[]): string {
+  if (lines.length === 1) return renderMarkdownLine(lines[0] ?? "");
+
+  return renderInlineMarkdown(joinParagraphLines(lines));
+}
+
+function joinParagraphLines(lines: string[]): string {
+  return lines.reduce((paragraph, line, index) => {
+    const trimmed = line.trim();
+    if (index === 0) return trimmed;
+
+    const previous = lines[index - 1] ?? "";
+    const separator = / {2,}$/.test(previous) ? "\n" : " ";
+    return `${paragraph}${separator}${trimmed}`;
+  }, "");
+}
+
+interface MarkdownListLine {
+  indent: string;
+  marker: string;
+  orderedNumber?: string;
+  content: string;
+}
+
+function renderListLine(line: string): string | undefined {
+  const parsed = parseListLine(line);
+  if (!parsed) return undefined;
+
+  const task = parseTaskListContent(parsed.content);
+  const marker = task?.marker ?? (parsed.orderedNumber ? `${parsed.orderedNumber}.` : "•");
+  const content = task?.content ?? parsed.content;
+
+  return `${parsed.indent}${marker} ${renderInlineMarkdown(content.trim())}`;
+}
+
+function parseListLine(line: string): MarkdownListLine | undefined {
+  const unordered = /^(\s*)([-*+])\s+(.+)$/.exec(line);
+  if (unordered) {
+    return {
+      indent: listIndent(unordered[1] ?? ""),
+      marker: unordered[2] ?? "•",
+      content: unordered[3] ?? "",
+    };
+  }
+
+  const ordered = /^(\s*)(\d+)[.)]\s+(.+)$/.exec(line);
+  if (ordered) {
+    return {
+      indent: listIndent(ordered[1] ?? ""),
+      marker: ordered[2] ?? "1",
+      orderedNumber: ordered[2] ?? "1",
+      content: ordered[3] ?? "",
+    };
+  }
+
+  return undefined;
+}
+
+function parseTaskListContent(content: string): { marker: string; content: string } | undefined {
+  const task = /^\[([ xX])\]\s+(.+)$/.exec(content.trimStart());
+  if (!task) return undefined;
+
+  return {
+    marker: task[1]?.toLowerCase() === "x" ? "✅" : "⬜",
+    content: task[2] ?? "",
+  };
+}
+
+function listIndent(rawIndent: string): string {
+  const spaces = rawIndent.replaceAll("\t", "  ").length;
+  return "  ".repeat(Math.min(Math.floor(spaces / 2), 6));
+}
+
+function appendMarkdownBlock(output: string[], block: string): void {
+  if (!block) return;
+  output.push(block);
+}
+
+function appendBlankLine(output: string[]): void {
+  if (output.length === 0 || output.at(-1) === "") return;
+  output.push("");
 }
 
 function renderInlineMarkdown(text: string): string {
