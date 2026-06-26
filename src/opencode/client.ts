@@ -15,6 +15,8 @@ import type {
   RuntimeSession,
   RuntimeStartedTurn,
   RuntimeTarget,
+  RuntimeTodo,
+  RuntimeToolCategory,
   RuntimeTurn,
   RuntimeTurnHandle,
   SendRuntimeMessageInput,
@@ -146,14 +148,25 @@ interface ObserveState {
   turnId?: string;
   beforeMessageIds: Set<string>;
   hasBeforeMessageSnapshot: boolean;
+  childSessionIds: Set<string>;
+  childSessionAgentsById: Map<string, string>;
   assistantMessageIds: Set<string>;
   finalizedMessageIds: Set<string>;
   pendingPermissionIds: Set<string>;
   textPartsByMessageId: Map<string, Map<string, string>>;
   toolStatusesByCallId: Map<string, string>;
+  toolInfoByCallId: Map<string, ObservedToolInfo>;
+  lastTodoFingerprintBySessionId: Map<string, string>;
   idleNoAssistantSinceMs?: number;
   pendingFinal?: Extract<RuntimeEvent, { type: "final" }>;
   pendingFinalMessageId?: string;
+}
+
+interface ObservedToolInfo {
+  name: string;
+  category?: RuntimeToolCategory;
+  summary?: string;
+  sessionId: string;
 }
 
 interface OpenCodeRuntimeOptions {
@@ -275,6 +288,9 @@ function normalizeSdkEvent(
   const properties = eventProperties(event);
 
   switch (type) {
+    case "session.created":
+    case "session.updated":
+      return normalizeSessionUpdated(properties, state);
     case "session.status":
       return normalizeSessionStatus(properties, state);
     case "session.idle":
@@ -292,11 +308,35 @@ function normalizeSdkEvent(
     case "permission.replied":
     case "permission.v2.replied":
       return normalizePermissionReplied(properties, state);
+    case "question.asked":
+    case "question.v2.asked":
+      return normalizeQuestionRequest(properties, state);
+    case "todo.updated":
+      return normalizeTodoUpdated(properties, state);
     case "session.error":
       return normalizeSessionError(properties, state);
     default:
+      if (type?.startsWith("session.next.")) return normalizeSessionNextEvent(type, properties, state);
       return noEvents();
   }
+}
+
+function normalizeSessionUpdated(
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  const info = getObject(properties, "info") ?? properties;
+  const sessionId = getObjectString(info, "id") ?? getObjectString(properties, "sessionID");
+  const parentId = getObjectString(info, "parentID") ?? getObjectString(info, "parentId");
+
+  if (sessionId && parentId === state.sessionId) {
+    state.childSessionIds.add(sessionId);
+
+    const agent = getObjectString(info, "agent");
+    if (agent) state.childSessionAgentsById.set(sessionId, agent);
+  }
+
+  return noEvents();
 }
 
 function normalizeSessionStatus(
@@ -368,10 +408,17 @@ function normalizeMessagePartUpdated(
 ): { events: RuntimeEvent[]; terminal: boolean } {
   const part = getObject(properties, "part");
   const sessionId = getObjectString(part, "sessionID") ?? getObjectString(properties, "sessionID");
-  if (!part || sessionId !== state.sessionId) return noEvents();
-  if (!partBelongsToObservedTurn(part, state)) return noEvents();
+  const sessionKind = sessionId ? relatedSessionKind(sessionId, state) : undefined;
+  if (!part || !sessionId || !sessionKind) return noEvents();
+
+  if (sessionKind === "primary" && !partBelongsToObservedTurn(part, state)) return noEvents();
 
   const partType = getObjectString(part, "type");
+
+  if (sessionKind === "subagent") {
+    if (partType === "tool") return { events: normalizeToolPart(part, state, { source: "subagent" }), terminal: false };
+    return noEvents();
+  }
 
   if (partType === "text") {
     const text = updateTextPartAndGetDelta(part, getObjectString(properties, "delta"), state);
@@ -380,6 +427,15 @@ function normalizeMessagePartUpdated(
 
   if (partType === "tool") {
     return { events: normalizeToolPart(part, state), terminal: false };
+  }
+
+  if (partType === "subtask") {
+    return { events: normalizeSubtaskPart(part, state), terminal: false };
+  }
+
+  if (partType === "agent") {
+    const name = getObjectString(part, "name");
+    return name ? { events: [{ type: "diagnostic", label: "Agent", summary: name }], terminal: false } : noEvents();
   }
 
   return noEvents();
@@ -460,6 +516,56 @@ function normalizePermissionReplied(
   return noEvents();
 }
 
+function normalizeQuestionRequest(
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  const sessionId = getObjectString(properties, "sessionID");
+  if (!sessionId || !relatedSessionKind(sessionId, state)) return noEvents();
+
+  const id = getObjectString(properties, "id") ?? getObjectString(properties, "requestID");
+  const rawQuestions = properties.questions;
+  const questions = Array.isArray(rawQuestions) ? rawQuestions : [properties];
+  const events: RuntimeEvent[] = [];
+
+  for (const [index, value] of questions.entries()) {
+    const question = asObject(value);
+    const prompt = getObjectString(question, "question") ?? getObjectString(question, "prompt");
+    if (!prompt) continue;
+
+    const choices = questionChoices(question);
+    events.push({
+      type: "question_request",
+      id: questions.length > 1 ? `${id ?? "question"}:${index + 1}` : id ?? `question-${index + 1}`,
+      prompt,
+      choices,
+    });
+  }
+
+  return { events, terminal: false };
+}
+
+function normalizeTodoUpdated(
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  const sessionId = getObjectString(properties, "sessionID");
+  const sessionKind = sessionId ? relatedSessionKind(sessionId, state) : undefined;
+  if (!sessionId || !sessionKind) return noEvents();
+
+  const todos = parseTodos(properties.todos);
+  if (!todos) return noEvents();
+
+  const fingerprint = JSON.stringify(todos);
+  if (state.lastTodoFingerprintBySessionId.get(sessionId) === fingerprint) return noEvents();
+  state.lastTodoFingerprintBySessionId.set(sessionId, fingerprint);
+
+  return {
+    events: [{ type: "todo_update", todos, source: sessionKind === "subagent" ? "subagent" : "session" }],
+    terminal: false,
+  };
+}
+
 function normalizeSessionError(
   properties: Record<string, unknown>,
   state: ObserveState,
@@ -474,32 +580,267 @@ function normalizeSessionError(
   };
 }
 
-function normalizeToolPart(part: Record<string, unknown>, state: ObserveState): RuntimeEvent[] {
+function normalizeToolPart(
+  part: Record<string, unknown>,
+  state: ObserveState,
+  options: { source?: "subagent" } = {},
+): RuntimeEvent[] {
   const callId = getObjectString(part, "callID") ?? getObjectString(part, "id");
-  const name = getObjectString(part, "tool") ?? "tool";
+  const sessionId = getObjectString(part, "sessionID") ?? state.sessionId;
+  const rawName = getObjectString(part, "tool") ?? "tool";
   const toolState = asObject(part.state);
   const status = toolState ? getObjectString(toolState, "status") : undefined;
 
   if (!callId || !status) return [];
 
-  const previousStatus = state.toolStatusesByCallId.get(callId);
-  if (previousStatus === status && (status === "completed" || status === "error")) return [];
+  const input = getObject(toolState, "input");
+  const metadata = getObject(toolState, "metadata");
+  rememberSubagentSession(rawName, metadata, state);
 
-  state.toolStatusesByCallId.set(callId, status);
-  const summary = toolState ? toolSummary(toolState) : undefined;
+  return normalizeToolLifecycle({
+    state,
+    sessionId,
+    callId,
+    status,
+    rawName,
+    input,
+    metadata,
+    title: getObjectString(toolState, "title"),
+    error: getObjectString(toolState, "error"),
+    source: options.source,
+  });
+}
 
-  if (!previousStatus && (status === "pending" || status === "running")) {
-    return [{ type: "tool_start", id: callId, name, summary }];
+function normalizeSubtaskPart(part: Record<string, unknown>, state: ObserveState): RuntimeEvent[] {
+  const id = getObjectString(part, "id");
+  const description = getObjectString(part, "description");
+  const agent = getObjectString(part, "agent") ?? "subagent";
+  if (!id) return [];
+
+  return normalizeToolLifecycle({
+    state,
+    sessionId: getObjectString(part, "sessionID") ?? state.sessionId,
+    callId: id,
+    status: "running",
+    rawName: "task",
+    input: compactObject({ description, subagent_type: agent }),
+    metadata: undefined,
+    title: description,
+    source: "subagent",
+  });
+}
+
+function normalizeSessionNextEvent(
+  eventType: string,
+  properties: Record<string, unknown>,
+  state: ObserveState,
+): { events: RuntimeEvent[]; terminal: boolean } {
+  const sessionId = getObjectString(properties, "sessionID");
+  const sessionKind = sessionId ? relatedSessionKind(sessionId, state) : undefined;
+  if (!sessionId || !sessionKind) return noEvents();
+
+  const source = sessionKind === "subagent" ? "subagent" : undefined;
+  const assistantMessageId = getObjectString(properties, "assistantMessageID");
+  if (sessionKind === "primary" && assistantMessageId) state.assistantMessageIds.add(assistantMessageId);
+
+  switch (eventType) {
+    case "session.next.tool.input.started": {
+      const callId = getObjectString(properties, "callID");
+      const rawName = getObjectString(properties, "name") ?? "tool";
+      if (callId) rememberToolInfo(state, sessionId, callId, rawName, undefined, undefined, source);
+      return noEvents();
+    }
+    case "session.next.tool.called": {
+      const callId = getObjectString(properties, "callID");
+      const rawName = getObjectString(properties, "tool") ?? "tool";
+      if (!callId) return noEvents();
+
+      const input = getObject(properties, "input") ?? {};
+      return {
+        events: normalizeToolLifecycle({
+          state,
+          sessionId,
+          callId,
+          status: "running",
+          rawName,
+          input,
+          metadata: undefined,
+          title: undefined,
+          source,
+        }),
+        terminal: false,
+      };
+    }
+    case "session.next.tool.progress": {
+      const callId = getObjectString(properties, "callID");
+      if (!callId) return noEvents();
+
+      const info = state.toolInfoByCallId.get(toolStateKey(sessionId, callId));
+      return {
+        events: normalizeToolLifecycle({
+          state,
+          sessionId,
+          callId,
+          status: "running",
+          rawName: info?.name ?? "tool",
+          input: undefined,
+          metadata: undefined,
+          title: sessionNextToolSummary(properties),
+          source: source ?? (info?.category === "subagent" ? "subagent" : undefined),
+        }),
+        terminal: false,
+      };
+    }
+    case "session.next.tool.success": {
+      const callId = getObjectString(properties, "callID");
+      if (!callId) return noEvents();
+
+      const info = state.toolInfoByCallId.get(toolStateKey(sessionId, callId));
+      return {
+        events: normalizeToolLifecycle({
+          state,
+          sessionId,
+          callId,
+          status: "completed",
+          rawName: info?.name ?? "tool",
+          input: undefined,
+          metadata: undefined,
+          title: sessionNextToolSummary(properties) ?? info?.summary,
+          source: source ?? (info?.category === "subagent" ? "subagent" : undefined),
+        }),
+        terminal: false,
+      };
+    }
+    case "session.next.tool.failed": {
+      const callId = getObjectString(properties, "callID");
+      if (!callId) return noEvents();
+
+      const info = state.toolInfoByCallId.get(toolStateKey(sessionId, callId));
+      return {
+        events: normalizeToolLifecycle({
+          state,
+          sessionId,
+          callId,
+          status: "error",
+          rawName: info?.name ?? "tool",
+          input: undefined,
+          metadata: undefined,
+          error: formatRuntimeError(properties.error),
+          source: source ?? (info?.category === "subagent" ? "subagent" : undefined),
+        }),
+        terminal: false,
+      };
+    }
+    case "session.next.retried":
+      return diagnosticEvent("Retry", `attempt ${getObjectNumber(properties, "attempt") ?? "unknown"}: ${formatRuntimeError(properties.error)}`);
+    case "session.next.compaction.started":
+      return diagnosticEvent("Compaction", `${getObjectString(properties, "reason") ?? "manual"} compaction started`);
+    case "session.next.compaction.ended":
+      return diagnosticEvent("Compaction", `${getObjectString(properties, "reason") ?? "manual"} compaction completed`);
+    case "session.next.step.started":
+      return diagnosticEvent("Step", `agent ${getObjectString(properties, "agent") ?? "unknown"} started`);
+    case "session.next.step.ended":
+      return diagnosticEvent("Step", `${getObjectString(properties, "finish") ?? "completed"}${costSuffix(getObjectNumber(properties, "cost"))}`);
+    case "session.next.step.failed":
+      return diagnosticEvent("Step", `failed: ${formatRuntimeError(properties.error)}`);
+    case "session.next.agent.switched":
+      return diagnosticEvent("Agent", getObjectString(properties, "agent") ?? "switched");
+    case "session.next.model.switched":
+      return diagnosticEvent("Model", formatModelRef(getObject(properties, "model")) ?? "switched");
+    default:
+      return noEvents();
+  }
+}
+
+function normalizeToolLifecycle(input: {
+  state: ObserveState;
+  sessionId: string;
+  callId: string;
+  status: string;
+  rawName: string;
+  input?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  title?: string;
+  error?: string;
+  source?: "subagent";
+}): RuntimeEvent[] {
+  const key = toolStateKey(input.sessionId, input.callId);
+  const previousStatus = input.state.toolStatusesByCallId.get(key);
+  if (previousStatus === input.status && (input.status === "completed" || input.status === "error")) return [];
+
+  input.state.toolStatusesByCallId.set(key, input.status);
+
+  const info = rememberToolInfo(
+    input.state,
+    input.sessionId,
+    input.callId,
+    input.rawName,
+    input.input,
+    input.metadata,
+    input.source,
+    input.title,
+    input.error,
+  );
+  const eventBase = { id: input.callId, name: info.name, summary: info.summary, category: info.category };
+
+  if (!previousStatus && (input.status === "pending" || input.status === "running")) {
+    return [{ type: "tool_start", ...eventBase }];
   }
 
-  if (status === "pending" || status === "running") {
-    return [{ type: "tool_update", id: callId, name, summary }];
+  if (input.status === "pending" || input.status === "running") {
+    return [{ type: "tool_update", ...eventBase }];
   }
 
-  if (status === "completed") return [{ type: "tool_end", id: callId, name, ok: true, summary }];
-  if (status === "error") return [{ type: "tool_end", id: callId, name, ok: false, summary }];
+  if (input.status === "completed") return [{ type: "tool_end", ...eventBase, ok: true }];
+  if (input.status === "error") return [{ type: "tool_end", ...eventBase, ok: false }];
 
   return [];
+}
+
+function rememberToolInfo(
+  state: ObserveState,
+  sessionId: string,
+  callId: string,
+  rawName: string,
+  input: Record<string, unknown> | undefined,
+  metadata: Record<string, unknown> | undefined,
+  source: "subagent" | undefined,
+  title?: string,
+  error?: string,
+): ObservedToolInfo {
+  const key = toolStateKey(sessionId, callId);
+  const existing = state.toolInfoByCallId.get(key);
+  const category = source === "subagent" ? "subagent" : existing?.category ?? toolCategory(rawName);
+  const name = toolDisplayName(rawName, input, metadata, existing?.name, category);
+  const summary = toolSummary(rawName, input, title, error, existing?.summary);
+  const info = { name, category, summary, sessionId } satisfies ObservedToolInfo;
+
+  state.toolInfoByCallId.set(key, info);
+  rememberSubagentSession(rawName, metadata, state);
+
+  return info;
+}
+
+function toolStateKey(sessionId: string, callId: string): string {
+  return `${sessionId}:${callId}`;
+}
+
+function toolCategory(rawName: string): RuntimeToolCategory | undefined {
+  if (rawName === "skill") return "skill";
+  if (rawName === "task") return "subagent";
+  return undefined;
+}
+
+function toolDisplayName(
+  rawName: string,
+  input: Record<string, unknown> | undefined,
+  metadata: Record<string, unknown> | undefined,
+  existing: string | undefined,
+  category: RuntimeToolCategory | undefined,
+): string {
+  if (category === "skill") return getObjectString(input, "name") ?? getObjectString(metadata, "name") ?? existing ?? rawName;
+  if (rawName === "task") return getObjectString(input, "subagent_type") ?? existing ?? "subagent";
+  return rawName || existing || "tool";
 }
 
 function updateTextPartAndGetDelta(
@@ -551,8 +892,97 @@ function permissionSummary(properties: Record<string, unknown>): string {
   );
 }
 
-function toolSummary(state: Record<string, unknown>): string | undefined {
-  return getObjectString(state, "title") ?? getObjectString(state, "error") ?? getObjectString(state, "status");
+function toolSummary(
+  rawName: string,
+  input: Record<string, unknown> | undefined,
+  title: string | undefined,
+  error: string | undefined,
+  existing: string | undefined,
+): string | undefined {
+  if (error) return error;
+  if (rawName === "task") return getObjectString(input, "description") ?? title ?? existing;
+  if (rawName === "skill") return title ?? existing;
+  if (rawName === "todowrite") return todoInputSummary(input) ?? title ?? existing;
+  return title ?? existing;
+}
+
+function rememberSubagentSession(rawName: string, metadata: Record<string, unknown> | undefined, state: ObserveState): void {
+  if (rawName !== "task") return;
+
+  const sessionId = getObjectString(metadata, "sessionId") ?? getObjectString(metadata, "sessionID");
+  if (!sessionId) return;
+
+  state.childSessionIds.add(sessionId);
+}
+
+function sessionNextToolSummary(properties: Record<string, unknown>): string | undefined {
+  return (
+    getObjectString(properties, "title") ??
+    contentSummary(properties.content) ??
+    structuredSummary(getObject(properties, "structured")) ??
+    resultSummary(properties.result)
+  );
+}
+
+function contentSummary(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+
+  for (const item of content) {
+    const text = getObjectString(item, "text") ?? getObjectString(item, "value");
+    if (text) return singleLine(text, 160);
+  }
+
+  return undefined;
+}
+
+function structuredSummary(value: Record<string, unknown> | undefined): string | undefined {
+  if (!value) return undefined;
+
+  return (
+    getObjectString(value, "title") ??
+    getObjectString(value, "summary") ??
+    getObjectString(value, "message") ??
+    getObjectString(value, "status")
+  );
+}
+
+function resultSummary(value: unknown): string | undefined {
+  if (typeof value === "string") return singleLine(value, 160);
+  const object = asObject(value);
+  if (!object) return undefined;
+
+  return structuredSummary(object);
+}
+
+function todoInputSummary(input: Record<string, unknown> | undefined): string | undefined {
+  const todos = input?.todos;
+  if (!Array.isArray(todos)) return undefined;
+
+  return `${todos.length} todo${todos.length === 1 ? "" : "s"}`;
+}
+
+function singleLine(value: string, maxLength: number): string {
+  const text = value.replaceAll(/\s+/g, " ").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(maxLength - 1, 0)).trimEnd()}...`;
+}
+
+function diagnosticEvent(label: string, summary: string | undefined): { events: RuntimeEvent[]; terminal: boolean } {
+  return { events: [{ type: "diagnostic", label, summary }], terminal: false };
+}
+
+function costSuffix(cost: number | undefined): string {
+  return cost === undefined ? "" : `, $${cost.toFixed(4)}`;
+}
+
+function formatModelRef(model: Record<string, unknown> | undefined): string | undefined {
+  if (!model) return undefined;
+
+  const providerId = getObjectString(model, "providerID") ?? getObjectString(model, "providerId");
+  const modelId = getObjectString(model, "modelID") ?? getObjectString(model, "modelId") ?? getObjectString(model, "id");
+  if (!providerId && !modelId) return undefined;
+
+  return providerId && modelId ? `${providerId}/${modelId}` : providerId ?? modelId;
 }
 
 function partBelongsToObservedTurn(part: Record<string, unknown>, state: ObserveState): boolean {
@@ -582,6 +1012,42 @@ function messageBelongsToObservedTurn(
 
 function matchesSession(properties: Record<string, unknown>, state: ObserveState): boolean {
   return getObjectString(properties, "sessionID") === state.sessionId;
+}
+
+function relatedSessionKind(sessionId: string, state: ObserveState): "primary" | "subagent" | undefined {
+  if (sessionId === state.sessionId) return "primary";
+  if (state.childSessionIds.has(sessionId)) return "subagent";
+  return undefined;
+}
+
+function questionChoices(question: Record<string, unknown> | undefined): string[] | undefined {
+  if (!question || !Array.isArray(question.options)) return undefined;
+
+  const labels = question.options
+    .map((option) => getObjectString(option, "label"))
+    .filter(isNonEmptyString);
+
+  return labels.length > 0 ? labels : undefined;
+}
+
+function parseTodos(value: unknown): RuntimeTodo[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+
+  const todos: RuntimeTodo[] = [];
+  for (const item of value) {
+    const todo = asObject(item);
+    const content = getObjectString(todo, "content");
+    const status = getObjectString(todo, "status");
+    if (!content || !status) continue;
+
+    todos.push({
+      content,
+      status,
+      priority: getObjectString(todo, "priority"),
+    });
+  }
+
+  return todos;
 }
 
 function eventProperties(event: Record<string, unknown>): Record<string, unknown> {
@@ -968,7 +1434,13 @@ async function forwardSideChannelEvents(
 }
 
 function isProgressEvent(event: RuntimeEvent): boolean {
-  return event.type === "tool_start" || event.type === "tool_update" || event.type === "tool_end" || event.type === "status";
+  return event.type === "tool_start" ||
+    event.type === "tool_update" ||
+    event.type === "tool_end" ||
+    event.type === "todo_update" ||
+    event.type === "diagnostic" ||
+    event.type === "question_request" ||
+    event.type === "status";
 }
 
 export class OpenCodeRuntime implements AgentRuntime {
@@ -1683,11 +2155,15 @@ function createObserveState(sessionId: string, turnId: string | undefined, befor
     turnId,
     beforeMessageIds: beforeMessageIds ?? new Set(),
     hasBeforeMessageSnapshot: beforeMessageIds !== undefined,
+    childSessionIds: new Set(),
+    childSessionAgentsById: new Map(),
     assistantMessageIds: new Set(),
     finalizedMessageIds: new Set(),
     pendingPermissionIds: new Set(),
     textPartsByMessageId: new Map(),
     toolStatusesByCallId: new Map(),
+    toolInfoByCallId: new Map(),
+    lastTodoFingerprintBySessionId: new Map(),
   };
 }
 

@@ -694,6 +694,58 @@ test("turn runner renders tool progress for tools verbosity", async () => {
   }
 });
 
+test("turn runner renders subagent updates and todos for tools verbosity", async () => {
+  const harness = await createHarness({
+    events: [
+      { type: "tool_start", id: "task-1", name: "general", category: "subagent", summary: "Inspect bug" },
+      { type: "tool_update", id: "grep-1", name: "grep", category: "subagent", summary: "Search runtime events" },
+      {
+        type: "todo_update",
+        source: "subagent",
+        todos: [
+          { content: "Search runtime events", status: "in_progress", priority: "high" },
+          { content: "Summarize findings", status: "pending", priority: "medium" },
+        ],
+      },
+      { type: "final", text: "done" },
+    ],
+    eventDelayMs: 5,
+    progressDelayMs: 1,
+    verbosity: "tools",
+  });
+
+  try {
+    await harness.runner.start({
+      message: inboundMessage(),
+      resolution: harness.resolution,
+      delivery: harness.delivery,
+    });
+    await waitForDeliveries(harness.deliveries, 4);
+
+    expect(harness.runtime.calls.startTurn[0]).toEqual(expect.objectContaining({
+      mode: "async",
+      observeProgress: true,
+    }));
+    expect(harness.deliveries).toEqual([
+      { kind: "progress", format: "plain", text: "Subagent general started: Inspect bug" },
+      { kind: "progress", format: "plain", text: "Subagent grep updated: Search runtime events" },
+      {
+        kind: "progress",
+        format: "plain",
+        text: [
+          "Subagent todos:",
+          "[~] Search runtime events (high)",
+          "[ ] Summarize findings (medium)",
+        ].join("\n"),
+      },
+      { kind: "final", format: "markdown", text: "done" },
+    ]);
+  } finally {
+    await harness.runner.stop();
+    harness.database.close();
+  }
+});
+
 interface HarnessOptions {
   events?: RuntimeEvent[];
   eventBatches?: RuntimeEvent[][];

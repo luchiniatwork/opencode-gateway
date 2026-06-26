@@ -892,6 +892,212 @@ test("observes tool lifecycle events", async () => {
   ]);
 });
 
+test("observes skill and subagent tool progress from message parts", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "skill-part-1",
+            sessionID: "session-1",
+            messageID: "assistant-1",
+            type: "tool",
+            callID: "call-skill",
+            tool: "skill",
+            state: { status: "running", input: { name: "customize-opencode" } },
+          },
+        },
+      },
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "skill-part-1",
+            sessionID: "session-1",
+            messageID: "assistant-1",
+            type: "tool",
+            callID: "call-skill",
+            tool: "skill",
+            state: { status: "completed", input: { name: "customize-opencode" }, title: "Loaded skill: customize-opencode" },
+          },
+        },
+      },
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "task-part-1",
+            sessionID: "session-1",
+            messageID: "assistant-1",
+            type: "tool",
+            callID: "call-task",
+            tool: "task",
+            state: {
+              status: "running",
+              input: { description: "Inspect bug", subagent_type: "general" },
+              metadata: { sessionId: "child-session-1" },
+            },
+          },
+        },
+      },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const events = await collectRuntimeEvents(runtime.observe({ target: attachTarget, sessionId: "session-1" }));
+
+  expect(events).toEqual([
+    { type: "tool_start", id: "call-skill", name: "customize-opencode", category: "skill", summary: undefined },
+    { type: "tool_end", id: "call-skill", name: "customize-opencode", category: "skill", ok: true, summary: "Loaded skill: customize-opencode" },
+    { type: "tool_start", id: "call-task", name: "general", category: "subagent", summary: "Inspect bug" },
+  ]);
+});
+
+test("observes todo and question updates", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "todo.updated",
+        properties: {
+          sessionID: "session-1",
+          todos: [
+            { content: "Implement runtime events", status: "in_progress", priority: "high" },
+            { content: "Add tests", status: "pending", priority: "medium" },
+          ],
+        },
+      },
+      {
+        type: "question.v2.asked",
+        properties: {
+          id: "question-1",
+          sessionID: "session-1",
+          questions: [
+            {
+              question: "Which branch?",
+              header: "Branch",
+              options: [{ label: "main", description: "Use main" }],
+            },
+          ],
+        },
+      },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const events = await collectRuntimeEvents(runtime.observe({ target: attachTarget, sessionId: "session-1" }));
+
+  expect(events).toEqual([
+    {
+      type: "todo_update",
+      source: "session",
+      todos: [
+        { content: "Implement runtime events", status: "in_progress", priority: "high" },
+        { content: "Add tests", status: "pending", priority: "medium" },
+      ],
+    },
+    { type: "question_request", id: "question-1", prompt: "Which branch?", choices: ["main"] },
+  ]);
+});
+
+test("observes session.next tool events and child subagent updates", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      {
+        type: "session.created",
+        properties: { sessionID: "child-session-1", info: { id: "child-session-1", parentID: "session-1", agent: "general" } },
+      },
+      {
+        type: "session.next.tool.called",
+        properties: {
+          sessionID: "session-1",
+          assistantMessageID: "assistant-1",
+          callID: "call-task",
+          tool: "task",
+          input: { description: "Inspect bug", subagent_type: "general" },
+          provider: { executed: false },
+        },
+      },
+      {
+        type: "session.next.tool.progress",
+        properties: {
+          sessionID: "session-1",
+          assistantMessageID: "assistant-1",
+          callID: "call-task",
+          structured: { status: "Running child agent" },
+          content: [],
+        },
+      },
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "child-tool-part-1",
+            sessionID: "child-session-1",
+            messageID: "child-assistant-1",
+            type: "tool",
+            callID: "child-call-1",
+            tool: "grep",
+            state: { status: "running", input: { pattern: "RuntimeEvent" }, title: "Search runtime events" },
+          },
+        },
+      },
+      {
+        type: "todo.updated",
+        properties: {
+          sessionID: "child-session-1",
+          todos: [{ content: "Search runtime events", status: "in_progress", priority: "high" }],
+        },
+      },
+      {
+        type: "session.next.tool.success",
+        properties: {
+          sessionID: "session-1",
+          assistantMessageID: "assistant-1",
+          callID: "call-task",
+          structured: {},
+          content: [{ type: "text", text: "Subagent complete" }],
+          provider: { executed: false },
+        },
+      },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const events = await collectRuntimeEvents(runtime.observe({ target: attachTarget, sessionId: "session-1" }));
+
+  expect(events).toEqual([
+    { type: "tool_start", id: "call-task", name: "general", category: "subagent", summary: "Inspect bug" },
+    { type: "tool_update", id: "call-task", name: "general", category: "subagent", summary: "Running child agent" },
+    { type: "tool_start", id: "child-call-1", name: "grep", category: "subagent", summary: "Search runtime events" },
+    {
+      type: "todo_update",
+      source: "subagent",
+      todos: [{ content: "Search runtime events", status: "in_progress", priority: "high" }],
+    },
+    { type: "tool_end", id: "call-task", name: "general", category: "subagent", ok: true, summary: "Subagent complete" },
+  ]);
+});
+
+test("observes verbose diagnostic session.next events", async () => {
+  const sdk = createFakeSdkClient({
+    events: [
+      { type: "session.next.retried", properties: { sessionID: "session-1", attempt: 2, error: { message: "rate limited" } } },
+      { type: "session.next.compaction.started", properties: { sessionID: "session-1", messageID: "message-1", reason: "auto" } },
+      { type: "session.next.step.started", properties: { sessionID: "session-1", assistantMessageID: "assistant-1", agent: "build" } },
+    ],
+  });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+
+  const events = await collectRuntimeEvents(runtime.observe({ target: attachTarget, sessionId: "session-1" }));
+
+  expect(events).toEqual([
+    { type: "diagnostic", label: "Retry", summary: "attempt 2: rate limited" },
+    { type: "diagnostic", label: "Compaction", summary: "auto compaction started" },
+    { type: "diagnostic", label: "Step", summary: "agent build started" },
+  ]);
+});
+
 test("observes permission requests without leaking raw SDK payloads", async () => {
   const sdk = createFakeSdkClient({
     events: [

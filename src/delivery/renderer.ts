@@ -213,11 +213,15 @@ function progressLine(event: RuntimeEvent, verbosity: Verbosity): string | undef
 function toolProgressLine(event: RuntimeEvent): string | undefined {
   switch (event.type) {
     case "tool_start":
-      return `Tool ${event.name} started${summarySuffix(event.summary)}`;
-    case "tool_end":
-      return `Tool ${event.name} ${event.ok ? "completed" : "failed"}${summarySuffix(event.summary)}`;
-    case "status":
+      return toolLifecycleLine(event, "started", { includeId: false });
     case "tool_update":
+      return event.category === "subagent" ? toolLifecycleLine(event, "updated", { includeId: false }) : undefined;
+    case "tool_end":
+      return toolLifecycleLine(event, toolEndAction(event), { includeId: false });
+    case "todo_update":
+      return todoProgressLine(event, false);
+    case "status":
+    case "diagnostic":
     case "permission_request":
     case "question_request":
     case "text_delta":
@@ -232,11 +236,15 @@ function verboseProgressLine(event: RuntimeEvent): string | undefined {
     case "status":
       return `Status: ${event.status}`;
     case "tool_start":
-      return `Tool ${toolLabel(event)} started${summarySuffix(event.summary)}`;
+      return toolLifecycleLine(event, "started", { includeId: true });
     case "tool_update":
-      return `Tool ${toolLabel(event)} updated${summarySuffix(event.summary)}`;
+      return toolLifecycleLine(event, "updated", { includeId: true });
     case "tool_end":
-      return `Tool ${toolLabel(event)} ${event.ok ? "completed" : "failed"}${summarySuffix(event.summary)}`;
+      return toolLifecycleLine(event, toolEndAction(event), { includeId: true });
+    case "todo_update":
+      return todoProgressLine(event, true);
+    case "diagnostic":
+      return `${event.label}${summarySuffix(event.summary)}`;
     case "permission_request":
       return `Permission requested (${event.id}): ${event.summary}`;
     case "question_request":
@@ -256,4 +264,61 @@ function summarySuffix(summary: string | undefined): string {
 
 function toolLabel(event: { id: string; name: string }): string {
   return `${event.name} (${event.id})`;
+}
+
+function toolLifecycleLine(
+  event: Extract<RuntimeEvent, { type: "tool_start" | "tool_update" | "tool_end" }>,
+  action: string,
+  options: { includeId: boolean },
+): string {
+  return `${toolEventLabel(event, options)} ${action}${summarySuffix(event.summary)}`;
+}
+
+function toolEventLabel(event: { id: string; name: string; category?: "tool" | "skill" | "subagent" }, options: { includeId: boolean }): string {
+  const name = options.includeId ? toolLabel(event) : event.name;
+
+  if (event.category === "skill") return `Skill ${name}`;
+  if (event.category === "subagent") return `Subagent ${name}`;
+  return `Tool ${name}`;
+}
+
+function toolEndAction(event: Extract<RuntimeEvent, { type: "tool_end" }>): string {
+  if (!event.ok) return "failed";
+  if (event.category === "skill") return "loaded";
+  return "completed";
+}
+
+function todoProgressLine(event: Extract<RuntimeEvent, { type: "todo_update" }>, verbose: boolean): string {
+  const title = event.source === "subagent" ? "Subagent todos" : "Todos";
+  if (event.todos.length === 0) return `${title}: none`;
+
+  const limit = verbose ? event.todos.length : 5;
+  const visible = event.todos.slice(0, limit).map((todo) => todoLine(todo));
+  const hidden = event.todos.length - visible.length;
+
+  return [
+    `${title}:`,
+    ...visible,
+    hidden > 0 ? `... ${hidden} more` : undefined,
+  ].filter((line): line is string => Boolean(line)).join("\n");
+}
+
+function todoLine(todo: { content: string; status: string; priority?: string }): string {
+  const priority = todo.priority ? ` (${todo.priority})` : "";
+  return `${todoStatusMarker(todo.status)} ${todo.content}${priority}`;
+}
+
+function todoStatusMarker(status: string): string {
+  switch (status) {
+    case "completed":
+      return "[x]";
+    case "in_progress":
+      return "[~]";
+    case "cancelled":
+      return "[-]";
+    case "pending":
+      return "[ ]";
+    default:
+      return "[?]";
+  }
 }

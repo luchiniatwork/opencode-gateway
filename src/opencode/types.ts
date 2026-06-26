@@ -59,6 +59,14 @@ export interface TokenUsage {
   total?: number;
 }
 
+export type RuntimeToolCategory = "tool" | "skill" | "subagent";
+
+export interface RuntimeTodo {
+  content: string;
+  status: string;
+  priority?: string;
+}
+
 export interface RuntimeTurn {
   id?: RuntimeTurnId;
   sessionId: RuntimeSessionId;
@@ -148,9 +156,11 @@ export interface PermissionResponseInput {
 export type RuntimeEvent =
   | { type: "status"; status: "queued" | "running" | "idle" | "aborted" | "error" }
   | { type: "text_delta"; text: string }
-  | { type: "tool_start"; id: string; name: string; summary?: string }
-  | { type: "tool_update"; id: string; name: string; summary?: string }
-  | { type: "tool_end"; id: string; name: string; ok: boolean; summary?: string }
+  | { type: "tool_start"; id: string; name: string; summary?: string; category?: RuntimeToolCategory }
+  | { type: "tool_update"; id: string; name: string; summary?: string; category?: RuntimeToolCategory }
+  | { type: "tool_end"; id: string; name: string; ok: boolean; summary?: string; category?: RuntimeToolCategory }
+  | { type: "todo_update"; todos: RuntimeTodo[]; source?: "session" | "subagent" }
+  | { type: "diagnostic"; label: string; summary?: string }
   | { type: "permission_request"; id: RuntimePermissionId; summary: string; details?: unknown }
   | { type: "question_request"; id: string; prompt: string; choices?: string[] }
   | { type: "final"; text: string; costUsd?: number; tokens?: TokenUsage }

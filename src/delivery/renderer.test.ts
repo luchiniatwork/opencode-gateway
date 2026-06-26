@@ -91,6 +91,7 @@ test("progress renderer only shows tool lifecycle events in tools verbosity", as
 
   await renderer.handle({ type: "status", status: "running" });
   await renderer.handle({ type: "tool_update", id: "tool-1", name: "bash", summary: "Still running" });
+  await renderer.handle({ type: "diagnostic", label: "Retry", summary: "attempt 1" });
   await renderer.handle({ type: "permission_request", id: "permission-1", summary: "Run bash" });
   await renderer.handle({ type: "question_request", id: "question-1", prompt: "Which branch?" });
   await renderer.handle({ type: "text_delta", text: "streamed text" });
@@ -109,6 +110,51 @@ test("progress renderer only shows tool lifecycle events in tools verbosity", as
     "Tool bash started: Run tests",
     "Tool bash completed: Passed",
   ]);
+});
+
+test("progress renderer includes subagent updates in tools verbosity", async () => {
+  const harness = createHarness();
+  const renderer = createProgressRenderer({ verbosity: "tools", delayMs: 1, ...harness.delivery });
+
+  await renderer.handle({ type: "tool_start", id: "task-1", name: "general", category: "subagent", summary: "Inspect bug" });
+  await waitFor(() => harness.sent.length === 1);
+  await renderer.handle({ type: "tool_update", id: "grep-1", name: "grep", category: "subagent", summary: "Searching files" });
+  await renderer.handle({ type: "tool_end", id: "task-1", name: "general", category: "subagent", ok: true, summary: "Inspect bug" });
+  await renderer.finalize();
+
+  expect(harness.sent.map((entry) => entry.message.text)).toEqual([
+    "Subagent general started: Inspect bug",
+    "Subagent grep updated: Searching files",
+    "Subagent general completed: Inspect bug",
+  ]);
+});
+
+test("progress renderer includes skill and todo progress in tools verbosity", async () => {
+  const harness = createHarness({ edit: true });
+  const renderer = createProgressRenderer({ verbosity: "tools", delayMs: 1, ...harness.delivery });
+
+  await renderer.handle({ type: "tool_start", id: "skill-1", name: "customize-opencode", category: "skill" });
+  await waitFor(() => harness.sent.length === 1);
+  await renderer.handle({
+    type: "todo_update",
+    source: "session",
+    todos: [
+      { content: "Implement runtime events", status: "in_progress", priority: "high" },
+      { content: "Add tests", status: "pending", priority: "medium" },
+      { content: "Research", status: "completed", priority: "low" },
+    ],
+  });
+  await renderer.handle({ type: "tool_end", id: "skill-1", name: "customize-opencode", category: "skill", ok: true });
+  await renderer.finalize();
+
+  expect(harness.edited.at(-1)?.message.text).toBe([
+    "Skill customize-opencode started",
+    "Todos:",
+    "[~] Implement runtime events (high)",
+    "[ ] Add tests (medium)",
+    "[x] Research (low)",
+    "Skill customize-opencode loaded",
+  ].join("\n"));
 });
 
 test("progress renderer includes verbose status and tool updates", async () => {
@@ -133,6 +179,8 @@ test("progress renderer shows verbose diagnostic events and suppresses deltas", 
   await waitFor(() => harness.sent.length === 1);
   await renderer.handle({ type: "tool_start", id: "tool-1", name: "bash", summary: "Run tests" });
   await renderer.handle({ type: "tool_update", id: "tool-1", name: "bash", summary: "Still running" });
+  await renderer.handle({ type: "todo_update", source: "subagent", todos: [{ content: "Inspect files", status: "in_progress", priority: "high" }] });
+  await renderer.handle({ type: "diagnostic", label: "Retry", summary: "attempt 1" });
   await renderer.handle({ type: "permission_request", id: "permission-1", summary: "Run bash" });
   await renderer.handle({ type: "question_request", id: "question-1", prompt: "Which branch?" });
   await renderer.handle({ type: "text_delta", text: "streamed text" });
@@ -145,6 +193,9 @@ test("progress renderer shows verbose diagnostic events and suppresses deltas", 
     "Status: running",
     "Tool bash (tool-1) started: Run tests",
     "Tool bash (tool-1) updated: Still running",
+    "Subagent todos:",
+    "[~] Inspect files (high)",
+    "Retry: attempt 1",
     "Permission requested (permission-1): Run bash",
     "Question requested (question-1): Which branch?",
     "Tool bash (tool-1) completed: Passed",
