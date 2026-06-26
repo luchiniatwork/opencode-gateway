@@ -70,6 +70,8 @@ test("help lists agent and model commands", async () => {
     expect(text).toContain("`/agents`");
     expect(text).toContain("`/model [id|default|clear]`");
     expect(text).toContain("`/models`");
+    expect(text).toContain("`/bind <target-id>`");
+    expect(text).toContain("`/unbind`");
   } finally {
     harness.database.close();
   }
@@ -132,6 +134,8 @@ test("status reports context without creating a binding", async () => {
     expect(text).toContain("Role: owner");
     expect(text).toContain("Profile: CTO (cto)");
     expect(text).toContain("Target: Default workspace (default) (healthy)");
+    expect(text).toContain("Target source: profile default");
+    expect(text).toContain("Profile default target: Default workspace (default)");
     expect(text).toContain("Session: none");
     expect(text).toContain("Agent: cto-agent (profile default)");
     expect(text).toContain("Model: provider/cto-model (profile default)");
@@ -497,6 +501,8 @@ test("profile command shows current profile", async () => {
 
     expect(text).toContain("Current profile: CTO (cto)");
     expect(text).toContain("Target: Default workspace (default)");
+    expect(text).toContain("Target source: profile default");
+    expect(text).toContain("Profile default target: Default workspace (default)");
     expect(text).toContain("Session: none");
     expect(text).toContain("Verbosity: compact (profile default)");
   } finally {
@@ -521,6 +527,85 @@ test("profile switch preserves session on same target and creates one on new tar
     expect(responseText(newTarget)).toContain("Previous session: session-1");
     expect(responseText(newTarget)).toContain("Current session: session-2");
     expect(harness.repositories.bindings.getByConversationKey(conversationKey)?.targetId).toBe("ops-target");
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("bind command explicitly binds the conversation to a target", async () => {
+  const harness = await createHarness();
+
+  try {
+    const result = await harness.router.handle(inboundMessage({ text: "/bind ops-target" }));
+    const text = responseText(result);
+
+    expect(text).toContain("Bound conversation to Ops workspace (ops-target).");
+    expect(text).toContain("Current session: session-1");
+    expect(text).toContain("Target source: explicit bind");
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toMatchObject({
+      targetId: "ops-target",
+      targetSource: "explicit_bind",
+    });
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("bind command requires owner or admin access", async () => {
+  const harness = await createHarness({
+    accessRules: [{ channel: "telegram", accountId: "default", senderId: "123", role: "user" }],
+  });
+
+  try {
+    const result = await harness.router.handle(inboundMessage({ text: "/bind ops-target" }));
+
+    expect(responseText(result)).toBe("Target binding changes require owner/admin access.");
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("profile switch preserves an explicit bind from the bind command", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.router.handle(inboundMessage({ text: "/bind ops-target" }));
+
+    const result = await harness.router.handle(inboundMessage({ text: "/profile review" }));
+    const text = responseText(result);
+
+    expect(text).toContain("Switched profile to Review (review).");
+    expect(text).toContain("Target: Ops workspace (ops-target)");
+    expect(text).toContain("Target source: explicit bind");
+    expect(text).toContain("Current session: session-1");
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toMatchObject({
+      profileId: "review",
+      targetId: "ops-target",
+      targetSource: "explicit_bind",
+    });
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("unbind command clears explicit target binding", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.router.handle(inboundMessage({ text: "/bind ops-target" }));
+
+    const result = await harness.router.handle(inboundMessage({ text: "/unbind" }));
+    const text = responseText(result);
+
+    expect(text).toContain("Cleared explicit target bind.");
+    expect(text).toContain("Target now follows profile CTO (cto): Default workspace (default).");
+    expect(text).toContain("Previous target: Ops workspace (ops-target)");
+    expect(text).toContain("Current session: session-2");
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toMatchObject({
+      targetId: "default",
+      targetSource: "profile_default",
+    });
   } finally {
     harness.database.close();
   }

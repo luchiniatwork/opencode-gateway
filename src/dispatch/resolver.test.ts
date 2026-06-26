@@ -72,6 +72,7 @@ test("first message creates a durable binding and later messages reuse it", asyn
     if (first.status !== "resolved" || second.status !== "resolved") throw new Error("expected resolved");
 
     expect(first.resolution.binding.opencodeSessionId).toBe("session-1");
+    expect(first.resolution.binding.targetSource).toBe("profile_default");
     expect(second.resolution.binding.opencodeSessionId).toBe("session-1");
     expect(harness.runtime.calls.ensureSession).toHaveLength(1);
     expect(harness.runtime.calls.ensureSession[0]).not.toHaveProperty("title");
@@ -202,6 +203,7 @@ test("reset creates a fresh session and updates the binding", async () => {
     expect(result.previousSessionId).toBe("session-1");
     expect(result.session.id).toBe("session-2");
     expect(result.resolution.binding.opencodeSessionId).toBe("session-2");
+    expect(result.resolution.binding.targetSource).toBe("profile_default");
     expect(harness.repositories.bindings.getByConversationKey(conversationKey)?.opencodeSessionId).toBe(
       "session-2",
     );
@@ -265,6 +267,7 @@ test("switchProfile keeps the current session when the target is unchanged", asy
     expect(result.session.id).toBe("session-1");
     expect(result.resolution.binding.profileId).toBe("review");
     expect(result.resolution.binding.targetId).toBe("default");
+    expect(result.resolution.binding.targetSource).toBe("profile_default");
     expect(result.resolution.binding.opencodeSessionId).toBe("session-1");
     expect(harness.runtime.calls.ensureSession).toHaveLength(1);
   } finally {
@@ -288,6 +291,7 @@ test("switchProfile creates a fresh session when the selected profile uses anoth
     expect(result.session.targetId).toBe("ops-target");
     expect(result.resolution.binding.profileId).toBe("ops");
     expect(result.resolution.binding.targetId).toBe("ops-target");
+    expect(result.resolution.binding.targetSource).toBe("profile_default");
   } finally {
     harness.database.close();
   }
@@ -342,6 +346,159 @@ test("switchProfile preserves binding overrides available on the new target", as
     expect(result.resolution.binding.model).toBe("provider/shared-model");
     expect(result.resolution.agent).toBe("shared-agent");
     expect(result.resolution.model).toBe("provider/shared-model");
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("bindTarget creates a session on the selected target and sets an explicit bind", async () => {
+  const harness = await createHarness();
+
+  try {
+    const result = await harness.resolver.bindTarget(inboundMessage(), "ops-target");
+
+    expect(result.status).toBe("rebound");
+    if (result.status !== "rebound") throw new Error("expected rebound");
+
+    expect(result.session.id).toBe("session-1");
+    expect(result.session.targetId).toBe("ops-target");
+    expect(result.resolution.binding.targetId).toBe("ops-target");
+    expect(result.resolution.binding.targetSource).toBe("explicit_bind");
+    expect(result.resolution.target.id).toBe("ops-target");
+    expect(harness.runtime.calls.ensureSession).toEqual([
+      expect.objectContaining({ target: expect.objectContaining({ id: "ops-target" }) }),
+    ]);
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("bindTarget no-ops when the conversation is already explicitly bound to the target", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.resolver.bindTarget(inboundMessage(), "ops-target");
+
+    const result = await harness.resolver.bindTarget(inboundMessage(), "ops-target");
+
+    expect(result.status).toBe("noop");
+    expect(result.status === "noop" ? result.reason : undefined).toBe("already_bound");
+    expect(harness.runtime.calls.ensureSession).toHaveLength(1);
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("bindTarget clears binding overrides unavailable on the selected target", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.resolver.ensureBindingForMessage(inboundMessage());
+    harness.repositories.bindings.updateAgent({ conversationKey, agent: "default-only-agent" });
+    harness.repositories.bindings.updateModel({ conversationKey, model: "provider/default-only-model" });
+
+    const result = await harness.resolver.bindTarget(inboundMessage(), "ops-target");
+
+    expect(result.status).toBe("rebound");
+    if (result.status !== "rebound") throw new Error("expected rebound");
+
+    expect(result.clearedOverrides).toEqual([
+      { kind: "agent", value: "default-only-agent", targetId: "ops-target" },
+      { kind: "model", value: "provider/default-only-model", targetId: "ops-target" },
+    ]);
+    expect(result.resolution.binding.agent).toBeUndefined();
+    expect(result.resolution.binding.model).toBeUndefined();
+    expect(result.resolution.binding.targetSource).toBe("explicit_bind");
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("switchProfile preserves an explicit target binding", async () => {
+  const harness = await createHarness();
+
+  try {
+    const bound = await harness.resolver.bindTarget(inboundMessage(), "ops-target");
+    if (bound.status !== "rebound") throw new Error("expected rebound");
+
+    const result = await harness.resolver.switchProfile(inboundMessage(), "review");
+
+    expect(result.status).toBe("rebound");
+    if (result.status !== "rebound") throw new Error("expected rebound");
+
+    expect(result.previousSessionId).toBe("session-1");
+    expect(result.session.id).toBe("session-1");
+    expect(result.resolution.binding.profileId).toBe("review");
+    expect(result.resolution.binding.targetId).toBe("ops-target");
+    expect(result.resolution.binding.targetSource).toBe("explicit_bind");
+    expect(result.resolution.target.id).toBe("ops-target");
+    expect(harness.runtime.calls.ensureSession).toHaveLength(1);
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("unbindTarget clears explicit bind and returns to the active profile default target", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.resolver.bindTarget(inboundMessage(), "ops-target");
+
+    const result = await harness.resolver.unbindTarget(inboundMessage());
+
+    expect(result.status).toBe("rebound");
+    if (result.status !== "rebound") throw new Error("expected rebound");
+
+    expect(result.previousSessionId).toBe("session-1");
+    expect(result.previousTargetId).toBe("ops-target");
+    expect(result.session.id).toBe("session-2");
+    expect(result.session.targetId).toBe("default");
+    expect(result.resolution.binding.targetId).toBe("default");
+    expect(result.resolution.binding.targetSource).toBe("profile_default");
+    expect(result.resolution.target.id).toBe("default");
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("unbindTarget refuses while an active run exists", async () => {
+  const harness = await createHarness();
+
+  try {
+    const bound = await harness.resolver.bindTarget(inboundMessage(), "ops-target");
+    if (bound.status !== "rebound") throw new Error("expected rebound");
+    const run = harness.repositories.runs.create({
+      bindingId: bound.resolution.binding.id,
+      targetId: bound.resolution.target.id,
+      opencodeSessionId: bound.resolution.binding.opencodeSessionId,
+    });
+
+    const result = await harness.resolver.unbindTarget(inboundMessage());
+
+    expect(result.status).toBe("blocked");
+    expect(result.status === "blocked" ? result.run.id : undefined).toBe(run.id);
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)?.targetSource).toBe("explicit_bind");
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("useSession validates against the explicit target when bound", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.resolver.bindTarget(inboundMessage(), "ops-target");
+
+    const result = await harness.resolver.useSession(inboundMessage(), "session-existing");
+
+    expect(result.status).toBe("rebound");
+    if (result.status !== "rebound") throw new Error("expected rebound");
+
+    expect(harness.runtime.calls.ensureSession.at(-1)).toEqual(expect.objectContaining({
+      sessionId: "session-existing",
+      target: expect.objectContaining({ id: "ops-target" }),
+    }));
+    expect(result.resolution.binding.targetSource).toBe("explicit_bind");
   } finally {
     harness.database.close();
   }

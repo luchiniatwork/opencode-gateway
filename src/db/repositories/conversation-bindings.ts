@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 
 import type { BusyMode, Verbosity } from "../../config/schema.ts";
-import type { ConversationBindingRecord } from "../types.ts";
+import type { ConversationBindingRecord, TargetBindingSource } from "../types.ts";
 
 interface ConversationBindingRow {
   id: string;
@@ -11,6 +11,7 @@ interface ConversationBindingRow {
   account_id: string;
   profile_id: string;
   target_id: string;
+  target_source: TargetBindingSource;
   opencode_session_id: string;
   session_name: string | null;
   agent: string | null;
@@ -27,6 +28,7 @@ export interface UpsertConversationBindingInput {
   accountId: string;
   profileId: string;
   targetId: string;
+  targetSource?: TargetBindingSource;
   opencodeSessionId: string;
   sessionName?: string;
   agent?: string;
@@ -38,6 +40,7 @@ export interface UpsertConversationBindingInput {
 export interface UpdateBindingSessionInput {
   conversationKey: string;
   targetId: string;
+  targetSource?: TargetBindingSource;
   opencodeSessionId: string;
   sessionName?: string;
 }
@@ -46,12 +49,32 @@ export interface UpdateBindingProfileInput {
   conversationKey: string;
   profileId: string;
   targetId: string;
+  targetSource?: TargetBindingSource;
   opencodeSessionId: string;
   sessionName?: string;
   agent?: string | null;
   model?: string | null;
   busyMode: BusyMode;
   verbosity: Verbosity;
+}
+
+export interface UpdateBindingTargetInput {
+  conversationKey: string;
+  targetId: string;
+  opencodeSessionId: string;
+  sessionName?: string;
+  targetSource: TargetBindingSource;
+  agent?: string | null;
+  model?: string | null;
+}
+
+export interface ClearExplicitTargetInput {
+  conversationKey: string;
+  targetId: string;
+  opencodeSessionId: string;
+  sessionName?: string;
+  agent?: string | null;
+  model?: string | null;
 }
 
 export interface UpdateBindingAgentInput {
@@ -70,8 +93,11 @@ export interface ConversationBindingRepository {
   upsert(input: UpsertConversationBindingInput): ConversationBindingRecord;
   updateSession(input: UpdateBindingSessionInput): ConversationBindingRecord | undefined;
   updateProfile(input: UpdateBindingProfileInput): ConversationBindingRecord | undefined;
+  updateTarget(input: UpdateBindingTargetInput): ConversationBindingRecord | undefined;
+  clearExplicitTarget(input: ClearExplicitTargetInput): ConversationBindingRecord | undefined;
   updateAgent(input: UpdateBindingAgentInput): ConversationBindingRecord | undefined;
   updateModel(input: UpdateBindingModelInput): ConversationBindingRecord | undefined;
+  listByTargetId(targetId: string): ConversationBindingRecord[];
 }
 
 export function createConversationBindingRepository(
@@ -101,14 +127,15 @@ export function createConversationBindingRepository(
       const row = db
         .query(
           `INSERT INTO conversation_bindings (
-            id, conversation_key, channel, account_id, profile_id, target_id, opencode_session_id,
+            id, conversation_key, channel, account_id, profile_id, target_id, target_source, opencode_session_id,
             session_name, agent, model, busy_mode, verbosity, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(conversation_key) DO UPDATE SET
             channel = excluded.channel,
             account_id = excluded.account_id,
             profile_id = excluded.profile_id,
             target_id = excluded.target_id,
+            target_source = excluded.target_source,
             opencode_session_id = excluded.opencode_session_id,
             session_name = excluded.session_name,
             agent = excluded.agent,
@@ -125,6 +152,7 @@ export function createConversationBindingRepository(
           input.accountId,
           input.profileId,
           input.targetId,
+          input.targetSource ?? "profile_default",
           input.opencodeSessionId,
           input.sessionName ?? null,
           input.agent ?? null,
@@ -143,6 +171,7 @@ export function createConversationBindingRepository(
         .query(
           `UPDATE conversation_bindings SET
             target_id = ?,
+            target_source = CASE WHEN ? THEN ? ELSE target_source END,
             opencode_session_id = ?,
             session_name = ?,
             updated_at = ?
@@ -151,6 +180,8 @@ export function createConversationBindingRepository(
         )
         .get(
           input.targetId,
+          input.targetSource === undefined ? 0 : 1,
+          input.targetSource ?? null,
           input.opencodeSessionId,
           input.sessionName ?? null,
           now().toISOString(),
@@ -166,6 +197,7 @@ export function createConversationBindingRepository(
           `UPDATE conversation_bindings SET
             profile_id = ?,
             target_id = ?,
+            target_source = CASE WHEN ? THEN ? ELSE target_source END,
             opencode_session_id = ?,
             session_name = ?,
             agent = CASE WHEN ? THEN ? ELSE agent END,
@@ -179,6 +211,8 @@ export function createConversationBindingRepository(
         .get(
           input.profileId,
           input.targetId,
+          input.targetSource === undefined ? 0 : 1,
+          input.targetSource ?? null,
           input.opencodeSessionId,
           input.sessionName ?? null,
           input.agent === undefined ? 0 : 1,
@@ -192,6 +226,40 @@ export function createConversationBindingRepository(
         ) as ConversationBindingRow | null;
 
       return row ? mapConversationBindingRow(row) : undefined;
+    },
+
+    updateTarget(input): ConversationBindingRecord | undefined {
+      const row = db
+        .query(
+          `UPDATE conversation_bindings SET
+            target_id = ?,
+            target_source = ?,
+            opencode_session_id = ?,
+            session_name = ?,
+            agent = CASE WHEN ? THEN ? ELSE agent END,
+            model = CASE WHEN ? THEN ? ELSE model END,
+            updated_at = ?
+          WHERE conversation_key = ?
+          RETURNING *`,
+        )
+        .get(
+          input.targetId,
+          input.targetSource,
+          input.opencodeSessionId,
+          input.sessionName ?? null,
+          input.agent === undefined ? 0 : 1,
+          input.agent ?? null,
+          input.model === undefined ? 0 : 1,
+          input.model ?? null,
+          now().toISOString(),
+          input.conversationKey,
+        ) as ConversationBindingRow | null;
+
+      return row ? mapConversationBindingRow(row) : undefined;
+    },
+
+    clearExplicitTarget(input): ConversationBindingRecord | undefined {
+      return this.updateTarget({ ...input, targetSource: "profile_default" });
     },
 
     updateAgent(input): ConversationBindingRecord | undefined {
@@ -221,6 +289,14 @@ export function createConversationBindingRepository(
 
       return row ? mapConversationBindingRow(row) : undefined;
     },
+
+    listByTargetId(targetId): ConversationBindingRecord[] {
+      const rows = db
+        .query("SELECT * FROM conversation_bindings WHERE target_id = ? ORDER BY updated_at DESC, id")
+        .all(targetId) as ConversationBindingRow[];
+
+      return rows.map(mapConversationBindingRow);
+    },
   };
 }
 
@@ -232,6 +308,7 @@ function mapConversationBindingRow(row: ConversationBindingRow): ConversationBin
     accountId: row.account_id,
     profileId: row.profile_id,
     targetId: row.target_id,
+    targetSource: row.target_source,
     opencodeSessionId: row.opencode_session_id,
     sessionName: nullableToUndefined(row.session_name),
     agent: nullableToUndefined(row.agent),

@@ -1,6 +1,6 @@
 import type { InboundMessage } from "../channels/types.ts";
 import type { AccessRole, GatewayConfig } from "../config/schema.ts";
-import type { DispatchResolver, DispatchResolverRepositories } from "../dispatch/resolver.ts";
+import type { BindingOperationResult, DispatchResolver, DispatchResolverRepositories } from "../dispatch/resolver.ts";
 import type { PendingPermissionRepository } from "../db/repositories/pending-permissions.ts";
 import type { ConversationBindingRecord, ProfileRecord, RunRecord, TargetRecord } from "../db/types.ts";
 import type { ActiveTurnDiagnostics, TurnRunner } from "../gateway/turn-runner.ts";
@@ -83,6 +83,10 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
         return profilesText(message);
       case "profile":
         return command.args.length === 0 ? currentProfileText(message) : switchProfileText(message, command.args[0]);
+      case "bind":
+        return bindTargetText(message, command.args[0]);
+      case "unbind":
+        return unbindTargetText(message);
       case "agents":
         return agentsText(message);
       case "agent":
@@ -118,6 +122,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       "`/use-session <id>` - Rebind this conversation to an existing session.",
       "`/profiles` - List available gateway profiles.",
       "`/profile [id]` - Show or switch the active profile.",
+      "`/bind <target-id>` - Explicitly bind this conversation to a target.",
+      "`/unbind` - Return target routing to the active profile default.",
       "`/agents` - List available OpenCode agents for the active target.",
       "`/agent [name|default|clear]` - Show, set, or clear the per-binding agent override.",
       "`/models` - List available OpenCode models for the active target.",
@@ -132,7 +138,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
 
     const binding = repositories.bindings.getByConversationKey(message.conversation.key);
     const profile = binding ? repositories.profiles.getById(binding.profileId) : getDefaultProfile();
-    const target = binding ? repositories.targets.getById(binding.targetId) : getTarget(profile?.defaultTargetId);
+    const target = getEffectiveTarget(binding, profile);
+    const profileDefaultTarget = getTarget(profile?.defaultTargetId);
     const activeRun = binding ? repositories.runs.getActiveByBindingId(binding.id) : undefined;
     const activeDiagnostics = binding ? turnRunner.getActiveDiagnostics(binding.id) : undefined;
     const queueDiagnostics = binding ? turnRunner.getQueueDiagnostics(binding.id) : undefined;
@@ -147,6 +154,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       `Role: ${decision.role}`,
       `Profile: ${formatProfile(profile)}`,
       `Target: ${formatTarget(target)} (${targetHealth})`,
+      `Target source: ${formatTargetSource(binding)}`,
+      `Profile default target: ${formatTarget(profileDefaultTarget)}`,
       `Session: ${binding?.opencodeSessionId ?? "none"}${binding?.sessionName ? ` (${binding.sessionName})` : ""}`,
       `Agent: ${formatEffectiveValue(resolveEffectiveAgentValue(binding, profile, target))}`,
       `Model: ${formatEffectiveValue(resolveEffectiveModelValue(binding, profile, target))}`,
@@ -167,6 +176,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
 
     if (result.status === "denied") return deniedDecisionText(result.decision.reason);
     if (result.status === "not_found") return `${titleCase(result.resource)} not found: ${result.id}`;
+    if (result.status === "noop") return bindingNoopText(result);
+    if (result.status === "blocked") return bindingBlockedText(result);
     if (result.status === "error") return `Unable to create a new session: ${result.error}`;
 
     return [
@@ -176,6 +187,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       `Current session: ${result.session.id}`,
       `Profile: ${result.resolution.profile.displayName} (${result.resolution.profile.id})`,
       `Target: ${result.resolution.target.name} (${result.resolution.target.id})`,
+      `Target source: ${formatTargetSource(result.resolution.binding)}`,
     ]
       .filter(Boolean)
       .join("\n");
@@ -270,6 +282,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
 
     if (result.status === "denied") return deniedDecisionText(result.decision.reason);
     if (result.status === "not_found") return `${titleCase(result.resource)} not found: ${result.id}`;
+    if (result.status === "noop") return bindingNoopText(result);
+    if (result.status === "blocked") return bindingBlockedText(result);
     if (result.status === "error") return `Unable to use session ${sessionId}: ${result.error}`;
 
     return [
@@ -277,6 +291,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       result.previousSessionId ? `Previous session: ${result.previousSessionId}` : undefined,
       `Profile: ${result.resolution.profile.displayName} (${result.resolution.profile.id})`,
       `Target: ${result.resolution.target.name} (${result.resolution.target.id})`,
+      `Target source: ${formatTargetSource(result.resolution.binding)}`,
     ]
       .filter(Boolean)
       .join("\n");
@@ -306,6 +321,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       `Current profile: ${context.profile.displayName} (${context.profile.id})`,
       context.profile.description ? `Description: ${context.profile.description}` : undefined,
       `Target: ${formatTarget(context.target)}`,
+      `Target source: ${formatTargetSource(context.binding)}`,
+      `Profile default target: ${formatTarget(getTarget(context.profile.defaultTargetId))}`,
       `Session: ${context.binding?.opencodeSessionId ?? "none"}`,
       `Verbosity: ${formatEffectiveVerbosity(context.binding, context.profile, config.defaults.verbosity)}`,
     ]
@@ -320,6 +337,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
 
     if (result.status === "denied") return deniedDecisionText(result.decision.reason);
     if (result.status === "not_found") return `${titleCase(result.resource)} not found: ${result.id}`;
+    if (result.status === "noop") return bindingNoopText(result);
+    if (result.status === "blocked") return bindingBlockedText(result);
     if (result.status === "error") return `Unable to switch profile: ${result.error}`;
 
     return [
@@ -329,7 +348,79 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
         : undefined,
       `Current session: ${result.session.id}`,
       `Target: ${result.resolution.target.name} (${result.resolution.target.id})`,
+      `Target source: ${formatTargetSource(result.resolution.binding)}`,
       `Verbosity: ${result.resolution.binding.verbosity}`,
+      ...formatClearedOverrideLines(
+        result.clearedOverrides,
+        result.resolution.binding,
+        result.resolution.profile,
+        result.resolution.target,
+      ),
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  async function bindTargetText(message: InboundMessage, targetId: string | undefined): Promise<string> {
+    if (!targetId) return "Usage: `/bind <target-id>`";
+
+    const decision = resolver.authorizeSender(message);
+    if (!decision.allowed) return deniedDecisionText(decision.reason);
+    if (!isAdminRole(decision.role)) return "Target binding changes require owner/admin access.";
+
+    const result = await resolver.bindTarget(message, targetId);
+
+    if (result.status === "denied") return deniedDecisionText(result.decision.reason);
+    if (result.status === "not_found") return `${titleCase(result.resource)} not found: ${result.id}`;
+    if (result.status === "noop") return bindingNoopText(result);
+    if (result.status === "blocked") return bindingBlockedText(result);
+    if (result.status === "error") return `Unable to bind target ${targetId}: ${result.error}`;
+
+    const activeRun = repositories.runs.getActiveByBindingId(result.resolution.binding.id);
+    const activeTargetId = activeRun?.targetId;
+
+    return [
+      `Bound conversation to ${result.resolution.target.name} (${result.resolution.target.id}).`,
+      result.previousTargetId && result.previousTargetId !== result.resolution.target.id
+        ? `Previous target: ${formatTarget(getTarget(result.previousTargetId))}`
+        : undefined,
+      `Current session: ${result.session.id}`,
+      `Profile: ${result.resolution.profile.displayName} (${result.resolution.profile.id})`,
+      `Target source: ${formatTargetSource(result.resolution.binding)}`,
+      activeRun && activeTargetId && activeTargetId !== result.resolution.target.id
+        ? `Active run ${activeRun.id} continues on previous target ${activeTargetId}. Future turns use ${result.resolution.target.id}.`
+        : undefined,
+      ...formatClearedOverrideLines(
+        result.clearedOverrides,
+        result.resolution.binding,
+        result.resolution.profile,
+        result.resolution.target,
+      ),
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  async function unbindTargetText(message: InboundMessage): Promise<string> {
+    const decision = resolver.authorizeSender(message);
+    if (!decision.allowed) return deniedDecisionText(decision.reason);
+    if (!isAdminRole(decision.role)) return "Target binding changes require owner/admin access.";
+
+    const result = await resolver.unbindTarget(message);
+
+    if (result.status === "denied") return deniedDecisionText(result.decision.reason);
+    if (result.status === "not_found") return `${titleCase(result.resource)} not found: ${result.id}`;
+    if (result.status === "noop") return bindingNoopText(result);
+    if (result.status === "blocked") return bindingBlockedText(result);
+    if (result.status === "error") return `Unable to clear target binding: ${result.error}`;
+
+    return [
+      "Cleared explicit target bind.",
+      `Target now follows profile ${result.resolution.profile.displayName} (${result.resolution.profile.id}): ${result.resolution.target.name} (${result.resolution.target.id}).`,
+      result.previousTargetId && result.previousTargetId !== result.resolution.target.id
+        ? `Previous target: ${formatTarget(getTarget(result.previousTargetId))}`
+        : undefined,
+      `Current session: ${result.session.id}`,
       ...formatClearedOverrideLines(
         result.clearedOverrides,
         result.resolution.binding,
@@ -494,7 +585,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
   } {
     const binding = repositories.bindings.getByConversationKey(message.conversation.key);
     const profile = binding ? repositories.profiles.getById(binding.profileId) : getDefaultProfile();
-    const target = binding ? repositories.targets.getById(binding.targetId) : getTarget(profile?.defaultTargetId);
+    const target = getEffectiveTarget(binding, profile);
 
     return { binding, profile, target };
   }
@@ -509,6 +600,16 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
 
   function getTarget(targetId: string | undefined): TargetRecord | undefined {
     return targetId ? repositories.targets.getById(targetId) : undefined;
+  }
+
+  function getEffectiveTarget(
+    binding: ConversationBindingRecord | undefined,
+    profile: ProfileRecord | undefined,
+  ): TargetRecord | undefined {
+    if (!profile) return undefined;
+    const targetId = binding?.targetSource === "explicit_bind" ? binding.targetId : profile.defaultTargetId;
+
+    return getTarget(targetId);
   }
 }
 
@@ -547,6 +648,31 @@ function formatProfile(profile: ProfileRecord | undefined): string {
 function formatTarget(target: TargetRecord | undefined): string {
   if (!target) return "unknown";
   return `${target.name} (${target.id})`;
+}
+
+function formatTargetSource(binding: ConversationBindingRecord | undefined): string {
+  if (binding?.targetSource === "explicit_bind") return "explicit bind";
+  return "profile default";
+}
+
+function bindingNoopText(result: Extract<BindingOperationResult, { status: "noop" }>): string {
+  if (result.reason === "already_bound") {
+    return `Conversation is already explicitly bound to ${formatTarget(result.resolution?.target)}.`;
+  }
+
+  if (result.reason === "already_profile_default") {
+    return `Target already follows the active profile default: ${formatTarget(result.resolution?.target)}.`;
+  }
+
+  return "No conversation binding exists to unbind.";
+}
+
+function bindingBlockedText(result: Extract<BindingOperationResult, { status: "blocked" }>): string {
+  if (result.reason === "active_run") {
+    return `Cannot change target binding while active run ${result.run.id} is running. Use /stop first.`;
+  }
+
+  return "Cannot change target binding right now.";
 }
 
 function formatRun(run: RunRecord | undefined, diagnostics?: ActiveTurnDiagnostics): string {

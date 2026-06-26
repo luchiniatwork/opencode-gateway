@@ -44,8 +44,16 @@ export type BindingOperationResult =
       resolution: ResolvedDispatch;
       session: RuntimeSession;
       previousSessionId?: RuntimeSessionId;
+      previousTargetId?: string;
       clearedOverrides?: ClearedBindingOverride[];
     }
+  | {
+      status: "noop";
+      reason: "already_bound" | "already_profile_default" | "no_binding";
+      resolution?: ResolvedDispatch;
+      session?: RuntimeSession;
+    }
+  | { status: "blocked"; reason: "active_run"; resolution: ResolvedDispatch; run: RunRecord }
   | { status: "denied"; decision: Extract<AccessDecision, { allowed: false }> }
   | { status: "not_found"; resource: "profile" | "target"; id: string }
   | { status: "error"; error: string };
@@ -77,6 +85,8 @@ export interface DispatchResolver {
   resetSession(message: InboundMessage): Promise<BindingOperationResult>;
   useSession(message: InboundMessage, sessionId: RuntimeSessionId): Promise<BindingOperationResult>;
   switchProfile(message: InboundMessage, profileId: string): Promise<BindingOperationResult>;
+  bindTarget(message: InboundMessage, targetId: string): Promise<BindingOperationResult>;
+  unbindTarget(message: InboundMessage): Promise<BindingOperationResult>;
 }
 
 export class DispatchResolverError extends Error {
@@ -163,14 +173,16 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
 
       const existing = repositories.bindings.getByConversationKey(message.conversation.key);
       const profile = existing ? requireProfile(existing.profileId) : requireDefaultProfile();
-      const target = requireTarget(existing?.targetId ?? profile.defaultTargetId);
+      const target = requireTarget(existing ? effectiveTargetId(existing, profile) : profile.defaultTargetId);
       const session = await createRuntimeSession(message, profile, target);
       const previousSessionId = existing?.opencodeSessionId;
+      const previousTargetId = existing?.targetId;
       const binding = existing
         ? requireUpdatedBinding(
             repositories.bindings.updateSession({
               conversationKey: message.conversation.key,
               targetId: target.id,
+              targetSource: existing.targetSource,
               opencodeSessionId: session.id,
               sessionName: session.title,
             }),
@@ -182,6 +194,7 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
             accountId: message.accountId,
             profileId: profile.id,
             targetId: target.id,
+            targetSource: "profile_default",
             opencodeSessionId: session.id,
             sessionName: session.title,
             busyMode: effectiveBusyMode(profile),
@@ -193,6 +206,7 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
         resolution: resolveBinding(binding, access.role),
         session,
         previousSessionId,
+        previousTargetId,
       };
     },
 
@@ -202,7 +216,7 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
 
       const existing = repositories.bindings.getByConversationKey(message.conversation.key);
       const profile = existing ? requireProfile(existing.profileId) : requireDefaultProfile();
-      const target = requireTarget(existing?.targetId ?? profile.defaultTargetId);
+      const target = requireTarget(existing ? effectiveTargetId(existing, profile) : profile.defaultTargetId);
 
       try {
         const session = await runtime.ensureSession({
@@ -214,11 +228,13 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
           metadata: messageMetadata(message),
         });
         const previousSessionId = existing?.opencodeSessionId;
+        const previousTargetId = existing?.targetId;
         const binding = existing
           ? requireUpdatedBinding(
               repositories.bindings.updateSession({
                 conversationKey: message.conversation.key,
                 targetId: target.id,
+                targetSource: existing.targetSource,
                 opencodeSessionId: session.id,
                 sessionName: session.title,
               }),
@@ -230,6 +246,7 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
               accountId: message.accountId,
               profileId: profile.id,
               targetId: target.id,
+              targetSource: "profile_default",
               opencodeSessionId: session.id,
               sessionName: session.title,
               busyMode: effectiveBusyMode(profile),
@@ -241,6 +258,7 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
           resolution: resolveBinding(binding, access.role),
           session,
           previousSessionId,
+          previousTargetId,
         };
       } catch (error) {
         return { status: "error", error: formatError(error) };
@@ -254,11 +272,13 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
       const profile = repositories.profiles.getById(profileId);
       if (!profile) return { status: "not_found", resource: "profile", id: profileId };
 
-      const target = repositories.targets.getById(profile.defaultTargetId);
-      if (!target) return { status: "not_found", resource: "target", id: profile.defaultTargetId };
-
       const existing = repositories.bindings.getByConversationKey(message.conversation.key);
+      const targetSource = existing?.targetSource ?? "profile_default";
+      const targetId = existing?.targetSource === "explicit_bind" ? existing.targetId : profile.defaultTargetId;
+      const target = repositories.targets.getById(targetId);
+      if (!target) return { status: "not_found", resource: "target", id: targetId };
       const shouldCreateSession = !existing || existing.targetId !== target.id;
+      const previousTargetId = existing?.targetId;
 
       let clearedOverrides: ClearedBindingOverride[] = [];
 
@@ -282,6 +302,7 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
               conversationKey: message.conversation.key,
               profileId: profile.id,
               targetId: target.id,
+              targetSource,
               opencodeSessionId: session.id,
               sessionName: session.title,
               agent: shouldClearAgent ? null : undefined,
@@ -297,6 +318,7 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
             accountId: message.accountId,
             profileId: profile.id,
             targetId: target.id,
+            targetSource: "profile_default",
             opencodeSessionId: session.id,
             sessionName: session.title,
             busyMode: effectiveBusyMode(profile),
@@ -308,6 +330,143 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
         resolution: resolveBinding(binding, access.role),
         session,
         previousSessionId,
+        previousTargetId,
+        clearedOverrides: clearedOverrides.length > 0 ? clearedOverrides : undefined,
+      };
+    },
+
+    async bindTarget(message, targetId): Promise<BindingOperationResult> {
+      const access = this.authorizeSender(message);
+      if (!access.allowed) return { status: "denied", decision: access };
+
+      const target = repositories.targets.getById(targetId);
+      if (!target) return { status: "not_found", resource: "target", id: targetId };
+
+      const existing = repositories.bindings.getByConversationKey(message.conversation.key);
+      const profile = existing ? requireProfile(existing.profileId) : requireDefaultProfile();
+
+      if (existing?.targetSource === "explicit_bind" && existing.targetId === target.id) {
+        return {
+          status: "noop",
+          reason: "already_bound",
+          resolution: resolveBinding(existing, access.role),
+          session: { id: existing.opencodeSessionId, targetId: target.id, title: existing.sessionName },
+        };
+      }
+
+      const targetChanged = !existing || existing.targetId !== target.id;
+      let clearedOverrides: ClearedBindingOverride[] = [];
+
+      if (existing && targetChanged) {
+        try {
+          clearedOverrides = await invalidOverridesForTarget(existing, target);
+        } catch (error) {
+          return { status: "error", error: `Unable to validate overrides for target ${target.id}: ${formatError(error)}` };
+        }
+      }
+
+      const session = targetChanged || !existing
+        ? await createRuntimeSession(message, profile, target)
+        : { id: existing.opencodeSessionId, targetId: target.id, title: existing.sessionName };
+      const previousSessionId = existing?.opencodeSessionId;
+      const previousTargetId = existing?.targetId;
+      const shouldClearAgent = clearedOverrides.some((override) => override.kind === "agent");
+      const shouldClearModel = clearedOverrides.some((override) => override.kind === "model");
+      const binding = existing
+        ? requireUpdatedBinding(
+            repositories.bindings.updateTarget({
+              conversationKey: message.conversation.key,
+              targetId: target.id,
+              targetSource: "explicit_bind",
+              opencodeSessionId: session.id,
+              sessionName: session.title,
+              agent: shouldClearAgent ? null : undefined,
+              model: shouldClearModel ? null : undefined,
+            }),
+            message.conversation.key,
+          )
+        : repositories.bindings.upsert({
+            conversationKey: message.conversation.key,
+            channel: message.channel,
+            accountId: message.accountId,
+            profileId: profile.id,
+            targetId: target.id,
+            targetSource: "explicit_bind",
+            opencodeSessionId: session.id,
+            sessionName: session.title,
+            busyMode: effectiveBusyMode(profile),
+            verbosity: effectiveVerbosity(profile),
+          });
+
+      return {
+        status: "rebound",
+        resolution: resolveBinding(binding, access.role),
+        session,
+        previousSessionId,
+        previousTargetId,
+        clearedOverrides: clearedOverrides.length > 0 ? clearedOverrides : undefined,
+      };
+    },
+
+    async unbindTarget(message): Promise<BindingOperationResult> {
+      const access = this.authorizeSender(message);
+      if (!access.allowed) return { status: "denied", decision: access };
+
+      const existing = repositories.bindings.getByConversationKey(message.conversation.key);
+      if (!existing) return { status: "noop", reason: "no_binding" };
+
+      const resolution = resolveBinding(existing, access.role);
+
+      if (existing.targetSource === "profile_default") {
+        return {
+          status: "noop",
+          reason: "already_profile_default",
+          resolution,
+          session: { id: existing.opencodeSessionId, targetId: resolution.target.id, title: existing.sessionName },
+        };
+      }
+
+      const activeRun = repositories.runs.getActiveByBindingId(existing.id);
+      if (activeRun) return { status: "blocked", reason: "active_run", resolution, run: activeRun };
+
+      const profile = resolution.profile;
+      const target = repositories.targets.getById(profile.defaultTargetId);
+      if (!target) return { status: "not_found", resource: "target", id: profile.defaultTargetId };
+
+      const targetChanged = existing.targetId !== target.id;
+      let clearedOverrides: ClearedBindingOverride[] = [];
+
+      if (targetChanged) {
+        try {
+          clearedOverrides = await invalidOverridesForTarget(existing, target);
+        } catch (error) {
+          return { status: "error", error: `Unable to validate overrides for target ${target.id}: ${formatError(error)}` };
+        }
+      }
+
+      const session = targetChanged
+        ? await createRuntimeSession(message, profile, target)
+        : { id: existing.opencodeSessionId, targetId: target.id, title: existing.sessionName };
+      const shouldClearAgent = clearedOverrides.some((override) => override.kind === "agent");
+      const shouldClearModel = clearedOverrides.some((override) => override.kind === "model");
+      const binding = requireUpdatedBinding(
+        repositories.bindings.clearExplicitTarget({
+          conversationKey: message.conversation.key,
+          targetId: target.id,
+          opencodeSessionId: session.id,
+          sessionName: session.title,
+          agent: shouldClearAgent ? null : undefined,
+          model: shouldClearModel ? null : undefined,
+        }),
+        message.conversation.key,
+      );
+
+      return {
+        status: "rebound",
+        resolution: resolveBinding(binding, access.role),
+        session,
+        previousSessionId: existing.opencodeSessionId,
+        previousTargetId: existing.targetId,
         clearedOverrides: clearedOverrides.length > 0 ? clearedOverrides : undefined,
       };
     },
@@ -324,6 +483,7 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
       accountId: message.accountId,
       profileId: profile.id,
       targetId: target.id,
+      targetSource: "profile_default",
       opencodeSessionId: session.id,
       sessionName: session.title,
       busyMode: effectiveBusyMode(profile),
@@ -350,7 +510,7 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
     role: Exclude<AccessRole, "blocked">,
   ): ResolvedDispatch {
     const profile = requireProfile(binding.profileId);
-    const target = requireTarget(binding.targetId);
+    const target = requireTarget(effectiveTargetId(binding, profile));
 
     return {
       role,
@@ -360,6 +520,10 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
       agent: effectiveAgent(binding, profile, target),
       model: effectiveModel(binding, profile, target),
     };
+  }
+
+  function effectiveTargetId(binding: ConversationBindingRecord, profile: ProfileRecord): string {
+    return binding.targetSource === "explicit_bind" ? binding.targetId : profile.defaultTargetId;
   }
 
   function requireDefaultProfile(): ProfileRecord {

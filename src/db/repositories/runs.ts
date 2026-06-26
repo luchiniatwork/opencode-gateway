@@ -35,6 +35,7 @@ export interface RunRepository {
   getById(id: string): RunRecord | undefined;
   getActiveByBindingId(bindingId: string): RunRecord | undefined;
   listActive(): RunRecord[];
+  listActiveByTargetId(targetId: string): RunRecord[];
   setOpenCodeMessageId(id: string, opencodeMessageId: string): RunRecord | undefined;
   finish(input: FinishRunInput): RunRecord | undefined;
   finishIfActive(input: FinishRunInput): RunRecord | undefined;
@@ -89,6 +90,14 @@ export function createRunRepository(
       const rows = db
         .query("SELECT * FROM runs WHERE status = 'active' ORDER BY started_at, id")
         .all() as RunRow[];
+
+      return rows.map(mapRunRow);
+    },
+
+    listActiveByTargetId(targetId): RunRecord[] {
+      const rows = db
+        .query("SELECT * FROM runs WHERE target_id = ? AND status = 'active' ORDER BY started_at, id")
+        .all(targetId) as RunRow[];
 
       return rows.map(mapRunRow);
     },

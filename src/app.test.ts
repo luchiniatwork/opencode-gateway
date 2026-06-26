@@ -965,6 +965,61 @@ test("gateway app starts queued messages with the current binding state", async 
   }
 });
 
+test("gateway app starts queued messages with the current explicit target binding", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new QueueRuntime();
+  const config = testConfig(join(dir, "state.db"));
+  config.opencode.targets.push({
+    id: "review",
+    name: "Review workspace",
+    mode: "attach",
+    serverUrl: "http://127.0.0.1:4097",
+    defaultAgent: "review-agent",
+    defaultModel: "provider/review-model",
+  });
+  const app = createApp({
+    config,
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await runtime.firstSendStarted;
+
+    await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
+    await waitForSent(channel, 1);
+
+    await channel.emit(inboundMessage({ id: "message-3", text: "/bind review", commandText: "/bind review" }));
+    await waitForSent(channel, 2);
+
+    runtime.finishFirstSend();
+    await waitForSent(channel, 4);
+
+    expect(channel.sent.map((entry) => entry.message.text)).toEqual([
+      expect.stringContaining("Queued behind active run"),
+      expect.stringContaining("Bound conversation to Review workspace (review)."),
+      "answer-1",
+      "answer-2",
+    ]);
+    expect(runtime.calls.startTurn.map((call) => call.text)).toEqual(["first", "second"]);
+    expect(runtime.calls.startTurn[1]).toEqual(expect.objectContaining({
+      sessionId: "session-2",
+      target: expect.objectContaining({ id: "review" }),
+      agent: "review-agent",
+      model: "provider/review-model",
+    }));
+  } finally {
+    runtime.finishFirstSend();
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("gateway app uses agent and model command overrides for future turns", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
@@ -1556,6 +1611,47 @@ test("gateway app /stop aborts the active run target after a profile switch", as
     await runtime.firstSendStarted;
 
     await channel.emit(inboundMessage({ id: "message-2", text: "/profile review", commandText: "/profile review" }));
+    await waitForSent(channel, 1);
+
+    await channel.emit(inboundMessage({ id: "message-3", text: "/stop", commandText: "/stop" }));
+    await waitForSent(channel, 2);
+
+    expect(runtime.calls.abort[0]).toEqual(expect.objectContaining({
+      target: expect.objectContaining({ id: "default" }),
+      sessionId: "session-1",
+    }));
+  } finally {
+    runtime.finishFirstSend();
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app /stop aborts the active run target after an explicit bind", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new QueueRuntime();
+  const config = testConfig(join(dir, "state.db"));
+  config.opencode.targets.push({
+    id: "review",
+    name: "Review workspace",
+    mode: "attach",
+    serverUrl: "http://127.0.0.1:4097",
+  });
+  const app = createApp({
+    config,
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await runtime.firstSendStarted;
+
+    await channel.emit(inboundMessage({ id: "message-2", text: "/bind review", commandText: "/bind review" }));
     await waitForSent(channel, 1);
 
     await channel.emit(inboundMessage({ id: "message-3", text: "/stop", commandText: "/stop" }));

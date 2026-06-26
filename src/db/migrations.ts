@@ -120,6 +120,14 @@ export const migrations: Migration[] = [
       `ALTER TABLE runs ADD COLUMN target_id TEXT`,
     ],
   },
+  {
+    id: "004_phase_4_target_binding_source",
+    statements: [
+      `ALTER TABLE conversation_bindings
+        ADD COLUMN target_source TEXT NOT NULL DEFAULT 'profile_default'
+        CHECK (target_source IN ('profile_default', 'explicit_bind'))`,
+    ],
+  },
 ];
 
 export function runMigrations(db: Database, now: () => Date = () => new Date()): void {

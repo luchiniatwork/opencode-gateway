@@ -32,6 +32,8 @@ export interface ProfileRecord {
   updatedAt: string;
 }
 
+export type TargetBindingSource = "profile_default" | "explicit_bind";
+
 export interface ConversationBindingRecord {
   id: string;
   conversationKey: ConversationKey;
@@ -39,6 +41,7 @@ export interface ConversationBindingRecord {
   accountId: string;
   profileId: string;
   targetId: RuntimeTargetId;
+  targetSource: TargetBindingSource;
   opencodeSessionId: RuntimeSessionId;
   sessionName?: string;
   agent?: string;

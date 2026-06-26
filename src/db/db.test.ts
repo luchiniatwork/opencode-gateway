@@ -51,7 +51,7 @@ test("migrations are idempotent", async () => {
       count: number;
     };
 
-    expect(row.count).toBe(3);
+    expect(row.count).toBe(4);
   } finally {
     database.close();
   }
@@ -203,9 +203,60 @@ test("conversation bindings keep one row per conversation key", async () => {
     expect(second.id).toBe(first.id);
     expect(second.opencodeSessionId).toBe("session-2");
     expect(second.sessionName).toBe("new session");
+    expect(second.targetSource).toBe("profile_default");
     expect(second.verbosity).toBe("tools");
     expect(count.count).toBe(1);
     expect(bindings.getByConversationKey("telegram:default:dm:123")?.opencodeSessionId).toBe("session-2");
+  } finally {
+    database.close();
+  }
+});
+
+test("conversation binding target source can be set and cleared", async () => {
+  const database = await openSeededDatabase();
+
+  try {
+    const bindings = createConversationBindingRepository(database.db, {
+      now: fixedNow,
+      createId: () => "binding-1",
+    });
+    const binding = bindings.upsert({
+      conversationKey: "telegram:default:dm:123",
+      channel: "telegram",
+      accountId: "default",
+      profileId: "cto",
+      targetId: "default",
+      opencodeSessionId: "session-1",
+      busyMode: "queue",
+      verbosity: "compact",
+    });
+
+    expect(binding.targetSource).toBe("profile_default");
+
+    const explicit = bindings.updateTarget({
+      conversationKey: binding.conversationKey,
+      targetId: "default",
+      targetSource: "explicit_bind",
+      opencodeSessionId: "session-1",
+      sessionName: "explicit",
+    });
+
+    expect(explicit).toMatchObject({
+      targetSource: "explicit_bind",
+      sessionName: "explicit",
+    });
+    expect(bindings.listByTargetId("default").map((entry) => entry.id)).toEqual(["binding-1"]);
+
+    const cleared = bindings.clearExplicitTarget({
+      conversationKey: binding.conversationKey,
+      targetId: "default",
+      opencodeSessionId: "session-2",
+    });
+
+    expect(cleared).toMatchObject({
+      targetSource: "profile_default",
+      opencodeSessionId: "session-2",
+    });
   } finally {
     database.close();
   }
@@ -338,10 +389,11 @@ test("runs can be created, queried as active, and finished", async () => {
       createId: () => "run-1",
     });
 
-    const run = runs.create({ bindingId: binding.id, opencodeSessionId: binding.opencodeSessionId });
+    const run = runs.create({ bindingId: binding.id, targetId: binding.targetId, opencodeSessionId: binding.opencodeSessionId });
 
     expect(run.status).toBe("active");
     expect(runs.getActiveByBindingId(binding.id)?.id).toBe("run-1");
+    expect(runs.listActiveByTargetId("default").map((entry) => entry.id)).toEqual(["run-1"]);
 
     const finished = runs.finish({ id: run.id, status: "completed", opencodeMessageId: "message-1" });
 
@@ -349,6 +401,7 @@ test("runs can be created, queried as active, and finished", async () => {
     expect(finished?.finishedAt).toBe("2026-01-01T00:00:00.000Z");
     expect(finished?.opencodeMessageId).toBe("message-1");
     expect(runs.getActiveByBindingId(binding.id)).toBeUndefined();
+    expect(runs.listActiveByTargetId("default")).toEqual([]);
   } finally {
     database.close();
   }
