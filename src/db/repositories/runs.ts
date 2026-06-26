@@ -30,6 +30,12 @@ export interface FinishRunInput {
   error?: string;
 }
 
+export interface FinishActiveByTargetInput {
+  targetId: string;
+  status: string;
+  error?: string;
+}
+
 export interface RunRepository {
   create(input: CreateRunInput): RunRecord;
   getById(id: string): RunRecord | undefined;
@@ -39,6 +45,7 @@ export interface RunRepository {
   setOpenCodeMessageId(id: string, opencodeMessageId: string): RunRecord | undefined;
   finish(input: FinishRunInput): RunRecord | undefined;
   finishIfActive(input: FinishRunInput): RunRecord | undefined;
+  finishActiveByTargetId(input: FinishActiveByTargetInput): RunRecord[];
   finishAllActive(input: Omit<FinishRunInput, "id" | "opencodeMessageId">): RunRecord[];
   markAborted(id: string): RunRecord | undefined;
 }
@@ -157,6 +164,21 @@ export function createRunRepository(
         ) as RunRow | null;
 
       return row ? mapRunRow(row) : undefined;
+    },
+
+    finishActiveByTargetId(input): RunRecord[] {
+      const rows = db
+        .query(
+          `UPDATE runs SET
+            status = ?,
+            error = ?,
+            finished_at = ?
+          WHERE target_id = ? AND status = 'active'
+          RETURNING *`,
+        )
+        .all(input.status, input.error ?? null, now().toISOString(), input.targetId) as RunRow[];
+
+      return rows.map(mapRunRow);
     },
 
     finishAllActive(input): RunRecord[] {

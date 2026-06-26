@@ -762,7 +762,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     context: GatewayLogContext,
   ): RecordedPendingPermission | undefined {
     if (!pendingPermissions) return undefined;
-    const existing = pendingPermissions.getByOpenCodePermissionId(event.id);
+    const existing = pendingPermissions.getByRunAndOpenCodePermissionId({ runId, opencodePermissionId: event.id });
     if (existing?.status === "pending" && existing.runId === runId && existing.actionMessageReceiptId) {
       log("info", "turn run permission request already has an action card", {
         ...context,
@@ -788,7 +788,7 @@ export function createTurnRunner(options: TurnRunnerOptions): TurnRunner {
     const expiresAt = new Date(now().getTime() + permissionTtlMs).toISOString();
 
     try {
-      const permission = pendingPermissions.upsertByOpenCodePermissionId({
+      const permission = pendingPermissions.upsertByRunAndOpenCodePermissionId({
         runId,
         opencodePermissionId: event.id,
         summary: event.summary,

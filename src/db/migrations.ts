@@ -128,6 +128,16 @@ export const migrations: Migration[] = [
         CHECK (target_source IN ('profile_default', 'explicit_bind'))`,
     ],
   },
+  {
+    id: "005_phase_4_pending_permission_scope",
+    statements: [
+      `DROP INDEX IF EXISTS pending_permissions_opencode_permission_id`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS pending_permissions_run_opencode_permission_id
+        ON pending_permissions(run_id, opencode_permission_id)`,
+      `CREATE INDEX IF NOT EXISTS pending_permissions_opencode_permission_id_lookup
+        ON pending_permissions(opencode_permission_id)`,
+    ],
+  },
 ];
 
 export function runMigrations(db: Database, now: () => Date = () => new Date()): void {

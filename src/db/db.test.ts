@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createApp } from "../app.ts";
 import type { ConfigSeeds, GatewayConfig } from "../config/schema.ts";
 import { openGatewayDatabase, type GatewayDatabase } from "./client.ts";
-import { runMigrations } from "./migrations.ts";
+import { migrations, runMigrations } from "./migrations.ts";
 import { createAccessRuleRepository } from "./repositories/access-rules.ts";
 import { createConversationBindingRepository } from "./repositories/conversation-bindings.ts";
 import { createDeliveryReceiptRepository } from "./repositories/delivery-receipts.ts";
@@ -16,7 +16,7 @@ import { createRunRepository } from "./repositories/runs.ts";
 import { seedDatabaseFromConfig } from "./repositories/seeds.ts";
 import { createTargetRepository } from "./repositories/targets.ts";
 
-test("migrations create the phase 2 database tables", async () => {
+test("migrations create the phase 4 database tables", async () => {
   const database = await openTestDatabase();
 
   try {
@@ -51,7 +51,7 @@ test("migrations are idempotent", async () => {
       count: number;
     };
 
-    expect(row.count).toBe(4);
+    expect(row.count).toBe(migrations.length);
   } finally {
     database.close();
   }
@@ -86,7 +86,10 @@ test("pending permissions can be created, queried, listed, and resolved", async 
       expiresAt: "2026-01-01T00:15:00.000Z",
     });
     expect(permissions.getById("permission-1")?.summary).toBe("Run bash command");
-    expect(permissions.getByOpenCodePermissionId("opencode-permission-1")?.id).toBe("permission-1");
+    expect(permissions.getByRunAndOpenCodePermissionId({
+      runId: run.id,
+      opencodePermissionId: "opencode-permission-1",
+    })?.id).toBe("permission-1");
     expect(permissions.listPendingByRunId(run.id).map((permission) => permission.id)).toEqual(["permission-1"]);
 
     const resolved = permissions.resolve({ id: "permission-1", status: "approved", actionMessageReceiptId: "receipt-1" });
@@ -95,6 +98,79 @@ test("pending permissions can be created, queried, listed, and resolved", async 
     expect(resolved?.resolvedAt).toBe("2026-01-01T00:00:00.000Z");
     expect(resolved?.actionMessageReceiptId).toBe("receipt-1");
     expect(permissions.listPendingByRunId(run.id)).toEqual([]);
+  } finally {
+    database.close();
+  }
+});
+
+test("pending permission OpenCode IDs are scoped by run", async () => {
+  const database = await openSeededDatabase();
+
+  try {
+    const bindings = createConversationBindingRepository(database.db, {
+      now: fixedNow,
+      createId: () => "binding-1",
+    });
+    const binding = bindings.upsert({
+      conversationKey: "telegram:default:dm:123",
+      channel: "telegram",
+      accountId: "default",
+      profileId: "cto",
+      targetId: "default",
+      opencodeSessionId: "session-1",
+      busyMode: "queue",
+      verbosity: "compact",
+    });
+    let runId = 0;
+    const runs = createRunRepository(database.db, {
+      now: fixedNow,
+      createId: () => `run-${(runId += 1)}`,
+    });
+    const firstRun = runs.create({
+      bindingId: binding.id,
+      targetId: binding.targetId,
+      opencodeSessionId: "session-1",
+      status: "completed",
+    });
+    const secondRun = runs.create({
+      bindingId: binding.id,
+      targetId: binding.targetId,
+      opencodeSessionId: "session-2",
+      status: "completed",
+    });
+    let permissionId = 0;
+    const permissions = createPendingPermissionRepository(database.db, {
+      now: fixedNow,
+      createId: () => `permission-${(permissionId += 1)}`,
+    });
+
+    const first = permissions.create({
+      runId: firstRun.id,
+      opencodePermissionId: "same-opencode-permission",
+      summary: "First run permission",
+      expiresAt: "2026-01-01T00:15:00.000Z",
+    });
+    const second = permissions.create({
+      runId: secondRun.id,
+      opencodePermissionId: "same-opencode-permission",
+      summary: "Second run permission",
+      expiresAt: "2026-01-01T00:15:00.000Z",
+    });
+
+    expect(permissions.getByRunAndOpenCodePermissionId({
+      runId: firstRun.id,
+      opencodePermissionId: "same-opencode-permission",
+    })?.id).toBe(first.id);
+    expect(permissions.getByRunAndOpenCodePermissionId({
+      runId: secondRun.id,
+      opencodePermissionId: "same-opencode-permission",
+    })?.id).toBe(second.id);
+    expect(() => permissions.create({
+      runId: firstRun.id,
+      opencodePermissionId: "same-opencode-permission",
+      summary: "Duplicate first run permission",
+      expiresAt: "2026-01-01T00:15:00.000Z",
+    })).toThrow();
   } finally {
     database.close();
   }
@@ -402,6 +478,62 @@ test("runs can be created, queried as active, and finished", async () => {
     expect(finished?.opencodeMessageId).toBe("message-1");
     expect(runs.getActiveByBindingId(binding.id)).toBeUndefined();
     expect(runs.listActiveByTargetId("default")).toEqual([]);
+  } finally {
+    database.close();
+  }
+});
+
+test("runs can finish active entries by target", async () => {
+  const database = await openSeededDatabase();
+
+  try {
+    createTargetRepository(database.db, fixedNow).upsertSeed({
+      id: "other",
+      name: "Other workspace",
+      mode: "attach",
+      serverUrl: "http://127.0.0.1:4097",
+    });
+    let bindingId = 0;
+    const bindings = createConversationBindingRepository(database.db, {
+      now: fixedNow,
+      createId: () => `binding-${(bindingId += 1)}`,
+    });
+    const defaultBinding = bindings.upsert({
+      conversationKey: "telegram:default:dm:123",
+      channel: "telegram",
+      accountId: "default",
+      profileId: "cto",
+      targetId: "default",
+      opencodeSessionId: "session-1",
+      busyMode: "queue",
+      verbosity: "compact",
+    });
+    const otherBinding = bindings.upsert({
+      conversationKey: "telegram:default:dm:456",
+      channel: "telegram",
+      accountId: "default",
+      profileId: "cto",
+      targetId: "other",
+      opencodeSessionId: "session-2",
+      busyMode: "queue",
+      verbosity: "compact",
+    });
+    let runId = 0;
+    const runs = createRunRepository(database.db, {
+      now: fixedNow,
+      createId: () => `run-${(runId += 1)}`,
+    });
+
+    runs.create({ bindingId: defaultBinding.id, targetId: "default", opencodeSessionId: "session-1" });
+    runs.create({ bindingId: otherBinding.id, targetId: "other", opencodeSessionId: "session-2" });
+
+    const finished = runs.finishActiveByTargetId({ targetId: "default", status: "error", error: "target crashed" });
+
+    expect(finished.map((run) => run.id)).toEqual(["run-1"]);
+    expect(runs.getById("run-1")).toMatchObject({ status: "error", error: "target crashed" });
+    expect(runs.getById("run-2")).toMatchObject({ status: "active", error: undefined });
+    expect(runs.listActiveByTargetId("default")).toEqual([]);
+    expect(runs.listActiveByTargetId("other").map((run) => run.id)).toEqual(["run-2"]);
   } finally {
     database.close();
   }

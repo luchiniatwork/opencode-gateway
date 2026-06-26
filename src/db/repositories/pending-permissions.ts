@@ -39,9 +39,9 @@ export interface UpdatePendingPermissionActionReceiptInput {
 
 export interface PendingPermissionRepository {
   create(input: CreatePendingPermissionInput): PendingPermissionRecord;
-  upsertByOpenCodePermissionId(input: CreatePendingPermissionInput): PendingPermissionRecord;
+  upsertByRunAndOpenCodePermissionId(input: CreatePendingPermissionInput): PendingPermissionRecord;
   getById(id: string): PendingPermissionRecord | undefined;
-  getByOpenCodePermissionId(opencodePermissionId: string): PendingPermissionRecord | undefined;
+  getByRunAndOpenCodePermissionId(input: { runId: string; opencodePermissionId: string }): PendingPermissionRecord | undefined;
   listPending(): PendingPermissionRecord[];
   listPendingByRunId(runId: string): PendingPermissionRecord[];
   setActionMessageReceiptId(input: UpdatePendingPermissionActionReceiptInput): PendingPermissionRecord | undefined;
@@ -81,15 +81,14 @@ export function createPendingPermissionRepository(
       return mapPendingPermissionRow(row);
     },
 
-    upsertByOpenCodePermissionId(input): PendingPermissionRecord {
+    upsertByRunAndOpenCodePermissionId(input): PendingPermissionRecord {
       const row = db
         .query(
           `INSERT INTO pending_permissions (
             id, run_id, opencode_permission_id, summary, details_json, action_message_receipt_id,
             status, created_at, expires_at, resolved_at
           ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)
-          ON CONFLICT(opencode_permission_id) DO UPDATE SET
-            run_id = excluded.run_id,
+          ON CONFLICT(run_id, opencode_permission_id) DO UPDATE SET
             summary = excluded.summary,
             details_json = excluded.details_json,
             action_message_receipt_id = NULL,
@@ -119,10 +118,10 @@ export function createPendingPermissionRepository(
       return row ? mapPendingPermissionRow(row) : undefined;
     },
 
-    getByOpenCodePermissionId(opencodePermissionId): PendingPermissionRecord | undefined {
+    getByRunAndOpenCodePermissionId(input): PendingPermissionRecord | undefined {
       const row = db
-        .query("SELECT * FROM pending_permissions WHERE opencode_permission_id = ?")
-        .get(opencodePermissionId) as PendingPermissionRow | null;
+        .query("SELECT * FROM pending_permissions WHERE run_id = ? AND opencode_permission_id = ?")
+        .get(input.runId, input.opencodePermissionId) as PendingPermissionRow | null;
 
       return row ? mapPendingPermissionRow(row) : undefined;
     },

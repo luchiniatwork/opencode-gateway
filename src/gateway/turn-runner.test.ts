@@ -610,7 +610,7 @@ test("turn runner observes permissions for compact profiles without progress mes
   }
 });
 
-test("turn runner resurfaces an already-pending OpenCode permission instead of dropping the card", async () => {
+test("turn runner scopes pending permission dedupe to the current run", async () => {
   const harness = await createHarness({
     events: [
       { type: "permission_request", id: "opencode-permission-1", summary: "Run bash", details: { action: "bash", resources: ["printf hello"] } },
@@ -631,11 +631,12 @@ test("turn runner resurfaces an already-pending OpenCode permission instead of d
     await waitForDeliveries(harness.deliveries, 2);
 
     expect(harness.deliveries).toEqual([
-      { kind: "status", format: "plain", text: "Permission card: permission-existing" },
+      { kind: "status", format: "plain", text: "Permission card: permission-1" },
       { kind: "final", format: "markdown", text: "done" },
     ]);
     expect(pendingPermissionRows(harness.database)).toEqual([
-      expect.objectContaining({ id: "permission-existing", opencode_permission_id: "opencode-permission-1", status: "expired" }),
+      expect.objectContaining({ id: "permission-1", run_id: "run-1", opencode_permission_id: "opencode-permission-1", status: "expired" }),
+      expect.objectContaining({ id: "permission-existing", run_id: "run-existing", opencode_permission_id: "opencode-permission-1", status: "pending" }),
     ]);
   } finally {
     await harness.runner.stop();
@@ -643,7 +644,7 @@ test("turn runner resurfaces an already-pending OpenCode permission instead of d
   }
 });
 
-test("turn runner does not resurrect expired OpenCode permissions when they are reported again", async () => {
+test("turn runner allows the same OpenCode permission ID in different runs", async () => {
   const permissionEvent: RuntimeEvent = {
     type: "permission_request",
     id: "opencode-permission-1",
@@ -672,15 +673,17 @@ test("turn runner does not resurrect expired OpenCode permissions when they are 
       resolution: harness.resolution,
       delivery: harness.delivery,
     });
-    await waitForDeliveries(harness.deliveries, 3);
+    await waitForDeliveries(harness.deliveries, 4);
 
     expect(harness.deliveries).toEqual([
       { kind: "status", format: "plain", text: "Permission card: permission-1" },
       { kind: "final", format: "markdown", text: "first done" },
+      { kind: "status", format: "plain", text: "Permission card: permission-2" },
       { kind: "final", format: "markdown", text: "second done" },
     ]);
     expect(pendingPermissionRows(harness.database)).toEqual([
-      expect.objectContaining({ id: "permission-1", opencode_permission_id: "opencode-permission-1", status: "expired" }),
+      expect.objectContaining({ id: "permission-1", run_id: "run-1", opencode_permission_id: "opencode-permission-1", status: "expired" }),
+      expect.objectContaining({ id: "permission-2", run_id: "run-2", opencode_permission_id: "opencode-permission-1", status: "expired" }),
     ]);
   } finally {
     await harness.runner.stop();
