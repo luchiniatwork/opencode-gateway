@@ -716,9 +716,9 @@ test("turn runner renders tool progress for tools verbosity", async () => {
       {
         kind: "progress",
         format: "plain",
-        text: "Tool bash started: Run tests",
+        text: "🛠️ Tool bash started: Run tests",
       },
-      { kind: "progress", format: "plain", text: "Tool bash completed: Passed" },
+      { kind: "progress", format: "plain", text: "✅ Tool bash completed: Passed" },
       { kind: "final", format: "markdown", text: "done" },
     ]);
   } finally {
@@ -760,15 +760,15 @@ test("turn runner renders subagent updates and todos for tools verbosity", async
       observeProgress: true,
     }));
     expect(harness.deliveries).toEqual([
-      { kind: "progress", format: "plain", text: "Subagent general started: Inspect bug" },
-      { kind: "progress", format: "plain", text: "Subagent grep updated: Search runtime events" },
+      { kind: "progress", format: "plain", text: "🤖 Subagent general started: Inspect bug" },
+      { kind: "progress", format: "plain", text: "🤖 Subagent grep updated: Search runtime events" },
       {
         kind: "progress",
         format: "plain",
         text: [
-          "Subagent todos:",
-          "[~] Search runtime events (high)",
-          "[ ] Summarize findings (medium)",
+          "🤖 Subagent todos:",
+          "🔄 Search runtime events (high)",
+          "⬜ Summarize findings (medium)",
         ].join("\n"),
       },
       { kind: "final", format: "markdown", text: "done" },

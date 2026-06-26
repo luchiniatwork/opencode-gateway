@@ -10,7 +10,7 @@ import type {
   SendReceipt,
   TypingState,
 } from "../types.ts";
-import { splitTelegramText, telegramOutboundText } from "./format.ts";
+import { renderTelegramMessage, splitTelegramText, telegramOutboundText, type TelegramParseMode } from "./format.ts";
 import {
   normalizeTelegramCallbackQuery,
   normalizeTelegramTextMessage,
@@ -39,12 +39,26 @@ export interface TelegramInlineKeyboardMarkupRef {
   inline_keyboard: TelegramInlineKeyboardButtonRef[][];
 }
 
+export interface TelegramLinkPreviewOptionsRef {
+  is_disabled?: boolean;
+}
+
+export interface TelegramReplyParametersRef {
+  message_id: number;
+  allow_sending_without_reply?: boolean;
+}
+
 export interface TelegramSendMessageOptions {
   message_thread_id?: number;
+  parse_mode?: TelegramParseMode;
+  link_preview_options?: TelegramLinkPreviewOptionsRef;
+  reply_parameters?: TelegramReplyParametersRef;
   reply_markup?: TelegramInlineKeyboardMarkupRef;
 }
 
 export interface TelegramEditMessageTextOptions {
+  parse_mode?: TelegramParseMode;
+  link_preview_options?: TelegramLinkPreviewOptionsRef;
   reply_markup?: TelegramInlineKeyboardMarkupRef;
 }
 
@@ -250,13 +264,31 @@ export async function sendTelegramMessage(
   message: OutboundMessage,
   now: () => Date = () => new Date(),
 ): Promise<SendReceipt> {
-  const text = telegramOutboundText(message);
-  const options = telegramSendOptions(target, message.actions);
+  const chunks = renderTelegramMessage(message);
   const sentMessages: TelegramSentMessageRef[] = [];
   let index = 0;
 
-  for (const chunk of splitTelegramText(text)) {
-    sentMessages.push(await bot.api.sendMessage(target.conversationId, chunk, index === 0 ? options : telegramSendOptions(target)));
+  for (const chunk of chunks) {
+    const options = telegramSendOptions(target, index === 0 ? message : undefined, chunk);
+
+    try {
+      sentMessages.push(await bot.api.sendMessage(target.conversationId, chunk.text, options));
+    } catch (error) {
+      if (!chunk.parseMode || sentMessages.length > 0) throw error;
+
+      const fallbackChunks = splitTelegramText(telegramOutboundText(message));
+      sentMessages.splice(0, sentMessages.length);
+      for (const [fallbackIndex, fallbackChunk] of fallbackChunks.entries()) {
+        sentMessages.push(
+          await bot.api.sendMessage(
+            target.conversationId,
+            fallbackChunk,
+            telegramSendOptions(target, fallbackIndex === 0 ? message : undefined),
+          ),
+        );
+      }
+      break;
+    }
     index += 1;
   }
 
@@ -282,9 +314,10 @@ export async function editTelegramMessage(
   message: OutboundMessage,
   now: () => Date = () => new Date(),
 ): Promise<SendReceipt> {
-  const text = telegramOutboundText(message);
+  const chunks = renderTelegramMessage(message);
+  const firstChunk = chunks[0];
 
-  if (splitTelegramText(text).length > 1) {
+  if (!firstChunk || chunks.length > 1) {
     throw new Error("Telegram edit text exceeds maximum message length");
   }
 
@@ -295,7 +328,15 @@ export async function editTelegramMessage(
     throw new Error("Telegram edit receipt has an invalid message id");
   }
 
-  const edited = await bot.api.editMessageText(chatId, messageId, text, telegramEditOptions(message.actions));
+  let edited: TelegramSentMessageRef | true;
+
+  try {
+    edited = await bot.api.editMessageText(chatId, messageId, firstChunk.text, telegramEditOptions(message, firstChunk));
+  } catch (error) {
+    if (!firstChunk.parseMode) throw error;
+
+    edited = await bot.api.editMessageText(chatId, messageId, telegramOutboundText(message), telegramEditOptions(message));
+  }
   const sentMessage = edited === true ? undefined : edited;
 
   return {
@@ -326,14 +367,27 @@ function telegramChatAction(state: TypingState): TelegramChatAction | undefined 
   return undefined;
 }
 
-function telegramSendOptions(target: OutboundTarget, actions?: OutboundAction[]): TelegramSendMessageOptions | undefined {
+function telegramSendOptions(target: OutboundTarget, message?: OutboundMessage, rendered?: { parseMode?: TelegramParseMode; disableWebPagePreview?: boolean }): TelegramSendMessageOptions | undefined {
   const topicId = target.topicId ?? target.threadId;
   const messageThreadId = topicId === undefined ? undefined : Number(topicId);
-  const replyMarkup = telegramReplyMarkup(actions);
+  const replyMarkup = telegramReplyMarkup(message?.actions);
+  const replyParameters = telegramReplyParameters(message?.replyToMessageId);
   const options: TelegramSendMessageOptions = {};
 
   if (messageThreadId !== undefined && Number.isInteger(messageThreadId)) {
     options.message_thread_id = messageThreadId;
+  }
+
+  if (rendered?.parseMode) {
+    options.parse_mode = rendered.parseMode;
+  }
+
+  if (rendered?.disableWebPagePreview) {
+    options.link_preview_options = { is_disabled: true };
+  }
+
+  if (replyParameters) {
+    options.reply_parameters = replyParameters;
   }
 
   if (replyMarkup) {
@@ -343,8 +397,30 @@ function telegramSendOptions(target: OutboundTarget, actions?: OutboundAction[])
   return Object.keys(options).length === 0 ? undefined : options;
 }
 
-function telegramEditOptions(actions?: OutboundAction[]): TelegramEditMessageTextOptions {
-  return { reply_markup: telegramReplyMarkup(actions) ?? { inline_keyboard: [] } };
+function telegramEditOptions(message: OutboundMessage, rendered?: { parseMode?: TelegramParseMode; disableWebPagePreview?: boolean }): TelegramEditMessageTextOptions {
+  const options: TelegramEditMessageTextOptions = { reply_markup: telegramReplyMarkup(message.actions) ?? { inline_keyboard: [] } };
+
+  if (rendered?.parseMode) {
+    options.parse_mode = rendered.parseMode;
+  }
+
+  if (rendered?.disableWebPagePreview) {
+    options.link_preview_options = { is_disabled: true };
+  }
+
+  return options;
+}
+
+function telegramReplyParameters(replyToMessageId: string | undefined): TelegramReplyParametersRef | undefined {
+  if (!replyToMessageId) return undefined;
+
+  const messageId = Number(replyToMessageId);
+  if (!Number.isInteger(messageId)) return undefined;
+
+  return {
+    message_id: messageId,
+    allow_sending_without_reply: true,
+  };
 }
 
 function telegramReplyMarkup(actions: OutboundAction[] | undefined): TelegramInlineKeyboardMarkupRef | undefined {

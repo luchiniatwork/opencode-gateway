@@ -366,10 +366,10 @@ test("gateway app sends permission buttons and approves callback actions", async
 
     expect(card).toMatchObject({
       kind: "status",
-      text: expect.stringContaining("Command:\nprintf 'permission smoke approve once'"),
+      text: expect.stringContaining("Command:\n```sh\nprintf 'permission smoke approve once'"),
       actions: [
-        { id: "permission.approve", label: "Approve once" },
-        { id: "permission.deny", label: "Deny" },
+        { id: "permission.approve", label: "✅ Approve once" },
+        { id: "permission.deny", label: "⛔ Deny" },
       ],
     });
     expect(card?.actions?.map((action) => action.id)).not.toContain("permission.always");
@@ -600,7 +600,7 @@ test("gateway app can enable always allow permission actions", async () => {
     await waitForSent(channel, 1);
 
     const alwaysAction = channel.sent[0]?.message.actions?.find((action) => action.id === "permission.always");
-    expect(alwaysAction).toMatchObject({ label: "Always allow" });
+    expect(alwaysAction).toMatchObject({ label: "♻️ Always allow" });
 
     await channel.emitAction(permissionAction({ actionId: "permission.always", value: alwaysAction?.value, messageId: "sent-1" }));
     await waitForEdited(channel, 1);

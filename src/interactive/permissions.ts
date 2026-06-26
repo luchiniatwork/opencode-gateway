@@ -278,17 +278,19 @@ function permissionRequestMessage(input: SendPermissionRequestInput, config: Int
   const commandHints = config.fallbackCommands ? fallbackCommandHints(input.permission.id, config.allowAlways) : [];
   const details = permissionCardDetails(input.permission);
   const lines = [
-    "OpenCode permission required",
-    details.action ? `Action: ${details.action}` : `Summary: ${input.permission.summary}`,
-    details.command ? `Command:\n${details.command}` : undefined,
-    !details.command && details.resource ? `Resource: ${details.resource}` : undefined,
-    details.action && details.action !== input.permission.summary ? `Summary: ${input.permission.summary}` : undefined,
-    `Target: ${input.resolution.target.name} (${input.resolution.target.id})`,
-    `Session: ${input.run.opencodeSessionId}`,
-    `Permission: ${input.permission.id}`,
+    "🔐 **OpenCode permission required**",
+    "",
+    details.action ? `Action: \`${details.action}\`` : `Summary: ${input.permission.summary}`,
+    details.command ? `Command:\n\`\`\`sh\n${details.command}\n\`\`\`` : undefined,
+    !details.command && details.resource ? `Resource:\n\`\`\`\n${details.resource}\n\`\`\`` : undefined,
+    details.action && details.action !== input.permission.summary ? `Risk summary: ${input.permission.summary}` : undefined,
+    "",
+    `Target: ${input.resolution.target.name} (\`${input.resolution.target.id}\`)`,
+    `Session: \`${input.run.opencodeSessionId}\``,
+    `Permission: \`${input.permission.id}\``,
     `Expires: ${input.permission.expiresAt}`,
     ...commandHints,
-  ].filter(isNonEmptyString);
+  ].filter((line): line is string => line !== undefined);
 
   return {
     kind: "status",
@@ -371,14 +373,14 @@ function isNonEmptyString(value: unknown): value is string {
 
 function permissionActions(permissionId: string, allowAlways: boolean): OutboundAction[] {
   const actions: OutboundAction[] = [
-    { id: PERMISSION_APPROVE_ACTION, label: "Approve once", style: "primary", value: permissionId },
+    { id: PERMISSION_APPROVE_ACTION, label: "✅ Approve once", style: "primary", value: permissionId },
   ];
 
   if (allowAlways) {
-    actions.push({ id: PERMISSION_ALWAYS_ACTION, label: "Always allow", style: "primary", value: permissionId });
+    actions.push({ id: PERMISSION_ALWAYS_ACTION, label: "♻️ Always allow", style: "primary", value: permissionId });
   }
 
-  actions.push({ id: PERMISSION_DENY_ACTION, label: "Deny", style: "danger", value: permissionId });
+  actions.push({ id: PERMISSION_DENY_ACTION, label: "⛔ Deny", style: "danger", value: permissionId });
 
   return actions;
 }
@@ -429,9 +431,9 @@ function actionReceipt(action: ChannelAction): SendReceipt {
 
 function permissionResolvedText(permission: PendingPermissionRecord, decision: PermissionDecision, actorName: string | undefined): string {
   const actor = actorName ? ` by ${actorName}` : "";
-  if (decision === "deny") return `Permission ${permission.id} denied${actor}.`;
-  if (decision === "always") return `Permission ${permission.id} approved always${actor}.`;
-  return `Permission ${permission.id} approved once${actor}.`;
+  if (decision === "deny") return `⛔ Permission ${permission.id} denied${actor}.`;
+  if (decision === "always") return `✅ Permission ${permission.id} approved always${actor}.`;
+  return `✅ Permission ${permission.id} approved once${actor}.`;
 }
 
 function isPermissionApprover(role: AccessRole | undefined): boolean {

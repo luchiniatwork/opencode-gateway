@@ -200,12 +200,12 @@ test("agents and models commands list available runtime selections and mark curr
     const models = await harness.router.handle(inboundMessage({ text: "/models" }));
 
     expect(responseText(agents)).toBe([
-      "OpenCode agents for Default workspace (default):",
+      "🤖 OpenCode agents for Default workspace (default):",
       "* cto-agent - CTO default",
       "- mobile-agent - Mobile specialist",
     ].join("\n"));
     expect(responseText(models)).toBe([
-      "OpenCode models for Default workspace (default):",
+      "🧠 OpenCode models for Default workspace (default):",
       "* provider/cto-model (CTO model)",
       "- provider/custom-model (Custom model)",
     ].join("\n"));
@@ -442,7 +442,11 @@ test("sessions command lists runtime sessions and marks the current one", async 
     const result = await harness.router.handle(inboundMessage({ text: "/sessions" }));
     const text = responseText(result);
 
-    expect(text).toBe(['- session-2 "Other"', '- session-1 "Current" (current)'].join("\n"));
+    expect(text).toBe([
+      "🧵 Recent sessions for Default workspace (default):",
+      '- session-2 "Other"',
+      '- session-1 "Current" (current)',
+    ].join("\n"));
     expect(harness.runtime.calls.listSessions).toEqual([expect.objectContaining({ limit: 10 })]);
   } finally {
     harness.database.close();

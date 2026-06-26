@@ -108,7 +108,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
 
   function helpText(): string {
     return [
-      "OpenCode Gateway commands:",
+      "🤖 OpenCode Gateway commands:",
       "",
       "`/help` - Show this help.",
       "`/status` - Show current routing and run status.",
@@ -141,7 +141,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
     const targetHealth = target ? (health?.targets?.[target.id] ?? "configured") : "unknown";
 
     return [
-      "Gateway status:",
+      "🟢 Gateway status:",
       `Channel: ${message.channel}:${message.accountId}`,
       `Conversation: ${message.conversation.key}`,
       `Role: ${decision.role}`,
@@ -257,7 +257,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       const sessions = await runtime.listSessions({ target: context.target, limit: 10 });
       if (sessions.length === 0) return `No recent sessions found for target ${context.target.id}.`;
 
-      return sessions.map((session) => formatSessionLine(session, context.binding?.opencodeSessionId)).join("\n");
+      return [`🧵 Recent sessions for ${formatTarget(context.target)}:`, ...sessions.map((session) => formatSessionLine(session, context.binding?.opencodeSessionId))].join("\n");
     } catch (error) {
       return `Unable to list sessions: ${formatError(error)}`;
     }
@@ -291,7 +291,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
 
     if (profiles.length === 0) return "No profiles are configured.";
 
-    return ["Gateway profiles:", ...profiles.map((profile) => formatProfileLine(profile, currentProfileId))].join("\n");
+    return ["👤 Gateway profiles:", ...profiles.map((profile) => formatProfileLine(profile, currentProfileId))].join("\n");
   }
 
   function currentProfileText(message: InboundMessage): string {
@@ -364,7 +364,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       const current = resolveEffectiveAgentValue(context.binding, context.profile, context.target).value;
 
       return [
-        `OpenCode agents for ${formatTarget(context.target)}:`,
+        `🤖 OpenCode agents for ${formatTarget(context.target)}:`,
         ...agents.map((agent) => formatAgentLine(agent, current)),
       ].join("\n");
     } catch (error) {
@@ -384,7 +384,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       const current = resolveEffectiveModelValue(context.binding, context.profile, context.target).value;
 
       return [
-        `OpenCode models for ${formatTarget(context.target)}:`,
+        `🧠 OpenCode models for ${formatTarget(context.target)}:`,
         ...models.map((model) => formatModelLine(model, current)),
       ].join("\n");
     } catch (error) {

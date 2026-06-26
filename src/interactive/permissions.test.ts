@@ -178,7 +178,7 @@ test("permission action resolution falls back to sending when editing fails", as
       {
         kind: "status",
         format: "markdown",
-        text: `Permission ${harness.permission.id} approved once by Tiago.`,
+        text: `✅ Permission ${harness.permission.id} approved once by Tiago.`,
       },
     ]);
     expect(harness.repositories.pendingPermissions.getById(harness.permission.id)?.status).toBe("approved");

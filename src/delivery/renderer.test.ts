@@ -64,9 +64,9 @@ test("progress renderer edits one progress message when editing is available", a
   await renderer.handle({ type: "tool_end", id: "tool-1", name: "bash", ok: true, summary: "Passed" });
   await renderer.finalize();
 
-  expect(harness.sent.map((entry) => entry.message.text)).toEqual(["Tool bash started: Run tests"]);
+  expect(harness.sent.map((entry) => entry.message.text)).toEqual(["🛠️ Tool bash started: Run tests"]);
   expect(harness.edited.map((entry) => entry.message.text)).toEqual([
-    "Tool bash started: Run tests\nTool bash completed: Passed",
+    "🛠️ Tool bash started: Run tests\n✅ Tool bash completed: Passed",
   ]);
 });
 
@@ -80,8 +80,8 @@ test("progress renderer falls back to sparse progress sends without editing", as
   await renderer.finalize();
 
   expect(harness.sent.map((entry) => entry.message.text)).toEqual([
-    "Tool bash started: Run tests",
-    "Tool bash failed",
+    "🛠️ Tool bash started: Run tests",
+    "❌ Tool bash failed",
   ]);
 });
 
@@ -94,7 +94,7 @@ test("progress renderer flushes delayed progress when finalized quickly", async 
   await renderer.finalize();
 
   expect(harness.sent.map((entry) => entry.message.text)).toEqual([
-    "Tool bash started: Run tests\nTool bash completed: Passed",
+    "🛠️ Tool bash started: Run tests\n✅ Tool bash completed: Passed",
   ]);
 });
 
@@ -120,8 +120,8 @@ test("progress renderer only shows tool lifecycle events in tools verbosity", as
   await renderer.finalize();
 
   expect(harness.sent.map((entry) => entry.message.text)).toEqual([
-    "Tool bash started: Run tests",
-    "Tool bash completed: Passed",
+    "🛠️ Tool bash started: Run tests",
+    "✅ Tool bash completed: Passed",
   ]);
 });
 
@@ -136,9 +136,9 @@ test("progress renderer includes subagent updates in tools verbosity", async () 
   await renderer.finalize();
 
   expect(harness.sent.map((entry) => entry.message.text)).toEqual([
-    "Subagent general started: Inspect bug",
-    "Subagent grep updated: Searching files",
-    "Subagent general completed: Inspect bug",
+    "🤖 Subagent general started: Inspect bug",
+    "🤖 Subagent grep updated: Searching files",
+    "✅ Subagent general completed: Inspect bug",
   ]);
 });
 
@@ -161,12 +161,12 @@ test("progress renderer includes skill and todo progress in tools verbosity", as
   await renderer.finalize();
 
   expect(harness.edited.at(-1)?.message.text).toBe([
-    "Skill customize-opencode started",
-    "Todos:",
-    "[~] Implement runtime events (high)",
-    "[ ] Add tests (medium)",
-    "[x] Research (low)",
-    "Skill customize-opencode loaded",
+    "🧩 Skill customize-opencode started",
+    "📋 Todos:",
+    "🔄 Implement runtime events (high)",
+    "⬜ Add tests (medium)",
+    "✅ Research (low)",
+    "✅ Skill customize-opencode loaded",
   ].join("\n"));
 });
 
@@ -180,7 +180,7 @@ test("progress renderer includes verbose status and tool updates", async () => {
   await renderer.finalize();
 
   expect(harness.edited.at(-1)?.message.text).toBe(
-    "Status: running\nTool bash (tool-1) updated: Still running",
+    "🏃 Status: running\n🛠️ Tool bash (tool-1) updated: Still running",
   );
 });
 
@@ -203,15 +203,15 @@ test("progress renderer shows verbose diagnostic events and suppresses deltas", 
   await renderer.finalize();
 
   expect(harness.edited.at(-1)?.message.text).toBe([
-    "Status: running",
-    "Tool bash (tool-1) started: Run tests",
-    "Tool bash (tool-1) updated: Still running",
-    "Subagent todos:",
-    "[~] Inspect files (high)",
-    "Retry: attempt 1",
-    "Permission requested (permission-1): Run bash",
-    "Question requested (question-1): Which branch?",
-    "Tool bash (tool-1) completed: Passed",
+    "🏃 Status: running",
+    "🛠️ Tool bash (tool-1) started: Run tests",
+    "🛠️ Tool bash (tool-1) updated: Still running",
+    "🤖 Subagent todos:",
+    "🔄 Inspect files (high)",
+    "🔎 Retry: attempt 1",
+    "🔐 Permission requested (permission-1): Run bash",
+    "❓ Question requested (question-1): Which branch?",
+    "✅ Tool bash (tool-1) completed: Passed",
   ].join("\n"));
 });
 
@@ -225,7 +225,7 @@ test("progress renderer includes verbose permission and question diagnostics", a
   await renderer.finalize();
 
   expect(harness.edited.at(-1)?.message.text).toBe(
-    "Permission requested (permission-1): Run bash\nQuestion requested (question-1): Which branch?",
+    "🔐 Permission requested (permission-1): Run bash\n❓ Question requested (question-1): Which branch?",
   );
 });
 
@@ -246,9 +246,9 @@ test("progress renderer falls back to sending sparse progress when editing fails
 
   expect(harness.edited).toEqual([]);
   expect(harness.sent.map((entry) => entry.message.text)).toEqual([
-    "Tool bash started: Run tests",
-    "Tool bash completed: Passed",
-    "Tool read started: Inspect file",
+    "🛠️ Tool bash started: Run tests",
+    "✅ Tool bash completed: Passed",
+    "🛠️ Tool read started: Inspect file",
   ]);
   expect(harness.errors.map((error) => error instanceof Error ? error.message : String(error))).toEqual(["edit failed"]);
 });
@@ -269,7 +269,7 @@ test("progress renderer does not cap accumulated edited progress lines", async (
   const finalProgress = harness.edited.at(-1)?.message.text ?? "";
   expect(finalProgress.split("\n")).toHaveLength(16);
   expect(finalProgress).toContain("Status: running");
-  expect(finalProgress).toContain("Tool bash (tool-15) updated: step 15");
+  expect(finalProgress).toContain("🛠️ Tool bash (tool-15) updated: step 15");
 });
 
 interface Harness {

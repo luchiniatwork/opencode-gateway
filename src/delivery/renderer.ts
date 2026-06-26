@@ -240,7 +240,7 @@ function toolProgressLine(event: RuntimeEvent): string | undefined {
 function verboseProgressLine(event: RuntimeEvent): string | undefined {
   switch (event.type) {
     case "status":
-      return `Status: ${event.status}`;
+      return `${statusIcon(event.status)} Status: ${event.status}`;
     case "tool_start":
       return toolLifecycleLine(event, "started", { includeId: true });
     case "tool_update":
@@ -250,11 +250,11 @@ function verboseProgressLine(event: RuntimeEvent): string | undefined {
     case "todo_update":
       return todoProgressLine(event, true);
     case "diagnostic":
-      return `${event.label}${summarySuffix(event.summary)}`;
+      return `🔎 ${event.label}${summarySuffix(event.summary)}`;
     case "permission_request":
-      return `Permission requested (${event.id}): ${event.summary}`;
+      return `🔐 Permission requested (${event.id}): ${event.summary}`;
     case "question_request":
-      return `Question requested (${event.id}): ${event.prompt}`;
+      return `❓ Question requested (${event.id}): ${event.prompt}`;
     case "text_delta":
     case "final":
     case "error":
@@ -277,7 +277,7 @@ function toolLifecycleLine(
   action: string,
   options: { includeId: boolean },
 ): string {
-  return `${toolEventLabel(event, options)} ${action}${summarySuffix(event.summary)}`;
+  return `${toolLifecycleIcon(event, action)} ${toolEventLabel(event, options)} ${action}${summarySuffix(event.summary)}`;
 }
 
 function toolEventLabel(event: { id: string; name: string; category?: "tool" | "skill" | "subagent" }, options: { includeId: boolean }): string {
@@ -294,8 +294,36 @@ function toolEndAction(event: Extract<RuntimeEvent, { type: "tool_end" }>): stri
   return "completed";
 }
 
+function toolLifecycleIcon(
+  event: Extract<RuntimeEvent, { type: "tool_start" | "tool_update" | "tool_end" }>,
+  action: string,
+): string {
+  if (action === "failed") return "❌";
+  if (action === "completed" || action === "loaded") return "✅";
+  if (event.category === "subagent") return "🤖";
+  if (event.category === "skill") return "🧩";
+  return "🛠️";
+}
+
+function statusIcon(status: string): string {
+  switch (status) {
+    case "queued":
+      return "📥";
+    case "running":
+      return "🏃";
+    case "idle":
+      return "✅";
+    case "aborted":
+      return "⏹️";
+    case "error":
+      return "❌";
+    default:
+      return "ℹ️";
+  }
+}
+
 function todoProgressLine(event: Extract<RuntimeEvent, { type: "todo_update" }>, verbose: boolean): string {
-  const title = event.source === "subagent" ? "Subagent todos" : "Todos";
+  const title = event.source === "subagent" ? "🤖 Subagent todos" : "📋 Todos";
   if (event.todos.length === 0) return `${title}: none`;
 
   const limit = verbose ? event.todos.length : 5;
@@ -317,14 +345,14 @@ function todoLine(todo: { content: string; status: string; priority?: string }):
 function todoStatusMarker(status: string): string {
   switch (status) {
     case "completed":
-      return "[x]";
+      return "✅";
     case "in_progress":
-      return "[~]";
+      return "🔄";
     case "cancelled":
-      return "[-]";
+      return "⏹️";
     case "pending":
-      return "[ ]";
+      return "⬜";
     default:
-      return "[?]";
+      return "❔";
   }
 }

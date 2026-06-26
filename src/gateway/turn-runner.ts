@@ -983,7 +983,7 @@ function expiredPermissionMessage(permission: PendingPermissionRecord, reason: s
   return {
     kind: "status",
     format: "markdown",
-    text: `Permission request ${permission.id} expired because ${reason}.`,
+    text: `⌛ Permission request ${permission.id} expired because ${reason}.`,
   };
 }
 

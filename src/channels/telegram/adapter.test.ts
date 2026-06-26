@@ -97,20 +97,23 @@ test("emits configured group messages when bot is mentioned", async () => {
   });
 });
 
-test("send uses plain Telegram text without parse mode", async () => {
+test("send renders markdown messages with Telegram HTML parse mode", async () => {
   const fakeBot = new FakeTelegramBot();
   const receipt = await sendTelegramMessage(
     fakeBot,
     outboundTarget(),
-    { kind: "final", format: "markdown", text: "**done**" },
+    { kind: "final", format: "markdown", text: "**done** and `safe`" },
     () => new Date("2026-01-01T00:00:00.000Z"),
   );
 
   expect(fakeBot.sentMessages).toEqual([
     {
       chatId: "123",
-      text: "**done**",
-      options: undefined,
+      text: "<b>done</b> and <code>safe</code>",
+      options: {
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+      },
     },
   ]);
   expect(receipt).toMatchObject({
@@ -120,6 +123,33 @@ test("send uses plain Telegram text without parse mode", async () => {
     platformMessageId: "1",
     timestamp: "2026-01-01T00:00:00.000Z",
   });
+});
+
+test("send keeps plain messages unformatted", async () => {
+  const fakeBot = new FakeTelegramBot();
+
+  await sendTelegramMessage(fakeBot, outboundTarget(), { kind: "status", format: "plain", text: "**not bold**" });
+
+  expect(fakeBot.sentMessages).toEqual([
+    {
+      chatId: "123",
+      text: "**not bold**",
+      options: undefined,
+    },
+  ]);
+});
+
+test("send preserves markdown code fences as Telegram code blocks", async () => {
+  const fakeBot = new FakeTelegramBot();
+
+  await sendTelegramMessage(fakeBot, outboundTarget(), {
+    kind: "final",
+    format: "markdown",
+    text: "Run this:\n```sh\nbun test\n```",
+  });
+
+  expect(fakeBot.sentMessages[0]?.text).toBe('Run this:\n<pre><code class="language-sh">bun test</code></pre>');
+  expect(fakeBot.sentMessages[0]?.options?.parse_mode).toBe("HTML");
 });
 
 test("send splits long Telegram messages", async () => {
@@ -241,6 +271,24 @@ test("edit updates a Telegram message and inline keyboard", async () => {
     },
   ]);
   expect(editedReceipt).toMatchObject({ platformMessageId: "1", timestamp: "2026-01-01T00:00:00.000Z" });
+});
+
+test("edit renders markdown with Telegram HTML parse mode", async () => {
+  const fakeBot = new FakeTelegramBot();
+  const receipt = await sendTelegramMessage(fakeBot, outboundTarget(), { kind: "progress", text: "Working" });
+
+  await editTelegramMessage(fakeBot, receipt, { kind: "progress", format: "markdown", text: "**Done**" });
+
+  expect(fakeBot.editedMessages[0]).toEqual({
+    chatId: "123",
+    messageId: 1,
+    text: "<b>Done</b>",
+    options: {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: { inline_keyboard: [] },
+    },
+  });
 });
 
 test("edit clears Telegram inline keyboard when no actions are present", async () => {

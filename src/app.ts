@@ -722,7 +722,7 @@ function turnStartMessages(result: StartTurnResult): OutboundMessage[] {
         {
           kind: "status",
           format: "plain",
-          text: `Queued behind active run ${result.run.id}. Queue size: ${result.queueSize}.`,
+          text: `📥 Queued behind active run ${result.run.id}. Queue size: ${result.queueSize}.`,
         },
       ];
     case "busy": {
@@ -746,7 +746,7 @@ function turnStartMessages(result: StartTurnResult): OutboundMessage[] {
         {
           kind: "status",
           format: "plain",
-          text: `${sessionText} ${modeText} Use /stop to abort the active run.`,
+          text: `⏳ ${sessionText} ${modeText} Use /stop to abort the active run.`,
         },
       ];
     }
