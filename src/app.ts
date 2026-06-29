@@ -45,6 +45,9 @@ import {
 } from "./observability/logging.ts";
 import { OpenCodeRuntime } from "./opencode/client.ts";
 import type { AgentRuntime } from "./opencode/types.ts";
+import { TargetResolvingRuntime } from "./targets/resolving-runtime.ts";
+import { createTargetSupervisor } from "./targets/supervisor.ts";
+import type { TargetSupervisor } from "./targets/types.ts";
 
 const TYPING_KEEPALIVE_MS = 4_000;
 
@@ -75,6 +78,7 @@ export interface GatewayAppOptions {
   logger?: (entry: GatewayLogEntry) => void;
   now?: () => Date;
   runtime?: AgentRuntime;
+  targetSupervisor?: TargetSupervisor;
   channels?: GatewayChannelRegistration<any>[];
   createTelegramAdapter?: () => ChannelAdapter<TelegramChannelConfig>;
   turnRunTimeoutMs?: number;
@@ -94,6 +98,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
   let turnRunner: TurnRunner | undefined;
   let permissionService: PermissionInteractionService | undefined;
   let inboundDebouncer: InboundMessageDebouncer<DebounceContext> | undefined;
+  let targetSupervisor: TargetSupervisor | undefined;
   let diagnosticRepositories: {
     runs: ReturnType<typeof createRunRepository>;
     pendingPermissions: ReturnType<typeof createPendingPermissionRepository>;
@@ -138,10 +143,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       let openedDatabase: GatewayDatabase | undefined;
 
       if (options.config) {
-        validatePhase1RuntimeTargets(options.config);
-        const runtime = options.runtime ?? new OpenCodeRuntime();
-
-        await validateOpenCodeTargetsReachable(options.config, runtime);
+        const baseRuntime = options.runtime ?? new OpenCodeRuntime();
 
         openedDatabase = await openGatewayDatabase(options.config.gateway.databasePath);
 
@@ -174,6 +176,15 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
             });
           }
 
+          targetSupervisor = options.targetSupervisor ?? createTargetSupervisor({
+            targets: options.config.opencode.targets,
+            runtime: baseRuntime,
+            now,
+            log,
+          });
+          await targetSupervisor.start();
+
+          const runtime = new TargetResolvingRuntime(targetSupervisor, baseRuntime);
           const resolver = createDispatchResolver({ config: options.config, repositories, runtime });
           diagnosticRepositories = {
             runs: repositories.runs,
@@ -369,6 +380,8 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
           diagnosticRepositories = undefined;
           await stopStartedChannels();
           stopHealthServer();
+          await targetSupervisor?.stop();
+          targetSupervisor = undefined;
           abortController = undefined;
           database = undefined;
           openedDatabase.close();
@@ -394,6 +407,8 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       abortController = undefined;
       await stopStartedChannels();
       stopHealthServer();
+      await targetSupervisor?.stop();
+      targetSupervisor = undefined;
       database?.close();
       database = undefined;
       log("info", "opencode-gateway stopped");
@@ -584,6 +599,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
       config: options.config,
       started,
       channelStatuses: Object.fromEntries(channelStatuses),
+      targetHealth: targetSupervisor?.health(),
       runtime: runtimeHealthSnapshot(),
     });
   }
@@ -679,38 +695,6 @@ function configuredChannels(
   }
 
   return channels;
-}
-
-function validatePhase1RuntimeTargets(config: GatewayConfig): void {
-  const targetsById = new Map(config.opencode.targets.map((target) => [target.id, target]));
-  const profileTargetIds = new Set(config.profiles.entries.map((profile) => profile.defaultTargetId));
-  profileTargetIds.add(config.defaults.target);
-
-  const unsupportedTargets = [...profileTargetIds]
-    .map((targetId) => targetsById.get(targetId))
-    .filter((target): target is NonNullable<typeof target> => Boolean(target && target.mode !== "attach"));
-
-  if (unsupportedTargets.length === 0) return;
-
-  const labels = unsupportedTargets.map((target) => `${target.id} (${target.mode})`).join(", ");
-
-  throw new Error(`Phase 1 only supports attach-mode OpenCode targets for profile routing: ${labels}`);
-}
-
-async function validateOpenCodeTargetsReachable(config: GatewayConfig, runtime: AgentRuntime): Promise<void> {
-  for (const target of config.opencode.targets) {
-    if (target.mode !== "attach") continue;
-
-    try {
-      await runtime.listAgents({ target });
-    } catch (error) {
-      const server = target.serverUrl ?? "unknown server URL";
-
-      throw new Error(
-        `OpenCode target ${target.id} is unavailable at ${server}. Start OpenCode with \`opencode serve\` before starting the gateway. ${formatError(error)}`,
-      );
-    }
-  }
 }
 
 function turnStartMessages(result: StartTurnResult): OutboundMessage[] {

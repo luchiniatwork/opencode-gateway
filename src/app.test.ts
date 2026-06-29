@@ -104,7 +104,7 @@ test("gateway app handles commands before runtime dispatch", async () => {
   }
 });
 
-test("gateway app fails fast when profile routing points at a managed target", async () => {
+test("gateway app starts when profile routing points at an unresolved managed target", async () => {
   const config = testConfig(":memory:");
   const target = config.opencode.targets[0];
 
@@ -123,23 +123,20 @@ test("gateway app fails fast when profile routing points at a managed target", a
     now: fixedNow,
   });
 
-  let error: unknown;
-
   try {
     await app.start();
-  } catch (caught) {
-    error = caught;
+
+    expect(app.status.started).toBe(true);
+    expect(app.health().opencodeTargets.default).toMatchObject({
+      mode: "managed",
+      status: "stopped",
+    });
   } finally {
     await app.stop();
   }
-
-  expect(error).toBeInstanceOf(Error);
-  expect(error instanceof Error ? error.message : "").toContain(
-    "Phase 1 only supports attach-mode OpenCode targets for profile routing: default (managed)",
-  );
 });
 
-test("gateway app fails fast when OpenCode target is unavailable", async () => {
+test("gateway app starts when an OpenCode target is unavailable", async () => {
   const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
   const channel = new FakeChannel();
   const runtime = new FakeRuntime();
@@ -152,23 +149,20 @@ test("gateway app fails fast when OpenCode target is unavailable", async () => {
     now: fixedNow,
   });
 
-  let error: unknown;
-
   try {
     await app.start();
-  } catch (caught) {
-    error = caught;
+
+    expect(channel.started).toBe(true);
+    expect(app.status.databaseConnected).toBe(true);
+    expect(app.health().opencodeTargets.default).toMatchObject({
+      mode: "attach",
+      status: "unhealthy",
+      lastError: "Unable to connect",
+    });
   } finally {
     await app.stop();
     await rm(dir, { recursive: true, force: true });
   }
-
-  expect(error).toBeInstanceOf(Error);
-  expect(error instanceof Error ? error.message : "").toContain(
-    "OpenCode target default is unavailable at http://127.0.0.1:4096. Start OpenCode with `opencode serve` before starting the gateway. Unable to connect",
-  );
-  expect(channel.started).toBe(false);
-  expect(app.status.databaseConnected).toBe(false);
 });
 
 test("gateway app dispatches non-command messages to OpenCode and sends final response", async () => {
@@ -1385,7 +1379,17 @@ test("gateway app serves health JSON", async () => {
       version: "0.1.0",
       gateway: "healthy",
       channels: { "telegram:default": "running" },
-      opencodeTargets: { default: "configured" },
+      opencodeTargets: {
+        default: {
+          id: "default",
+          name: "Default workspace",
+          mode: "attach",
+          status: "healthy",
+          serverUrl: "http://127.0.0.1:4096",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          lastProbeAt: "2026-01-01T00:00:00.000Z",
+        },
+      },
       profiles: { default: "cto", active: ["cto"] },
       runtime: {
         activeRunCount: 0,

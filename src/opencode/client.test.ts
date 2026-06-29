@@ -1883,7 +1883,7 @@ test("lists sessions sorted by updated time and applies limit", async () => {
   expect(sdk.calls.list).toEqual([{ query: { directory: "/work/repo" } }]);
 });
 
-test("rejects non-attach targets", async () => {
+test("rejects targets without an effective server URL", async () => {
   const sdk = createFakeSdkClient();
   const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
   const target: RuntimeTarget = {
@@ -1894,7 +1894,25 @@ test("rejects non-attach targets", async () => {
   };
 
   await expect(runtime.listSessions({ target })).rejects.toThrow(OpenCodeRuntimeError);
+  await expect(runtime.listSessions({ target })).rejects.toThrow("missing an effective serverUrl");
   expect(sdk.calls.list).toEqual([]);
+});
+
+test("accepts resolved managed targets with an effective server URL", async () => {
+  const sdk = createFakeSdkClient({ sessions: [{ id: "managed-session", title: "Managed" }] });
+  const runtime = new OpenCodeRuntime({ createClient: () => sdk.client });
+  const target: RuntimeTarget = {
+    id: "managed",
+    name: "Managed",
+    mode: "managed",
+    serverUrl: "http://127.0.0.1:4097",
+    workdir: "/work/repo",
+  };
+
+  const sessions = await runtime.listSessions({ target });
+
+  expect(sessions.map((session) => session.targetId)).toEqual(["managed"]);
+  expect(sdk.calls.list).toEqual([{ query: { directory: "/work/repo" } }]);
 });
 
 test("wraps SDK error responses with an actionable message", async () => {

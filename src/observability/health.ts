@@ -1,15 +1,18 @@
 import type { GatewayConfig } from "../config/schema.ts";
+import type { TargetHealthSnapshot } from "../targets/types.ts";
 
 export type GatewayHealthStatus = "healthy" | "unhealthy" | "unknown" | "configured" | (string & {});
 
 export type ChannelHealthStatus = "configured" | "running" | "stopped" | "error" | (string & {});
+
+export type OpenCodeTargetHealth = GatewayHealthStatus | TargetHealthSnapshot;
 
 export interface GatewayHealthSnapshot {
   ok: boolean;
   version: string;
   gateway: GatewayHealthStatus;
   channels: Record<string, ChannelHealthStatus>;
-  opencodeTargets: Record<string, GatewayHealthStatus>;
+  opencodeTargets: Record<string, OpenCodeTargetHealth>;
   profiles: {
     default: string;
     active: string[];
@@ -48,6 +51,7 @@ export interface CreateHealthSnapshotInput {
   config?: GatewayConfig;
   started: boolean;
   channelStatuses?: Record<string, ChannelHealthStatus>;
+  targetHealth?: Record<string, TargetHealthSnapshot>;
   runtime?: GatewayRuntimeHealthSnapshot;
   version?: string;
 }
@@ -63,13 +67,13 @@ export function createHealthSnapshot(input: CreateHealthSnapshotInput): GatewayH
     version: input.version ?? gatewayVersion,
     gateway,
     channels: channelStatuses,
-    opencodeTargets: targetHealth(input.config),
+    opencodeTargets: input.targetHealth ?? targetHealth(input.config),
     profiles: profileHealth(input.config),
     runtime: input.runtime,
   };
 }
 
-function targetHealth(config: GatewayConfig | undefined): Record<string, GatewayHealthStatus> {
+function targetHealth(config: GatewayConfig | undefined): Record<string, OpenCodeTargetHealth> {
   if (!config) return {};
 
   return Object.fromEntries(config.opencode.targets.map((target) => [target.id, "configured"]));

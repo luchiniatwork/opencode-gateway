@@ -1854,7 +1854,7 @@ export class OpenCodeRuntime implements AgentRuntime {
   }
 
   private getClient(target: RuntimeTarget): OpenCodeSdkClient {
-    validateAttachTarget(target);
+    validateEffectiveTarget(target);
 
     const key = `${target.id}:${target.serverUrl ?? ""}`;
     const cached = this.clients.get(key);
@@ -1955,15 +1955,11 @@ function finalAssistantText(message: SdkMessageEntry): string {
   return extractAssistantText(message.parts ?? []);
 }
 
-function validateAttachTarget(target: RuntimeTarget): void {
-  if (target.mode !== "attach") {
-    throw new OpenCodeRuntimeError(
-      `OpenCode target ${target.id} uses mode ${target.mode}; Phase 1 only supports attach mode`,
-    );
-  }
-
+function validateEffectiveTarget(target: RuntimeTarget): void {
   if (!target.serverUrl) {
-    throw new OpenCodeRuntimeError(`OpenCode target ${target.id} is missing serverUrl`);
+    throw new OpenCodeRuntimeError(
+      `OpenCode target ${target.id} is missing an effective serverUrl; resolve the target before runtime calls`,
+    );
   }
 }
 

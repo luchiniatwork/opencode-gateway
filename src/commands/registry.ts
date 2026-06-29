@@ -7,12 +7,14 @@ import type { ActiveTurnDiagnostics, TurnRunner } from "../gateway/turn-runner.t
 import type { PermissionDecision, PermissionInteractionService } from "../interactive/permissions.ts";
 import type { OutboundMessage } from "../messages/types.ts";
 import type { AgentRuntime, RuntimeAgent, RuntimeModel, RuntimeSession } from "../opencode/types.ts";
+import type { TargetHealthSnapshot } from "../targets/types.ts";
 
 export type GatewayHealthStatus = "healthy" | "unhealthy" | "unknown" | "configured" | (string & {});
+export type CommandTargetHealth = GatewayHealthStatus | TargetHealthSnapshot;
 
 export interface CommandHealthSnapshot {
   gateway?: GatewayHealthStatus;
-  targets?: Record<string, GatewayHealthStatus>;
+  targets?: Record<string, CommandTargetHealth>;
 }
 
 export interface CommandRouterOptions {
@@ -145,7 +147,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
     const queueDiagnostics = binding ? turnRunner.getQueueDiagnostics(binding.id) : undefined;
     const pendingPermissions = activeRun ? options.pendingPermissions?.listPendingByRunId(activeRun.id) ?? [] : [];
     const health = options.getHealth?.();
-    const targetHealth = target ? (health?.targets?.[target.id] ?? "configured") : "unknown";
+    const targetHealth = target ? formatTargetHealth(health?.targets?.[target.id] ?? "configured") : "unknown";
 
     return [
       "🟢 Gateway status:",
@@ -648,6 +650,12 @@ function formatProfile(profile: ProfileRecord | undefined): string {
 function formatTarget(target: TargetRecord | undefined): string {
   if (!target) return "unknown";
   return `${target.name} (${target.id})`;
+}
+
+function formatTargetHealth(health: CommandTargetHealth): string {
+  if (typeof health === "string") return health;
+
+  return health.lastError ? `${health.status}: ${health.lastError}` : health.status;
 }
 
 function formatTargetSource(binding: ConversationBindingRecord | undefined): string {
