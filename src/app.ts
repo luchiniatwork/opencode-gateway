@@ -237,6 +237,8 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
 
               return {
                 gateway: snapshot.gateway,
+                degraded: snapshot.degraded,
+                degradedReasons: snapshot.degradedReasons,
                 targets: snapshot.opencodeTargets,
               };
             },
@@ -610,6 +612,7 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
     const activeRuns = diagnosticRepositories.runs.listActive().map((run) => ({
       id: run.id,
       bindingId: run.bindingId,
+      targetId: run.targetId,
       sessionId: run.opencodeSessionId,
       opencodeMessageId: run.opencodeMessageId,
       startedAt: run.startedAt,

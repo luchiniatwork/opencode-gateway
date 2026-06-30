@@ -14,6 +14,8 @@ export type CommandTargetHealth = GatewayHealthStatus | TargetHealthSnapshot;
 
 export interface CommandHealthSnapshot {
   gateway?: GatewayHealthStatus;
+  degraded?: boolean;
+  degradedReasons?: string[];
   targets?: Record<string, CommandTargetHealth>;
 }
 
@@ -148,6 +150,10 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
     const pendingPermissions = activeRun ? options.pendingPermissions?.listPendingByRunId(activeRun.id) ?? [] : [];
     const health = options.getHealth?.();
     const targetHealth = target ? formatTargetHealth(health?.targets?.[target.id] ?? "configured") : "unknown";
+    const profileDefaultTargetHealth = profileDefaultTarget
+      ? formatTargetHealth(health?.targets?.[profileDefaultTarget.id] ?? "configured")
+      : undefined;
+    const activeRunTarget = activeRun ? getTarget(activeRun.targetId ?? binding?.targetId) : undefined;
 
     return [
       "🟢 Gateway status:",
@@ -157,16 +163,21 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       `Profile: ${formatProfile(profile)}`,
       `Target: ${formatTarget(target)} (${targetHealth})`,
       `Target source: ${formatTargetSource(binding)}`,
-      `Profile default target: ${formatTarget(profileDefaultTarget)}`,
+      `Profile default target: ${formatTarget(profileDefaultTarget)}${profileDefaultTargetHealth ? ` (${profileDefaultTargetHealth})` : ""}`,
       `Session: ${binding?.opencodeSessionId ?? "none"}${binding?.sessionName ? ` (${binding.sessionName})` : ""}`,
       `Agent: ${formatEffectiveValue(resolveEffectiveAgentValue(binding, profile, target))}`,
       `Model: ${formatEffectiveValue(resolveEffectiveModelValue(binding, profile, target))}`,
       `Verbosity: ${formatEffectiveVerbosity(binding, profile, config.defaults.verbosity)}`,
       `Active run: ${formatRun(activeRun, activeDiagnostics)}`,
+      activeRunTarget && target && activeRunTarget.id !== target.id
+        ? `Active run target: ${formatTarget(activeRunTarget)}`
+        : undefined,
       `Queue: ${formatQueue(queueDiagnostics)}`,
       `Pending permissions: ${formatPendingPermissions(pendingPermissions)}`,
+      `Command policy: ${formatCommandPolicy(profile)}`,
       `Gateway health: ${health?.gateway ?? "unknown"}`,
-    ].join("\n");
+      `Gateway degraded: ${formatGatewayDegraded(health)}`,
+    ].filter(isNonEmptyString).join("\n");
   }
 
   async function resetText(message: InboundMessage, commandName: string): Promise<string> {
@@ -661,6 +672,19 @@ function formatTargetHealth(health: CommandTargetHealth): string {
 function formatTargetSource(binding: ConversationBindingRecord | undefined): string {
   if (binding?.targetSource === "explicit_bind") return "explicit bind";
   return "profile default";
+}
+
+function formatCommandPolicy(profile: ProfileRecord | undefined): string {
+  return profile?.commandPolicyId ? `profile:${profile.commandPolicyId}` : "default";
+}
+
+function formatGatewayDegraded(health: CommandHealthSnapshot | undefined): string {
+  if (!health || health.degraded === undefined) return "unknown";
+  if (!health.degraded) return "false";
+
+  return health.degradedReasons && health.degradedReasons.length > 0
+    ? `true (${health.degradedReasons.join("; ")})`
+    : "true";
 }
 
 function bindingNoopText(result: Extract<BindingOperationResult, { status: "noop" }>): string {

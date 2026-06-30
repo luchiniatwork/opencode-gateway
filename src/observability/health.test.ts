@@ -10,15 +10,26 @@ test("health snapshot reports configured targets and active profiles", () => {
     channelStatuses: { "telegram:default": "running" },
   });
 
-  expect(snapshot).toEqual({
-    ok: true,
-    version: "0.1.0",
-    gateway: "healthy",
-    channels: { "telegram:default": "running" },
-    opencodeTargets: { default: "configured" },
-    profiles: { default: "cto", active: ["cto"] },
+    expect(snapshot).toEqual({
+      ok: true,
+      degraded: false,
+      degradedReasons: [],
+      version: "0.1.0",
+      gateway: "healthy",
+      channels: { "telegram:default": "running" },
+      opencodeTargets: {
+        default: {
+          id: "default",
+          name: "Default workspace",
+          mode: "attach",
+          status: "configured",
+          serverUrl: "http://127.0.0.1:4096",
+          activeRunCount: 0,
+        },
+      },
+      profiles: { default: "cto", active: ["cto"] },
+    });
   });
-});
 
 test("health snapshot is not ok when a channel is in error", () => {
   const snapshot = createHealthSnapshot({
@@ -28,6 +39,68 @@ test("health snapshot is not ok when a channel is in error", () => {
   });
 
   expect(snapshot.ok).toBe(false);
+  expect(snapshot.degraded).toBe(true);
+  expect(snapshot.degradedReasons).toContain("gateway liveness check failed");
+  expect(snapshot.degradedReasons).toContain("channel telegram:default is in error");
+});
+
+test("health snapshot sanitizes target URLs and overlays active run counts", () => {
+  const snapshot = createHealthSnapshot({
+    config: testConfig(),
+    started: true,
+    targetHealth: {
+      default: {
+        id: "default",
+        name: "Default workspace",
+        mode: "attach",
+        status: "healthy",
+        serverUrl: "http://user:secret@127.0.0.1:4096/path?token=secret#fragment",
+      },
+    },
+    runtime: {
+      activeRunCount: 1,
+      queuedTurnCount: 0,
+      queuedBindingCount: 0,
+      pendingPermissionCount: 0,
+      activeRuns: [
+        {
+          id: "run-1",
+          bindingId: "binding-1",
+          targetId: "default",
+          sessionId: "session-1",
+          startedAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      queuedTurns: [],
+      pendingPermissions: [],
+    },
+  });
+
+  expect(snapshot.opencodeTargets.default).toMatchObject({
+    status: "healthy",
+    serverUrl: "http://127.0.0.1:4096/path",
+    activeRunCount: 1,
+  });
+});
+
+test("health snapshot marks default profile target degradation without failing liveness", () => {
+  const snapshot = createHealthSnapshot({
+    config: testConfig(),
+    started: true,
+    targetHealth: {
+      default: {
+        id: "default",
+        name: "Default workspace",
+        mode: "attach",
+        status: "unhealthy",
+        lastError: "connection refused",
+      },
+    },
+  });
+
+  expect(snapshot.ok).toBe(true);
+  expect(snapshot.degraded).toBe(true);
+  expect(snapshot.degradedReasons).toEqual(["default profile target default is unhealthy: connection refused"]);
 });
 
 test("health snapshot includes runtime diagnostics when provided", () => {
@@ -43,6 +116,7 @@ test("health snapshot includes runtime diagnostics when provided", () => {
         {
           id: "run-1",
           bindingId: "binding-1",
+          targetId: "default",
           sessionId: "session-1",
           opencodeMessageId: "message-1",
           startedAt: "2026-01-01T00:00:00.000Z",
@@ -77,6 +151,7 @@ test("health snapshot includes runtime diagnostics when provided", () => {
       {
         id: "run-1",
         bindingId: "binding-1",
+        targetId: "default",
         sessionId: "session-1",
         opencodeMessageId: "message-1",
         startedAt: "2026-01-01T00:00:00.000Z",

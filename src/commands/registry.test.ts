@@ -31,7 +31,7 @@ import type {
   SendRuntimeMessageInput,
   StartRuntimeTurnInput,
 } from "../opencode/types.ts";
-import { createCommandRouter, type CommandRouter } from "./registry.ts";
+import { createCommandRouter, type CommandHealthSnapshot, type CommandRouter } from "./registry.ts";
 
 test("non-slash text is not handled as a command", async () => {
   const harness = await createHarness();
@@ -135,13 +135,46 @@ test("status reports context without creating a binding", async () => {
     expect(text).toContain("Profile: CTO (cto)");
     expect(text).toContain("Target: Default workspace (default) (healthy)");
     expect(text).toContain("Target source: profile default");
-    expect(text).toContain("Profile default target: Default workspace (default)");
+    expect(text).toContain("Profile default target: Default workspace (default) (healthy)");
     expect(text).toContain("Session: none");
     expect(text).toContain("Agent: cto-agent (profile default)");
     expect(text).toContain("Model: provider/cto-model (profile default)");
     expect(text).toContain("Verbosity: compact (profile default)");
+    expect(text).toContain("Command policy: default");
+    expect(text).toContain("Gateway degraded: false");
     expect(harness.runtime.calls.ensureSession).toEqual([]);
     expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("status reports target degradation details", async () => {
+  const harness = await createHarness({
+    health: {
+      gateway: "healthy",
+      degraded: true,
+      degradedReasons: ["default profile target default is unhealthy: connection refused"],
+      targets: {
+        default: {
+          id: "default",
+          name: "Default workspace",
+          mode: "attach",
+          status: "unhealthy",
+          lastError: "connection refused",
+        },
+        "ops-target": "healthy",
+      },
+    },
+  });
+
+  try {
+    const result = await harness.router.handle(inboundMessage({ text: "/status" }));
+    const text = responseText(result);
+
+    expect(text).toContain("Target: Default workspace (default) (unhealthy: connection refused)");
+    expect(text).toContain("Profile default target: Default workspace (default) (unhealthy: connection refused)");
+    expect(text).toContain("Gateway degraded: true (default profile target default is unhealthy: connection refused)");
   } finally {
     harness.database.close();
   }
@@ -156,6 +189,7 @@ test("status reports active run and pending permission diagnostics", async () =>
 
     const run = harness.repositories.runs.create({
       bindingId: bindingResult.resolution.binding.id,
+      targetId: "ops-target",
       opencodeSessionId: bindingResult.resolution.binding.opencodeSessionId,
       opencodeMessageId: "message-active",
     });
@@ -170,6 +204,7 @@ test("status reports active run and pending permission diagnostics", async () =>
     const text = responseText(result);
 
     expect(text).toContain(`Active run: ${run.id} (active) session=session-1 message=message-active`);
+    expect(text).toContain("Active run target: Ops workspace (ops-target)");
     expect(text).toContain("Pending permissions: 1 pending, 1 without action card");
   } finally {
     harness.database.close();
@@ -647,7 +682,7 @@ interface Harness {
   repositories: ReturnType<typeof createRepositories>;
 }
 
-async function createHarness(options: { accessRules?: AccessRuleSeed[] } = {}): Promise<Harness> {
+async function createHarness(options: { accessRules?: AccessRuleSeed[]; health?: CommandHealthSnapshot } = {}): Promise<Harness> {
   const database = await openGatewayDatabase(":memory:");
   const config = testConfig();
   const runtime = new FakeRuntime();
@@ -665,7 +700,12 @@ async function createHarness(options: { accessRules?: AccessRuleSeed[] } = {}): 
     runtime,
     turnRunner,
     pendingPermissions: repositories.pendingPermissions,
-    getHealth: () => ({ gateway: "healthy", targets: { default: "healthy", "ops-target": "healthy" } }),
+    getHealth: () => options.health ?? {
+      gateway: "healthy",
+      degraded: false,
+      degradedReasons: [],
+      targets: { default: "healthy", "ops-target": "healthy" },
+    },
   });
 
   return { database, runtime, repositories, resolver, router };

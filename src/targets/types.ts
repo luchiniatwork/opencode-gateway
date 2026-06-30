@@ -21,6 +21,7 @@ export interface TargetHealthSnapshot {
   lastError?: string;
   restartCount?: number;
   pid?: number;
+  activeRunCount?: number;
 }
 
 export interface ManagedTargetController {

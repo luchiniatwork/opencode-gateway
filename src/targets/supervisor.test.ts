@@ -126,6 +126,55 @@ test("runtime failure marks target unhealthy", () => {
   });
 });
 
+test("runtime success after failure marks target healthy", () => {
+  const supervisor = createTargetSupervisor({ targets: [attachConfig], runtime: new FakeRuntime(), now: fixedNow });
+
+  supervisor.recordRuntimeFailure("default", new Error("prompt failed"));
+  supervisor.recordRuntimeSuccess("default");
+
+  expect(supervisor.health().default).toMatchObject({
+    status: "healthy",
+    lastError: undefined,
+  });
+});
+
+test("health returns immutable snapshots", () => {
+  const supervisor = createTargetSupervisor({ targets: [attachConfig], runtime: new FakeRuntime(), now: fixedNow });
+  const first = supervisor.health();
+
+  if (!first.default) throw new Error("expected default target health");
+  first.default.status = "error";
+
+  expect(supervisor.health().default).toMatchObject({ status: "configured" });
+});
+
+test("target health transition logs are structured and URL-safe", () => {
+  const entries: Array<{ level: string; message: string; context: Record<string, unknown> | undefined }> = [];
+  const supervisor = createTargetSupervisor({
+    targets: [{ ...attachConfig, serverUrl: "http://user:secret@127.0.0.1:4096/path?token=secret#fragment" }],
+    runtime: new FakeRuntime(),
+    now: fixedNow,
+    log: (level, message, context) => entries.push({ level, message, context }),
+  });
+
+  supervisor.recordRuntimeFailure("default", new Error("prompt failed"));
+
+  expect(entries).toContainEqual({
+    level: "warn",
+    message: "OpenCode target health changed",
+    context: expect.objectContaining({
+      component: "targets",
+      source: "runtime",
+      targetId: "default",
+      targetMode: "attach",
+      previousStatus: "configured",
+      status: "unhealthy",
+      serverUrl: "http://127.0.0.1:4096/path",
+      error: "prompt failed",
+    }),
+  });
+});
+
 const attachConfig: GatewayTargetConfig = {
   id: "default",
   name: "Default workspace",

@@ -159,6 +159,8 @@ test("gateway app starts when an OpenCode target is unavailable", async () => {
       status: "unhealthy",
       lastError: "Unable to connect",
     });
+    expect(app.health().degraded).toBe(true);
+    expect(app.health().degradedReasons).toContain("default profile target default is unhealthy: Unable to connect");
   } finally {
     await app.stop();
     await rm(dir, { recursive: true, force: true });
@@ -750,10 +752,11 @@ test("gateway app drains multiple queued messages in arrival order", async () =>
     logger: () => undefined,
     now: fixedNow,
   });
+  let emit: Promise<void> | undefined;
 
   try {
     await app.start();
-    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    emit = channel.emit(inboundMessage({ id: "message-1", text: "first" }));
     await runtime.firstSendStarted;
 
     await channel.emit(inboundMessage({ id: "message-2", text: "second" }));
@@ -773,6 +776,7 @@ test("gateway app drains multiple queued messages in arrival order", async () =>
     ]);
   } finally {
     runtime.finishFirstSend();
+    await emit?.catch(() => undefined);
     await app.stop();
     await rm(dir, { recursive: true, force: true });
   }
@@ -1376,6 +1380,8 @@ test("gateway app serves health JSON", async () => {
     expect(response.status).toBe(200);
     expect(body).toMatchObject({
       ok: true,
+      degraded: false,
+      degradedReasons: [],
       version: "0.1.0",
       gateway: "healthy",
       channels: { "telegram:default": "running" },
@@ -1388,6 +1394,7 @@ test("gateway app serves health JSON", async () => {
           serverUrl: "http://127.0.0.1:4096",
           startedAt: "2026-01-01T00:00:00.000Z",
           lastProbeAt: "2026-01-01T00:00:00.000Z",
+          activeRunCount: 0,
         },
       },
       profiles: { default: "cto", active: ["cto"] },
@@ -1405,6 +1412,42 @@ test("gateway app serves health JSON", async () => {
 
     expect(missing.status).toBe(404);
   } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway app health includes active run target counts", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new QueueRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ id: "message-1", text: "first" }));
+    await runtime.firstSendStarted;
+
+    const snapshot = app.health();
+
+    expect(snapshot.opencodeTargets.default).toMatchObject({
+      status: "healthy",
+      activeRunCount: 1,
+    });
+    expect(snapshot.runtime?.activeRuns).toEqual([
+      expect.objectContaining({
+        targetId: "default",
+        sessionId: "session-1",
+      }),
+    ]);
+  } finally {
+    runtime.finishFirstSend();
     await app.stop();
     await rm(dir, { recursive: true, force: true });
   }

@@ -1,5 +1,6 @@
 import type { GatewayTargetConfig } from "../config/schema.ts";
 import type { GatewayLogContext, GatewayLogLevel } from "../observability/logging.ts";
+import { sanitizeDiagnosticUrl } from "../observability/sanitize.ts";
 import type { AgentRuntime, RuntimeTarget } from "../opencode/types.ts";
 import { TargetUnavailableError } from "./errors.ts";
 import type { ManagedTargetController, TargetHealthSnapshot, TargetSupervisor } from "./types.ts";
@@ -170,7 +171,26 @@ export function createTargetSupervisor(options: TargetSupervisorOptions): Target
     const next = { ...current, ...patch };
 
     snapshots.set(targetId, next);
+    logHealthTransition(current, next);
     return { ...next };
+  }
+
+  function logHealthTransition(previous: TargetHealthSnapshot, next: TargetHealthSnapshot): void {
+    if (previous.status === next.status) return;
+
+    const level: GatewayLogLevel = next.status === "unhealthy" || next.status === "error" ? "warn" : "info";
+
+    log(level, "OpenCode target health changed", {
+      source: "runtime",
+      targetId: next.id,
+      targetMode: next.mode,
+      previousStatus: previous.status,
+      status: next.status,
+      serverUrl: sanitizeDiagnosticUrl(next.serverUrl),
+      pid: next.pid,
+      restartCount: next.restartCount,
+      error: next.lastError,
+    });
   }
 
   function existing(targetId: string): TargetHealthSnapshot | undefined {
