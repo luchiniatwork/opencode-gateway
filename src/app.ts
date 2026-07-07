@@ -185,7 +185,14 @@ export function createApp(options: GatewayAppOptions = {}): GatewayApp {
           await targetSupervisor.start();
 
           const runtime = new TargetResolvingRuntime(targetSupervisor, baseRuntime);
-          const resolver = createDispatchResolver({ config: options.config, repositories, runtime });
+          const resolver = createDispatchResolver({
+            config: options.config,
+            repositories,
+            runtime,
+            activity: {
+              getQueuedTurnCount: (bindingId) => turnRunner?.getQueueDiagnostics(bindingId)?.size ?? 0,
+            },
+          });
           diagnosticRepositories = {
             runs: repositories.runs,
             pendingPermissions: repositories.pendingPermissions,

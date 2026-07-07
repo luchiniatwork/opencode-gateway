@@ -704,6 +704,11 @@ function bindingBlockedText(result: Extract<BindingOperationResult, { status: "b
     return `Cannot change target binding while active run ${result.run.id} is running. Use /stop first.`;
   }
 
+  if (result.reason === "queued_turns") {
+    const noun = result.queueSize === 1 ? "turn is" : "turns are";
+    return `Cannot change target binding while ${result.queueSize} queued ${noun} pending. Wait for the queue to drain.`;
+  }
+
   return "Cannot change target binding right now.";
 }
 

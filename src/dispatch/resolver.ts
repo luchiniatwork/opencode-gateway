@@ -54,6 +54,7 @@ export type BindingOperationResult =
       session?: RuntimeSession;
     }
   | { status: "blocked"; reason: "active_run"; resolution: ResolvedDispatch; run: RunRecord }
+  | { status: "blocked"; reason: "queued_turns"; resolution: ResolvedDispatch; queueSize: number }
   | { status: "denied"; decision: Extract<AccessDecision, { allowed: false }> }
   | { status: "not_found"; resource: "profile" | "target"; id: string }
   | { status: "error"; error: string };
@@ -72,10 +73,15 @@ export interface DispatchResolverRepositories {
   runs: RunRepository;
 }
 
+export interface BindingActivityInspector {
+  getQueuedTurnCount(bindingId: string): number;
+}
+
 export interface DispatchResolverOptions {
   config: GatewayConfig;
   repositories: DispatchResolverRepositories;
   runtime: AgentRuntime;
+  activity?: BindingActivityInspector;
 }
 
 export interface DispatchResolver {
@@ -428,6 +434,11 @@ export function createDispatchResolver(options: DispatchResolverOptions): Dispat
 
       const activeRun = repositories.runs.getActiveByBindingId(existing.id);
       if (activeRun) return { status: "blocked", reason: "active_run", resolution, run: activeRun };
+
+      const queuedTurnCount = options.activity?.getQueuedTurnCount(existing.id) ?? 0;
+      if (queuedTurnCount > 0) {
+        return { status: "blocked", reason: "queued_turns", resolution, queueSize: queuedTurnCount };
+      }
 
       const profile = resolution.profile;
       const target = repositories.targets.getById(profile.defaultTargetId);

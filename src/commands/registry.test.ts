@@ -646,6 +646,26 @@ test("unbind command clears explicit target binding", async () => {
   }
 });
 
+test("unbind command explains queued target-binding blockage", async () => {
+  const harness = await createHarness({ queuedTurnCount: 1 });
+
+  try {
+    await harness.router.handle(inboundMessage({ text: "/bind ops-target" }));
+
+    const result = await harness.router.handle(inboundMessage({ text: "/unbind" }));
+
+    expect(responseText(result)).toBe(
+      "Cannot change target binding while 1 queued turn is pending. Wait for the queue to drain.",
+    );
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toMatchObject({
+      targetId: "ops-target",
+      targetSource: "explicit_bind",
+    });
+  } finally {
+    harness.database.close();
+  }
+});
+
 test("profile switch reports binding overrides cleared for the new target", async () => {
   const harness = await createHarness();
 
@@ -682,16 +702,31 @@ interface Harness {
   repositories: ReturnType<typeof createRepositories>;
 }
 
-async function createHarness(options: { accessRules?: AccessRuleSeed[]; health?: CommandHealthSnapshot } = {}): Promise<Harness> {
+async function createHarness(
+  options: {
+    accessRules?: AccessRuleSeed[];
+    health?: CommandHealthSnapshot;
+    queuedTurnCount?: number | ((bindingId: string) => number);
+  } = {},
+): Promise<Harness> {
   const database = await openGatewayDatabase(":memory:");
   const config = testConfig();
   const runtime = new FakeRuntime();
   const repositories = createRepositories(database);
+  const queuedTurnCount = options.queuedTurnCount;
+  const getQueuedTurnCount: (bindingId: string) => number = typeof queuedTurnCount === "function"
+    ? queuedTurnCount
+    : () => queuedTurnCount ?? 0;
 
   runMigrations(database.db, fixedNow);
   seedDatabaseFromConfig(database.db, testSeeds(options.accessRules), fixedNow);
 
-  const resolver = createDispatchResolver({ config, repositories, runtime });
+  const resolver = createDispatchResolver({
+    config,
+    repositories,
+    runtime,
+    activity: { getQueuedTurnCount },
+  });
   const turnRunner = createTurnRunner({ runtime, runs: repositories.runs });
   const router = createCommandRouter({
     config,

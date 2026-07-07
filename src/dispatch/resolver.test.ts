@@ -389,6 +389,27 @@ test("bindTarget no-ops when the conversation is already explicitly bound to the
   }
 });
 
+test("bindTarget pins the current profile default target without creating a new session", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.resolver.ensureBindingForMessage(inboundMessage());
+
+    const result = await harness.resolver.bindTarget(inboundMessage(), "default");
+
+    expect(result.status).toBe("rebound");
+    if (result.status !== "rebound") throw new Error("expected rebound");
+
+    expect(result.previousSessionId).toBe("session-1");
+    expect(result.session.id).toBe("session-1");
+    expect(result.resolution.binding.targetId).toBe("default");
+    expect(result.resolution.binding.targetSource).toBe("explicit_bind");
+    expect(harness.runtime.calls.ensureSession).toHaveLength(1);
+  } finally {
+    harness.database.close();
+  }
+});
+
 test("bindTarget clears binding overrides unavailable on the selected target", async () => {
   const harness = await createHarness();
 
@@ -476,8 +497,26 @@ test("unbindTarget refuses while an active run exists", async () => {
     const result = await harness.resolver.unbindTarget(inboundMessage());
 
     expect(result.status).toBe("blocked");
-    expect(result.status === "blocked" ? result.run.id : undefined).toBe(run.id);
+    expect(result.status === "blocked" && result.reason === "active_run" ? result.run.id : undefined).toBe(run.id);
     expect(harness.repositories.bindings.getByConversationKey(conversationKey)?.targetSource).toBe("explicit_bind");
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("unbindTarget refuses while queued turns exist", async () => {
+  const harness = await createHarness({ queuedTurnCount: 2 });
+
+  try {
+    await harness.resolver.bindTarget(inboundMessage(), "ops-target");
+
+    const result = await harness.resolver.unbindTarget(inboundMessage());
+
+    expect(result.status).toBe("blocked");
+    expect(result.status === "blocked" ? result.reason : undefined).toBe("queued_turns");
+    expect(result.status === "blocked" && result.reason === "queued_turns" ? result.queueSize : undefined).toBe(2);
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)?.targetSource).toBe("explicit_bind");
+    expect(harness.runtime.calls.ensureSession).toHaveLength(1);
   } finally {
     harness.database.close();
   }
@@ -513,11 +552,17 @@ interface Harness {
   repositories: ReturnType<typeof createRepositories>;
 }
 
-async function createHarness(options: { accessRules?: AccessRuleSeed[] } = {}): Promise<Harness> {
+async function createHarness(
+  options: { accessRules?: AccessRuleSeed[]; queuedTurnCount?: number | ((bindingId: string) => number) } = {},
+): Promise<Harness> {
   const database = await openGatewayDatabase(":memory:");
   const config = testConfig();
   const runtime = new FakeRuntime();
   const repositories = createRepositories(database);
+  const queuedTurnCount = options.queuedTurnCount;
+  const getQueuedTurnCount: (bindingId: string) => number = typeof queuedTurnCount === "function"
+    ? queuedTurnCount
+    : () => queuedTurnCount ?? 0;
 
   runMigrations(database.db, fixedNow);
   seedDatabaseFromConfig(database.db, testSeeds(options.accessRules), fixedNow);
@@ -526,7 +571,14 @@ async function createHarness(options: { accessRules?: AccessRuleSeed[] } = {}): 
     database,
     runtime,
     repositories,
-    resolver: createDispatchResolver({ config, repositories, runtime }),
+    resolver: createDispatchResolver({
+      config,
+      repositories,
+      runtime,
+      activity: {
+        getQueuedTurnCount,
+      },
+    }),
   };
 }
 
