@@ -1,5 +1,5 @@
 import type { InboundMessage } from "../channels/types.ts";
-import type { AccessRole, GatewayConfig } from "../config/schema.ts";
+import type { GatewayConfig } from "../config/schema.ts";
 import type { BindingOperationResult, DispatchResolver, DispatchResolverRepositories } from "../dispatch/resolver.ts";
 import type { PendingPermissionRepository } from "../db/repositories/pending-permissions.ts";
 import type { ConversationBindingRecord, ProfileRecord, RunRecord, TargetRecord } from "../db/types.ts";
@@ -7,6 +7,11 @@ import type { ActiveTurnDiagnostics, TurnRunner } from "../gateway/turn-runner.t
 import type { PermissionDecision, PermissionInteractionService } from "../interactive/permissions.ts";
 import type { OutboundMessage } from "../messages/types.ts";
 import type { AgentRuntime, RuntimeAgent, RuntimeModel, RuntimeSession } from "../opencode/types.ts";
+import {
+  authorizeCommandAction,
+  commandAuthorizationDeniedText,
+  gatewayCommandAction,
+} from "../security/commands.ts";
 import type { TargetHealthSnapshot } from "../targets/types.ts";
 
 export type GatewayHealthStatus = "healthy" | "unhealthy" | "unknown" | "configured" | (string & {});
@@ -60,8 +65,21 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       const parsed = parseCommand(message);
       if (!parsed) return { handled: false };
 
-      const denied = accessDeniedText(message);
-      if (denied) return { handled: true, command: parsed.name, messages: [markdown(denied)] };
+      const senderDecision = resolver.authorizeSender(message);
+      if (!senderDecision.allowed) {
+        return { handled: true, command: parsed.name, messages: [markdown(deniedDecisionText(senderDecision.reason))] };
+      }
+
+      const action = gatewayCommandAction(parsed.name, parsed.args);
+      const commandDecision = authorizeCommandAction({
+        role: senderDecision.role,
+        action,
+        profile: getCurrentProfileForPolicy(message),
+      });
+
+      if (!commandDecision.allowed) {
+        return { handled: true, command: parsed.name, messages: [markdown(commandAuthorizationDeniedText(action))] };
+      }
 
       const response = await executeCommand(parsed, message);
       return { handled: true, command: parsed.name, messages: [typeof response === "string" ? markdown(response) : response] };
@@ -74,6 +92,8 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
         return helpText();
       case "status":
         return statusText(message);
+      case "targets":
+        return targetsText(message, command.args[0]);
       case "new":
       case "reset":
         return resetText(message, command.name);
@@ -124,6 +144,7 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       "`/stop` - Abort the active run for this conversation.",
       "`/sessions` - List recent OpenCode sessions for the active target.",
       "`/use-session <id>` - Rebind this conversation to an existing session.",
+      "`/targets` - List configured OpenCode targets.",
       "`/profiles` - List available gateway profiles.",
       "`/profile [id]` - Show or switch the active profile.",
       "`/bind <target-id>` - Explicitly bind this conversation to a target.",
@@ -178,6 +199,36 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
       `Gateway health: ${health?.gateway ?? "unknown"}`,
       `Gateway degraded: ${formatGatewayDegraded(health)}`,
     ].filter(isNonEmptyString).join("\n");
+  }
+
+  function targetsText(message: InboundMessage, targetId: string | undefined): string {
+    const context = getConversationRuntimeContext(message);
+    const targets = repositories.targets.list();
+    const health = options.getHealth?.();
+
+    if (targetId) {
+      const target = repositories.targets.getById(targetId);
+
+      if (!target) return `OpenCode target not found: ${targetId}`;
+
+      return [
+        `🎯 OpenCode target: ${target.name} (${target.id})`,
+        `Mode: ${target.mode}`,
+        `Health: ${formatTargetHealth(health?.targets?.[target.id] ?? "configured")}`,
+        `Markers: ${formatTargetMarkers(target, context).join(", ") || "none"}`,
+        `Default agent: ${target.defaultAgent ?? "none"}`,
+        `Default model: ${target.defaultModel ?? "none"}`,
+      ].filter(isNonEmptyString).join("\n");
+    }
+
+    if (targets.length === 0) return "No OpenCode targets are configured.";
+
+    return [
+      "🎯 OpenCode targets:",
+      ...targets.map((target) => formatTargetLine(target, context, health)),
+      "",
+      "Use /bind <target-id> to bind this conversation to a target.",
+    ].join("\n");
   }
 
   async function resetText(message: InboundMessage, commandName: string): Promise<string> {
@@ -377,10 +428,6 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
   async function bindTargetText(message: InboundMessage, targetId: string | undefined): Promise<string> {
     if (!targetId) return "Usage: `/bind <target-id>`";
 
-    const decision = resolver.authorizeSender(message);
-    if (!decision.allowed) return deniedDecisionText(decision.reason);
-    if (!isAdminRole(decision.role)) return "Target binding changes require owner/admin access.";
-
     const result = await resolver.bindTarget(message, targetId);
 
     if (result.status === "denied") return deniedDecisionText(result.decision.reason);
@@ -415,10 +462,6 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
   }
 
   async function unbindTargetText(message: InboundMessage): Promise<string> {
-    const decision = resolver.authorizeSender(message);
-    if (!decision.allowed) return deniedDecisionText(decision.reason);
-    if (!isAdminRole(decision.role)) return "Target binding changes require owner/admin access.";
-
     const result = await resolver.unbindTarget(message);
 
     if (result.status === "denied") return deniedDecisionText(result.decision.reason);
@@ -502,7 +545,6 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
 
     const decision = resolver.authorizeSender(message);
     if (!decision.allowed) return deniedDecisionText(decision.reason);
-    if (!isAdminRole(decision.role)) return `${overrideLabel(kind)} changes require owner/admin access.`;
 
     const value = args[0];
     if (!value) return overrideUsage(kind);
@@ -605,6 +647,10 @@ export function createCommandRouter(options: CommandRouterOptions): CommandRoute
 
   function getCurrentProfileId(message: InboundMessage): string {
     return repositories.bindings.getByConversationKey(message.conversation.key)?.profileId ?? config.defaults.profile;
+  }
+
+  function getCurrentProfileForPolicy(message: InboundMessage): ProfileRecord | undefined {
+    return repositories.profiles.getById(getCurrentProfileId(message));
   }
 
   function getDefaultProfile(): ProfileRecord | undefined {
@@ -786,6 +832,40 @@ function formatProfileLine(profile: ProfileRecord, currentProfileId: string): st
   return `${marker} ${profile.id}: ${profile.displayName}${suffix}${description}`;
 }
 
+function formatTargetLine(
+  target: TargetRecord,
+  context: { binding?: ConversationBindingRecord; profile?: ProfileRecord; target?: TargetRecord },
+  health: CommandHealthSnapshot | undefined,
+): string {
+  const marker = context.target?.id === target.id ? "*" : "-";
+  const status = formatTargetHealth(health?.targets?.[target.id] ?? "configured");
+  const markers = formatTargetMarkers(target, context);
+  const markerText = markers.length > 0 ? ` ${markers.join(", ")}` : "";
+  const defaultText = formatTargetDefaults(target);
+
+  return `${marker} ${target.id}: ${target.name} [${target.mode}, ${status}]${markerText}${defaultText}`;
+}
+
+function formatTargetMarkers(
+  target: TargetRecord,
+  context: { binding?: ConversationBindingRecord; profile?: ProfileRecord; target?: TargetRecord },
+): string[] {
+  return [
+    context.target?.id === target.id ? "current" : undefined,
+    context.profile?.defaultTargetId === target.id ? "profile default" : undefined,
+    context.binding?.targetSource === "explicit_bind" && context.binding.targetId === target.id ? "explicit bind" : undefined,
+  ].filter(isNonEmptyString);
+}
+
+function formatTargetDefaults(target: TargetRecord): string {
+  const defaults = [
+    target.defaultAgent ? `agent=${target.defaultAgent}` : undefined,
+    target.defaultModel ? `model=${target.defaultModel}` : undefined,
+  ].filter(isNonEmptyString);
+
+  return defaults.length > 0 ? ` defaults: ${defaults.join(", ")}` : "";
+}
+
 function formatEffectiveVerbosity(
   binding: ConversationBindingRecord | undefined,
   profile: ProfileRecord | undefined,
@@ -900,10 +980,6 @@ function isClearOverrideValue(value: string): boolean {
   const normalized = value.toLowerCase();
 
   return normalized === "default" || normalized === "clear";
-}
-
-function isAdminRole(role: AccessRole | undefined): boolean {
-  return role === "owner" || role === "admin";
 }
 
 function titleCase(value: string): string {

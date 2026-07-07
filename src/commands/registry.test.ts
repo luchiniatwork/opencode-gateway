@@ -70,8 +70,66 @@ test("help lists agent and model commands", async () => {
     expect(text).toContain("`/agents`");
     expect(text).toContain("`/model [id|default|clear]`");
     expect(text).toContain("`/models`");
+    expect(text).toContain("`/targets`");
     expect(text).toContain("`/bind <target-id>`");
     expect(text).toContain("`/unbind`");
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("targets command lists targets without creating a binding", async () => {
+  const harness = await createHarness();
+
+  try {
+    const result = await harness.router.handle(inboundMessage({ text: "/targets" }));
+    const text = responseText(result);
+
+    expect(text).toBe([
+      "🎯 OpenCode targets:",
+      "* default: Default workspace [attach, healthy] current, profile default defaults: agent=target-agent, model=provider/target-model",
+      "- ops-target: Ops workspace [attach, healthy] defaults: agent=ops-target-agent",
+      "",
+      "Use /bind <target-id> to bind this conversation to a target.",
+    ].join("\n"));
+    expect(harness.runtime.calls.ensureSession).toEqual([]);
+    expect(harness.runtime.calls.listAgents).toEqual([]);
+    expect(harness.runtime.calls.listModels).toEqual([]);
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("targets command marks explicit target binding", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.router.handle(inboundMessage({ text: "/bind ops-target" }));
+
+    const result = await harness.router.handle(inboundMessage({ text: "/targets" }));
+    const text = responseText(result);
+
+    expect(text).toContain("- default: Default workspace [attach, healthy] profile default");
+    expect(text).toContain("* ops-target: Ops workspace [attach, healthy] current, explicit bind");
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("targets command can show one target detail", async () => {
+  const harness = await createHarness();
+
+  try {
+    const result = await harness.router.handle(inboundMessage({ text: "/targets ops-target" }));
+    const text = responseText(result);
+
+    expect(text).toContain("OpenCode target: Ops workspace (ops-target)");
+    expect(text).toContain("Mode: attach");
+    expect(text).toContain("Health: healthy");
+    expect(text).toContain("Default agent: ops-target-agent");
+    expect(harness.runtime.calls.ensureSession).toEqual([]);
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
   } finally {
     harness.database.close();
   }
@@ -348,6 +406,28 @@ test("normal users can view but not mutate agent and model overrides", async () 
   }
 });
 
+test("normal users can inspect targets and profiles but cannot rebind sessions or switch profiles", async () => {
+  const harness = await createHarness({
+    accessRules: [{ channel: "telegram", accountId: "default", senderId: "123", role: "user" }],
+  });
+
+  try {
+    const targets = await harness.router.handle(inboundMessage({ text: "/targets" }));
+    const profileView = await harness.router.handle(inboundMessage({ text: "/profile" }));
+    const profileSwitch = await harness.router.handle(inboundMessage({ text: "/profile ops" }));
+    const useSession = await harness.router.handle(inboundMessage({ text: "/use-session existing-session" }));
+
+    expect(responseText(targets)).toContain("OpenCode targets:");
+    expect(responseText(profileView)).toContain("Current profile: CTO (cto)");
+    expect(responseText(profileSwitch)).toBe("Profile switching requires owner/admin access.");
+    expect(responseText(useSession)).toBe("Session rebinding requires owner/admin access.");
+    expect(harness.runtime.calls.ensureSession).toEqual([]);
+    expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
+  } finally {
+    harness.database.close();
+  }
+});
+
 test("new command creates a fresh session binding", async () => {
   const harness = await createHarness();
 
@@ -596,6 +676,20 @@ test("bind command requires owner or admin access", async () => {
 
     expect(responseText(result)).toBe("Target binding changes require owner/admin access.");
     expect(harness.repositories.bindings.getByConversationKey(conversationKey)).toBeUndefined();
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("permission fallback command requires owner or admin access", async () => {
+  const harness = await createHarness({
+    accessRules: [{ channel: "telegram", accountId: "default", senderId: "123", role: "user" }],
+  });
+
+  try {
+    const result = await harness.router.handle(inboundMessage({ text: "/permission approve permission-1" }));
+
+    expect(responseText(result)).toBe("Permission responses require owner/admin access.");
   } finally {
     harness.database.close();
   }

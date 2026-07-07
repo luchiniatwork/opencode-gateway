@@ -1,5 +1,5 @@
 import type { ChannelAction, InboundMessage, SendReceipt } from "../channels/types.ts";
-import type { AccessRole, InteractivePermissionsConfig } from "../config/schema.ts";
+import type { InteractivePermissionsConfig } from "../config/schema.ts";
 import type { AccessRuleRepository } from "../db/repositories/access-rules.ts";
 import type { ConversationBindingRepository } from "../db/repositories/conversation-bindings.ts";
 import type { PendingPermissionRepository } from "../db/repositories/pending-permissions.ts";
@@ -11,6 +11,7 @@ import type { ResolvedDispatch } from "../dispatch/resolver.ts";
 import type { OutboundAction, OutboundMessage } from "../messages/types.ts";
 import type { GatewayLogContext, GatewayLogLevel } from "../observability/logging.ts";
 import type { AgentRuntime, PermissionResponseInput, RuntimeEvent } from "../opencode/types.ts";
+import { authorizeCommandAction, commandAuthorizationDeniedText } from "../security/commands.ts";
 
 export const PERMISSION_APPROVE_ACTION = "permission.approve";
 export const PERMISSION_ALWAYS_ACTION = "permission.always";
@@ -162,8 +163,9 @@ export function createPermissionInteractionService(options: PermissionInteractio
       senderId: input.actor.senderId,
     });
 
-    if (!isPermissionApprover(role)) {
-      return { message: errorMessage("Permission responses require owner/admin access."), editOriginal: false };
+    const authorization = authorizeCommandAction({ role, action: "respond_permission" });
+    if (!authorization.allowed) {
+      return { message: errorMessage(commandAuthorizationDeniedText("respond_permission")), editOriginal: false };
     }
 
     const permission = repositories.pendingPermissions.getById(input.permissionId);
@@ -434,10 +436,6 @@ function permissionResolvedText(permission: PendingPermissionRecord, decision: P
   if (decision === "deny") return `⛔ Permission ${permission.id} denied${actor}.`;
   if (decision === "always") return `✅ Permission ${permission.id} approved always${actor}.`;
   return `✅ Permission ${permission.id} approved once${actor}.`;
-}
-
-function isPermissionApprover(role: AccessRole | undefined): boolean {
-  return role === "owner" || role === "admin";
 }
 
 function statusMessage(text: string): OutboundMessage {

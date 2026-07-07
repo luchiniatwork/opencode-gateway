@@ -104,6 +104,47 @@ test("gateway app handles commands before runtime dispatch", async () => {
   }
 });
 
+test("gateway app handles targets command without creating a session", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-gateway-app-"));
+  const channel = new FakeChannel();
+  const runtime = new FakeRuntime();
+  const app = createApp({
+    config: testConfig(join(dir, "state.db")),
+    runtime,
+    channels: [fakeRegistration(channel)],
+    logger: () => undefined,
+    now: fixedNow,
+  });
+
+  try {
+    await app.start();
+    await channel.emit(inboundMessage({ text: "/targets", commandText: "/targets" }));
+
+    expect(runtime.calls.ensureSession).toHaveLength(0);
+    expect(runtime.calls.send).toHaveLength(0);
+    expect(runtime.calls.startTurn).toHaveLength(0);
+    expect(channel.sent).toHaveLength(1);
+    expect(channel.sent[0]?.message.text).toContain("OpenCode targets:");
+
+    await app.stop();
+
+    const database = await openGatewayDatabase(join(dir, "state.db"));
+    try {
+      runMigrations(database.db, fixedNow);
+      const bindings = createConversationBindingRepository(database.db, { now: fixedNow });
+      const runs = createRunRepository(database.db, { now: fixedNow });
+
+      expect(bindings.getByConversationKey(conversationKey)).toBeUndefined();
+      expect(runs.listActive()).toEqual([]);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("gateway app starts when profile routing points at an unresolved managed target", async () => {
   const config = testConfig(":memory:");
   const target = config.opencode.targets[0];

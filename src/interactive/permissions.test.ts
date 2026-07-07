@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 
 import type { ChannelAction, InboundMessage, SendReceipt } from "../channels/types.ts";
+import type { AccessRole } from "../config/schema.ts";
 import { openGatewayDatabase } from "../db/client.ts";
 import { runMigrations } from "../db/migrations.ts";
 import { createAccessRuleRepository } from "../db/repositories/access-rules.ts";
@@ -123,6 +124,46 @@ test("permission fallback commands can be disabled", async () => {
   }
 });
 
+test("permission fallback commands require owner or admin access", async () => {
+  const harness = await createPermissionHarness({ accessRole: "user" });
+
+  try {
+    const response = await harness.service.handleFallbackCommand(inboundMessage(), "approve", harness.permission.id);
+
+    expect(response).toEqual({
+      kind: "error",
+      format: "plain",
+      text: "Permission responses require owner/admin access.",
+    });
+    expect(harness.runtime.permissionResponses).toEqual([]);
+    expect(harness.repositories.pendingPermissions.getById(harness.permission.id)?.status).toBe("pending");
+  } finally {
+    harness.database.close();
+  }
+});
+
+test("permission action buttons require owner or admin access", async () => {
+  const harness = await createPermissionHarness({ accessRole: "user" });
+  const delivery = recordingDelivery();
+
+  try {
+    const handled = await harness.service.handleAction(permissionAction(harness.permission.id), delivery);
+
+    expect(handled).toBe(true);
+    expect(delivery.sent).toEqual([
+      {
+        kind: "error",
+        format: "plain",
+        text: "Permission responses require owner/admin access.",
+      },
+    ]);
+    expect(harness.runtime.permissionResponses).toEqual([]);
+    expect(harness.repositories.pendingPermissions.getById(harness.permission.id)?.status).toBe("pending");
+  } finally {
+    harness.database.close();
+  }
+});
+
 test("permission fallback commands validate missing and unknown permission IDs", async () => {
   const harness = await createPermissionHarness();
 
@@ -199,7 +240,7 @@ interface PermissionHarness {
 }
 
 async function createPermissionHarness(
-  options: { fallbackCommands?: boolean } = {},
+  options: { fallbackCommands?: boolean; accessRole?: AccessRole } = {},
 ): Promise<PermissionHarness> {
   const database = await openGatewayDatabase(":memory:");
   runMigrations(database.db, fixedNow);
@@ -208,7 +249,7 @@ async function createPermissionHarness(
     {
       targets: [targetSeed("default")],
       profiles: [profileSeed()],
-      accessRules: [{ channel: "telegram", accountId: "default", senderId: "123", role: "owner" }],
+      accessRules: [{ channel: "telegram", accountId: "default", senderId: "123", role: options.accessRole ?? "owner" }],
     },
     fixedNow,
   );
